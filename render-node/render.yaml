@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: rasterize-node-native
+    env: node
+    rootDir: render-node
+    buildCommand: npm install
+    startCommand: npm start

@@ -1,11 +1,9 @@
-import { initWasm, Resvg } from "@resvg/resvg-wasm";
-import resvgWasm from "@resvg/resvg-wasm/index_bg.wasm?module";
-import { processRequest } from "../../core/logic.js";
+import { initWasm, Resvg } from "npm:@resvg/resvg-wasm@2.6.2";
+import { processRequest } from "../../../core/logic.js";
 
-export const config = { runtime: "edge" };
-let wasmInitialized = false;
+let wasmPromise = null;
 
-export default async function handler(request) {
+export default async (request, context) => {
     if (request.method === 'OPTIONS') {
         return new Response(null, {
             status: 204,
@@ -17,13 +15,17 @@ export default async function handler(request) {
         });
     }
 
-    if (!wasmInitialized) {
-        await initWasm(resvgWasm);
-        wasmInitialized = true;
+    if (!wasmPromise) {
+        wasmPromise = fetch(new URL("npm:@resvg/resvg-wasm@2.6.2/index_bg.wasm", import.meta.url))
+            .then(res => res.arrayBuffer())
+            .then(buf => initWasm(buf));
     }
+    await wasmPromise;
 
     const getBodyText = async () => await request.text();
-    const processed = await processRequest(request.url, request.method, request.headers, getBodyText, process.env);
+    const env = Deno.env.toObject();
+    
+    const processed = await processRequest(request.url, request.method, request.headers, getBodyText, env);
 
     if (processed.status !== 200 || !processed.svgText) {
         return new Response(processed.body, { 
@@ -53,4 +55,4 @@ export default async function handler(request) {
             headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
         });
     }
-}
+};
