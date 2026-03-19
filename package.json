@@ -1,8 +1,0 @@
-{
-  "name": "rasterize-node",
-  "private": true,
-  "type": "module",
-  "dependencies": {
-    "@resvg/resvg-wasm": "^2.6.2"
-  }
-}
