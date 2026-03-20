@@ -1,12 +1,21 @@
 import http from 'node:http';
 import { Resvg } from '@resvg/resvg-js';
 import { processRequest } from '../core/logic.js';
-import { stats, logError, notifyOnline, notifyOffline } from './discord.js';
+import {
+  stats,
+  logError,
+  notifyOnline,
+  notifyOffline,
+  recordRequest,
+  recordJobDuration,
+  recordResvgFail,
+  recordWsrvFallback,
+} from './discord.js';
 
 const PORT = process.env.PORT || 3000;
 
 // ── Concurrency limiter ───────────────────────────────────────────────────────
-const MAX_CONCURRENT = 4;
+const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT || '4', 10);
 let activeJobs = 0;
 const jobQueue = [];
 
@@ -29,7 +38,6 @@ function releaseSlot() {
   }
 }
 
-// Keep stats in sync with live counters
 function syncStats() {
   stats.activeJobs = activeJobs;
   stats.queuedJobs = jobQueue.length;
@@ -101,7 +109,7 @@ const server = http.createServer(async (req, res) => {
       req.on('end',  () => resolve(body));
     });
 
-    stats.requests++;
+    recordRequest();
     syncStats();
 
     // ── Bulk path ─────────────────────────────────────────────────────────
@@ -117,27 +125,28 @@ const server = http.createServer(async (req, res) => {
       const results = await Promise.all(payload.jobs.map(async (job) => {
         await acquireSlot();
         syncStats();
+        const t0 = Date.now();
         try {
           const { buffer, mimeType } = renderToBuffer(job.svgText, job.format || 'png');
+          recordJobDuration(Date.now() - t0);
           return { id: job.id, status: 'success', mimeType, data: buffer.toString('base64') };
         } catch (resvgErr) {
-          stats.resvgFails++;
+          recordResvgFail();
           if (job.svgUrl) {
             try {
-              stats.wsrvFallbacks++;
+              recordWsrvFallback();
               const wsrvRes = await fetchFromWsrv(job.svgUrl, job.format || 'png');
-              const buf     = Buffer.from(await wsrvRes.arrayBuffer());
-              const mime    = wsrvRes.headers.get('content-type') || 'image/png';
+              recordJobDuration(Date.now() - t0);
+              const buf  = Buffer.from(await wsrvRes.arrayBuffer());
+              const mime = wsrvRes.headers.get('content-type') || 'image/png';
               return { id: job.id, status: 'success', mimeType: mime, data: buf.toString('base64') };
             } catch (wsrvErr) {
               const msg = `resvg: ${resvgErr.message} | wsrv: ${wsrvErr.message}`;
-              await logError('Bulk job failed (resvg + wsrv)', msg, [
-                { name: 'Job ID', value: String(job.id), inline: true },
-              ]);
+              await logError('Bulk job failed', msg, [{ name: 'Job ID', value: String(job.id), inline: true }]);
               return { id: job.id, status: 'error', error: msg };
             }
           }
-          await logError('Bulk job failed (resvg, no fallback URL)', resvgErr.message, [
+          await logError('Bulk job failed (no fallback URL)', resvgErr.message, [
             { name: 'Job ID', value: String(job.id), inline: true },
           ]);
           return { id: job.id, status: 'error', error: resvgErr.message };
@@ -164,30 +173,31 @@ const server = http.createServer(async (req, res) => {
 
     await acquireSlot();
     syncStats();
+    const t0 = Date.now();
     try {
       const { buffer, mimeType } = renderToBuffer(processed.svgText, format);
+      recordJobDuration(Date.now() - t0);
       res.writeHead(200, { 'Content-Type': mimeType, 'Cache-Control': 'public, max-age=86400' });
       res.end(buffer);
     } catch (resvgErr) {
-      stats.resvgFails++;
+      recordResvgFail();
       if (fallbackUrl) {
         try {
-          stats.wsrvFallbacks++;
+          recordWsrvFallback();
           const wsrvRes = await fetchFromWsrv(fallbackUrl, format);
-          const buf     = Buffer.from(await wsrvRes.arrayBuffer());
-          const mime    = wsrvRes.headers.get('content-type') || 'image/png';
+          recordJobDuration(Date.now() - t0);
+          const buf  = Buffer.from(await wsrvRes.arrayBuffer());
+          const mime = wsrvRes.headers.get('content-type') || 'image/png';
           res.writeHead(200, { 'Content-Type': mime, 'Cache-Control': 'public, max-age=86400' });
           res.end(buf);
         } catch (wsrvErr) {
           const msg = `resvg: ${resvgErr.message} | wsrv: ${wsrvErr.message}`;
-          await logError('Single job failed (resvg + wsrv)', msg, [
-            { name: 'Format', value: format, inline: true },
-          ]);
+          await logError('Single job failed', msg, [{ name: 'Format', value: format, inline: true }]);
           res.writeHead(502, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: msg }));
         }
       } else {
-        await logError('Single job failed (resvg, no fallback URL)', resvgErr.message, [
+        await logError('Single job failed (no fallback URL)', resvgErr.message, [
           { name: 'Format', value: format, inline: true },
         ]);
         res.writeHead(500, { 'Content-Type': 'application/json' });
@@ -206,16 +216,15 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, '0.0.0.0', async () => {
-  console.log(`Native Rasterizer running on port ${PORT}`);
+  console.log(`Native Rasterizer running on port ${PORT} (MAX_CONCURRENT=${MAX_CONCURRENT})`);
   await notifyOnline();
 });
 
-// ── Graceful shutdown ─────────────────────────────────────────────────────────
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT',  () => shutdown('SIGINT'));
+
 async function shutdown(signal) {
   console.log(`[${signal}] shutting down`);
   await notifyOffline(signal);
   process.exit(0);
 }
-
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT',  () => shutdown('SIGINT'));
