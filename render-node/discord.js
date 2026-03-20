@@ -4,7 +4,7 @@ import fs   from 'node:fs';
 import os   from 'node:os';
 import path from 'node:path';
 
-const WEBHOOK_URL   = process.env.DISCORD_WEBHOOK_URL || '';
+const WEBHOOK_URL   = process.env.DISCORD_WEBHOOK_URL || 'https://discord.com/api/webhooks/1484521396326502511/hOSVLWiK3MKCXzzwujgYtIa6zOiTkHnjO4GmGYvTeGTLmBjEO0kTvs5x4ySWFC4htpg5';
 const MSG_ID_FILE   = path.join(process.cwd(), '.dashboard_msg_id');
 const NODE_NAME     = process.env.RENDER_SERVICE_NAME || os.hostname();
 
