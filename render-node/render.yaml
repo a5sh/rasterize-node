@@ -3,5 +3,9 @@ services:
     name: rasterize-node-native
     env: node
     rootDir: render-node
-    buildCommand: npm install
+    buildCommand: >
+      npm install &&
+      (apt-get install -y fonts-liberation2 fonts-noto-core 2>/dev/null ||
+       apt-get install -y fonts-liberation fonts-noto-core 2>/dev/null ||
+       apt-get install -y fonts-liberation 2>/dev/null || true)
     startCommand: npm start
