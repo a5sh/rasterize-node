@@ -50,7 +50,7 @@ const RESVG_OPTS = {
   imageRendering: 0,
 };
 
-// ── Render SVG to buffer (single .render() call) ──────────────────────────────
+// ── Render SVG to buffer ──────────────────────────────────────────────────────
 function renderToBuffer(svgText, format) {
   const resvg    = new Resvg(svgText, RESVG_OPTS);
   const rendered = resvg.render();
@@ -100,9 +100,40 @@ const server = http.createServer(async (req, res) => {
     return res.end();
   }
 
+  const reqUrl  = `http://${req.headers.host}${req.url}`;
+  const urlObj  = new URL(reqUrl);
+
+  // ── Health endpoint — MUST NOT be cached ─────────────────────────────────
+  //
+  // Why: Render.com and CDN proxies will cache a 200 response unless told not
+  // to.  A cached /health response means keep-alive pings never reach the
+  // Node process, the 15-minute Render inactivity timer keeps ticking, and
+  // the service spins down while appearing "online" to the caller.
+  //
+  // Fix: Cache-Control: no-store + unique timestamp in the body forces every
+  // ping to traverse the network and actually hit this process.
+  if (urlObj.pathname === '/health') {
+    const body = JSON.stringify({
+      status:      'ok',
+      version:     '2.0',
+      ts:          Date.now(),          // unique per request — defeats any cache
+      activeJobs,
+      queuedJobs:  jobQueue.length,
+      maxConcurrent: MAX_CONCURRENT,
+      uptime:      Math.floor(process.uptime()),
+    });
+    res.writeHead(200, {
+      'Content-Type':  'application/json',
+      // Instruct every proxy / CDN / browser to NEVER cache this response
+      'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+      'Pragma':        'no-cache',       // HTTP/1.0 proxies
+      'Expires':       '0',
+      'Access-Control-Allow-Origin': '*',
+    });
+    return res.end(body);
+  }
+
   try {
-    const reqUrl      = `http://${req.headers.host}${req.url}`;
-    const urlObj      = new URL(reqUrl);
     const getBodyText = () => new Promise((resolve) => {
       let body = '';
       req.on('data', (chunk) => body += chunk.toString());
