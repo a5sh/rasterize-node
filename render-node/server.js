@@ -1,12 +1,18 @@
 // render-node/server.js
-// (apply identical changes to node/index.js — copy renderWorker.js there too)
+// Apply identical changes to node/index.js — copy renderWorker.js there too.
+//
+// Changes in this version:
+//   1. readBody() tags client-abort errors so the outer catch can stay silent
+//      (avoids Discord spam from expected race-cancellation "aborted" errors)
+//   2. Outer catch skips Discord + error counter for client-abort errors
+//   3. pendingRespawns exposed in /health response
 
-import http                from 'node:http';
-import fs                  from 'node:fs';
-import os                  from 'node:os';
-import path, { dirname, join } from 'node:path';
-import { fileURLToPath }   from 'node:url';
-import { RenderPool }      from '../core/renderPool.js';
+import http                     from 'node:http';
+import fs                       from 'node:fs';
+import os                       from 'node:os';
+import path, { dirname, join }  from 'node:path';
+import { fileURLToPath }        from 'node:url';
+import { RenderPool }           from '../core/renderPool.js';
 import {
   stats,
   logError,
@@ -21,8 +27,10 @@ import {
 const PORT           = process.env.PORT || 3000;
 const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT || 2, 10);
 
-// Absolute path to renderWorker.js — must be co-located with server.js so that
-// Node.js can resolve `import '@resvg/resvg-js'` relative to it (next to node_modules/).
+// ── Worker path ───────────────────────────────────────────────────────────────
+// renderWorker.js MUST sit in the same directory as this file (next to
+// node_modules/).  Node resolves `import '@resvg/resvg-js'` relative to the
+// worker file — not the main process — so co-location is required.
 const WORKER_PATH = join(dirname(fileURLToPath(import.meta.url)), 'renderWorker.js');
 
 // ── Font resolution ───────────────────────────────────────────────────────────
@@ -78,7 +86,6 @@ async function buildResvgOpts() {
   const result        = await resolveFont();
   const isLiberation  = result.fontDirs?.some(d => d.includes('liberation'));
   const defaultFamily = isLiberation ? 'Liberation Sans' : 'Noto Sans';
-
   return {
     fitTo:          { mode: 'original' },
     imageRendering: 0,
@@ -93,14 +100,32 @@ async function buildResvgOpts() {
   };
 }
 
-// ── Body reader (O(n) Buffer concat) ─────────────────────────────────────────
+// ── Body reader ───────────────────────────────────────────────────────────────
+//
+// Tags abort errors so the outer catch can distinguish them from real errors.
+//
+// When the CF Worker's AbortController fires (another backend won the race),
+// the TCP connection drops mid-body.  Node.js fires either:
+//   • req 'error' event with message "aborted"
+//   • req 'close' before 'end'  (req.complete === false)
+//
+// Both cases reject with { _clientAbort: true } so the outer catch can skip
+// Discord logging and error counting for this expected condition.
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
-    req.on('data',  c => chunks.push(c));
+    req.on('data',  c  => chunks.push(c));
     req.on('end',   () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
+    req.on('error', err => {
+      err._clientAbort = true;
+      reject(err);
+    });
+    req.on('close', () => {
+      if (!req.complete) {
+        reject(Object.assign(new Error('aborted'), { _clientAbort: true }));
+      }
+    });
   });
 }
 
@@ -167,18 +192,19 @@ const server = http.createServer(async (req, res) => {
       'Access-Control-Allow-Origin': '*',
     });
     return res.end(JSON.stringify({
-      status:        'ok',
-      version:       '2.1',
-      ts:            Date.now(),
-      activeJobs:    stats.activeJobs,
-      queuedJobs:    stats.queuedJobs,
-      workerCount:   pool?.workerCount ?? 0,
-      maxConcurrent: MAX_CONCURRENT,
-      uptime:        Math.floor(process.uptime()),
-      fontsReady:    pool !== null,
-      fontDefault:   fontCfg?.defaultFontFamily ?? null,
-      fontDirs:      fontCfg?.fontDirs  ?? [],
-      fontFiles:     fontCfg?.fontFiles ?? [],
+      status:           'ok',
+      version:          '2.1',
+      ts:               Date.now(),
+      activeJobs:       stats.activeJobs,
+      queuedJobs:       stats.queuedJobs,
+      workerCount:      pool?.workerCount      ?? 0,
+      pendingRespawns:  pool?.pendingRespawns  ?? 0,
+      maxConcurrent:    MAX_CONCURRENT,
+      uptime:           Math.floor(process.uptime()),
+      fontsReady:       pool !== null,
+      fontDefault:      fontCfg?.defaultFontFamily ?? null,
+      fontDirs:         fontCfg?.fontDirs  ?? [],
+      fontFiles:        fontCfg?.fontFiles ?? [],
     }));
   }
 
@@ -194,6 +220,9 @@ const server = http.createServer(async (req, res) => {
     const format      = params.get('format') || 'png';
     const fallbackUrl = params.get('fallback_url') || null;
 
+    // readBody() rejects with _clientAbort=true when the upstream CF Worker
+    // aborts the connection (race won by another backend).  Re-throw here —
+    // the outer catch will check the flag and stay silent.
     const bodyBuf = req.method === 'POST' ? await readBody(req) : null;
     syncStats();
 
@@ -314,6 +343,14 @@ const server = http.createServer(async (req, res) => {
       }
     }
   } catch (error) {
+    // ── Client abort: CF Worker dropped the connection (race won elsewhere) ───
+    // This is expected behaviour — another backend responded first and the
+    // Worker's AbortController fired.  Do NOT log to Discord or count as error.
+    if (error._clientAbort) {
+      // Connection already closed — nothing to send, nothing to log
+      return;
+    }
+
     await logError('Unhandled server error', error.message);
     if (!res.headersSent) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
@@ -336,9 +373,8 @@ server.on('connection', socket => socket.setNoDelay(true));
   const resvgOpts = await buildResvgOpts();
   console.log('[resvg] Font config:', JSON.stringify(resvgOpts.font, null, 2));
 
-  // Pass WORKER_PATH so RenderPool spawns workers next to node_modules/
   pool = new RenderPool(WORKER_PATH, MAX_CONCURRENT, resvgOpts);
-  console.log(`[pool] ${MAX_CONCURRENT} worker threads ready`);
+  console.log(`[pool] ${MAX_CONCURRENT} worker threads ready — worker: ${WORKER_PATH}`);
 
   server.listen(PORT, '0.0.0.0', async () => {
     console.log(`Rasterizer ready on port ${PORT} (${MAX_CONCURRENT} workers)`);
