@@ -25,6 +25,10 @@ export default {
         }
 
         try {
+    console.log('[rasterize] svg length:', processed.svgText.length);
+    console.log('[rasterize] svg preview:', processed.svgText.slice(0, 200));
+    console.log('[rasterize] fontBuffer type:', Object.prototype.toString.call(fontBuffer), 'size:', fontBuffer?.byteLength);
+
             const resvg = new Resvg(processed.svgText, {
                 fitTo: { mode: "original" },
                 font: {
@@ -49,11 +53,16 @@ export default {
             }
             return response;
 
-        } catch (error) {
-            return new Response(JSON.stringify({ error: error.message }), {
-                status: 500,
-                headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
-            });
-        }
+        // edge-node/worker.js
+} catch (error) {
+    const msg = error instanceof Error 
+        ? error.message 
+        : (typeof error === 'string' ? error : JSON.stringify(error));
+    console.error('[rasterize] render error:', msg, error?.stack || '');
+    return new Response(JSON.stringify({ error: msg, stack: error?.stack }), {
+        status: 500,
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+    });
+}
     }
 };
