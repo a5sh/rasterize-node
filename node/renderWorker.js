@@ -1,21 +1,15 @@
-// core/renderWorker.js
+// render-node/renderWorker.js   (also copy to node/renderWorker.js)
 //
-// Runs inside a worker_thread.  The main thread is NEVER blocked by rendering.
+// IMPORTANT — this file must live in the SAME DIRECTORY as server.js / index.js,
+// not in core/.  Node.js resolves `import '@resvg/resvg-js'` relative to this
+// file's location.  Placing it next to server.js puts it next to node_modules/,
+// so the package is always found regardless of the project's root structure.
 //
 // Lifecycle:
-//   1. Receive { resvgOpts } via workerData at spawn time
-//   2. Pre-warm: render one real-shaped SVG to force V8 JIT compilation
-//      before the first live request arrives
-//   3. Listen for { jobId, svgText, format } messages
-//   4. Post back { jobId, buffer (transferred ArrayBuffer), mimeType }
-//      — or { jobId, error } on failure
-//
-// Buffer transfer strategy:
-//   resvg-js returns a Node.js Buffer whose .buffer is a V8 ArrayBuffer.
-//   Node.js Buffers from small allocations share a pooled ArrayBuffer
-//   (byteOffset may be non-zero).  We always slice() to obtain a standalone
-//   ArrayBuffer before transferring so the Structured Clone algorithm can
-//   use a zero-copy move rather than a memcpy.
+//   1. Spawned by RenderPool with { resvgOpts } in workerData
+//   2. Pre-warms V8 JIT by rendering one poster-shaped SVG at startup
+//   3. Processes { jobId, svgText, format } messages, posts back
+//      { jobId, buffer (transferred ArrayBuffer), mimeType } or { jobId, error }
 
 import { workerData, parentPort } from 'node:worker_threads';
 import { Resvg }                  from '@resvg/resvg-js';
@@ -23,12 +17,8 @@ import { Resvg }                  from '@resvg/resvg-js';
 const OPTS = workerData.resvgOpts;
 
 // ── Pre-warm ──────────────────────────────────────────────────────────────────
-//
-// Rendering the first SVG after a cold start is ~2–4× slower than subsequent
-// renders because V8 hasn't JIT-compiled the resvg-js hot paths yet.
-// We render a poster-shaped SVG (text, rect, preserve-aspect-ratio) here so
-// the very first real user request hits already-compiled code.
-
+// V8 JIT-compiles Resvg's hot paths after the first render.  Running a dummy
+// render at spawn time means the very first real request hits compiled code.
 const WARMUP_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="500" height="750" viewBox="0 0 500 750">
   <rect width="500" height="750" fill="#1a1a1a"/>
   <rect x="30" y="30" width="140" height="60" rx="12" fill="rgba(0,0,0,0.45)"/>
@@ -43,10 +33,8 @@ const WARMUP_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="500" height="
 
 try {
   new Resvg(WARMUP_SVG, OPTS).render().asPng();
-} catch (_) {
-  // Font config or resvg issue — don't crash the worker, log and continue.
-  // The first real render may be slow but will still work.
-  console.warn('[worker] Pre-warm failed (non-fatal):', _.message);
+} catch (e) {
+  console.warn('[worker] Pre-warm failed (non-fatal):', e.message);
 }
 
 // ── Message handler ───────────────────────────────────────────────────────────
@@ -57,7 +45,6 @@ parentPort.on('message', ({ jobId, svgText, format }) => {
     const rendered = resvg.render();
 
     let buf, mime;
-
     if ((format === 'jpg' || format === 'jpeg') && typeof rendered.asJpeg === 'function') {
       buf  = rendered.asJpeg(85);
       mime = 'image/jpeg';
@@ -69,9 +56,8 @@ parentPort.on('message', ({ jobId, svgText, format }) => {
       mime = 'image/png';
     }
 
-    // buf is a Node.js Buffer — its .buffer ArrayBuffer may be a shared pool
-    // with a non-zero byteOffset.  slice() creates an independent ArrayBuffer
-    // so postMessage() can *transfer* it (zero-copy) instead of cloning it.
+    // slice() produces a standalone ArrayBuffer so postMessage can *transfer*
+    // it (zero-copy move) instead of structured-clone copying it.
     const ab = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
     parentPort.postMessage({ jobId, buffer: ab, mimeType: mime }, [ab]);
 

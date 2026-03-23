@@ -1,43 +1,12 @@
-// render-node/server.js  (apply identical changes to node/index.js)
-//
-// Performance changes vs previous version:
-//
-//   1. WORKER THREAD POOL (biggest win)
-//      new Resvg().render() is synchronous + CPU-bound.  Running it on the
-//      main thread froze the event loop for 200–800 ms per render — no other
-//      request could even be *read* during that time.  RenderPool offloads
-//      every render to a dedicated worker thread; the main thread stays free
-//      for I/O (body reads, health checks, wsrv fallbacks, Discord webhooks).
-//      Pool size = MAX_CONCURRENT (default: cpu core count).
-//
-//   2. BUFFER BODY READING (O(n) instead of O(n²))
-//      Previous: body += chunk.toString()  — each concatenation allocates a
-//      new string and copies all previous bytes.  For a 150 KB SVG body with
-//      ~20 chunks that's ~1.5 MB of unnecessary copying.
-//      Now: push Buffer chunks into an array, Buffer.concat() once at the end.
-//
-//   3. ZERO-COPY BUFFER TRANSFER
-//      Workers transfer their output ArrayBuffer (postMessage transferables)
-//      to the main thread instead of copying it.  The main thread wraps it
-//      with Buffer.from() (view, no copy) and writes directly to the socket.
-//
-//   4. HTTP SOCKET TUNING
-//      - setNoDelay(true): disable Nagle's algorithm → every write flushes
-//        immediately, cutting the 40 ms ACK delay on small responses.
-//      - keepAliveTimeout 65 s: longer than the CF Workers / proxy keepalive
-//        (60 s default) so the connection stays warm for repeated requests
-//        from the same Cloudflare PoP.
-//      - headersTimeout 66 s: must exceed keepAliveTimeout.
-//
-//   5. JIT PRE-WARM (in renderWorker.js)
-//      Each worker renders one poster-shaped SVG at spawn time so V8 has
-//      already JIT-compiled the hot Resvg paths before the first real request.
+// render-node/server.js
+// (apply identical changes to node/index.js — copy renderWorker.js there too)
 
-import http from 'node:http';
-import fs   from 'node:fs';
-import os   from 'node:os';
-import path from 'node:path';
-import { RenderPool } from '../core/renderPool.js';
+import http                from 'node:http';
+import fs                  from 'node:fs';
+import os                  from 'node:os';
+import path, { dirname, join } from 'node:path';
+import { fileURLToPath }   from 'node:url';
+import { RenderPool }      from '../core/renderPool.js';
 import {
   stats,
   logError,
@@ -50,7 +19,11 @@ import {
 } from './discord.js';
 
 const PORT           = process.env.PORT || 3000;
-const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT || String(os.cpus().length), 10);
+const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT || 4, 10);
+
+// Absolute path to renderWorker.js — must be co-located with server.js so that
+// Node.js can resolve `import '@resvg/resvg-js'` relative to it (next to node_modules/).
+const WORKER_PATH = join(dirname(fileURLToPath(import.meta.url)), 'renderWorker.js');
 
 // ── Font resolution ───────────────────────────────────────────────────────────
 
@@ -102,8 +75,8 @@ async function resolveFont() {
 }
 
 async function buildResvgOpts() {
-  const result       = await resolveFont();
-  const isLiberation = result.fontDirs?.some(d => d.includes('liberation'));
+  const result        = await resolveFont();
+  const isLiberation  = result.fontDirs?.some(d => d.includes('liberation'));
   const defaultFamily = isLiberation ? 'Liberation Sans' : 'Noto Sans';
 
   return {
@@ -120,12 +93,7 @@ async function buildResvgOpts() {
   };
 }
 
-// ── Body reader ───────────────────────────────────────────────────────────────
-//
-// Collects incoming chunks as Buffers and concatenates once at the end.
-// Previous string-concat approach (body += chunk.toString()) was O(n²) in
-// total bytes — each concat allocates a new string and copies all prior data.
-// Buffer.concat is a single native memcpy.
+// ── Body reader (O(n) Buffer concat) ─────────────────────────────────────────
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
@@ -160,10 +128,7 @@ async function fetchFromWsrv(svgUrl, format) {
   }
 }
 
-// ── Stats sync ────────────────────────────────────────────────────────────────
-//
-// Previously read from module-level counters; now reads from the pool so the
-// Discord dashboard reflects the actual worker state.
+// ── Pool + stats ──────────────────────────────────────────────────────────────
 
 let pool = null;
 
@@ -186,12 +151,11 @@ const server = http.createServer(async (req, res) => {
     return res.end();
   }
 
-  // Cheap URL parse — skip full URL construction for the hot path
-  const qIdx    = req.url.indexOf('?');
+  const qIdx     = req.url.indexOf('?');
   const pathname = qIdx === -1 ? req.url : req.url.slice(0, qIdx);
   const search   = qIdx === -1 ? ''      : req.url.slice(qIdx);
 
-  // ── Health check ───────────────────────────────────────────────────────────
+  // ── Health check ──────────────────────────────────────────────────────────
   if (pathname === '/health') {
     syncStats();
     const fontCfg = pool?._resvgOpts?.font ?? null;
@@ -218,7 +182,6 @@ const server = http.createServer(async (req, res) => {
     }));
   }
 
-  // Pool not yet ready (first ~100 ms after boot while font resolution runs)
   if (!pool) {
     res.writeHead(503, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ error: 'Initialising — retry in a moment.' }));
@@ -227,17 +190,14 @@ const server = http.createServer(async (req, res) => {
   try {
     recordRequest();
 
-    // ── Parse query string once ──────────────────────────────────────────────
     const params      = new URLSearchParams(search);
     const format      = params.get('format') || 'png';
     const fallbackUrl = params.get('fallback_url') || null;
 
-    // ── Read body (Buffer, O(n)) — only for POST ─────────────────────────────
     const bodyBuf = req.method === 'POST' ? await readBody(req) : null;
-
     syncStats();
 
-    // ── Bulk path: Content-Type: application/json ─────────────────────────────
+    // ── Bulk path ─────────────────────────────────────────────────────────────
     if (req.headers['content-type'] === 'application/json') {
       if (!bodyBuf?.length) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -256,18 +216,14 @@ const server = http.createServer(async (req, res) => {
         return res.end(JSON.stringify({ error: "Expected JSON object with a 'jobs' array" }));
       }
 
-      // Dispatch all jobs to the pool concurrently — pool queues internally.
-      // No need for a separate acquireSlot() mechanism.
-      const results = await Promise.all(payload.jobs.map(async (job) => {
+      const results = await Promise.all(payload.jobs.map(async job => {
         const t0  = Date.now();
         const fmt = job.format || 'png';
-
         try {
           const { buffer, mimeType } = await pool.render(job.svgText, fmt);
           recordJobDuration(Date.now() - t0);
           syncStats();
           return { id: job.id, status: 'success', mimeType, data: buffer.toString('base64') };
-
         } catch (resvgErr) {
           recordResvgFail();
           if (job.svgUrl) {
@@ -296,17 +252,14 @@ const server = http.createServer(async (req, res) => {
     }
 
     // ── Single path ───────────────────────────────────────────────────────────
-
     let svgText;
 
     if (req.method === 'POST') {
-      // Body already read as Buffer above
       if (!bodyBuf?.length) {
         res.writeHead(400, { 'Content-Type': 'text/plain' });
         return res.end('Empty SVG body');
       }
       svgText = bodyBuf.toString('utf8');
-
     } else if (req.method === 'GET') {
       const targetSvgUrl = params.get('url');
       if (!targetSvgUrl) {
@@ -322,26 +275,21 @@ const server = http.createServer(async (req, res) => {
         return res.end(JSON.stringify({ error: `SVG fetch failed: ${svgRes.status}` }));
       }
       svgText = await svgRes.text();
-
     } else {
       res.writeHead(405, { 'Content-Type': 'text/plain' });
       return res.end('Method not allowed');
     }
 
-    // ── Render via pool (non-blocking) ────────────────────────────────────────
     const t0 = Date.now();
     try {
       const { buffer, mimeType } = await pool.render(svgText, format);
       recordJobDuration(Date.now() - t0);
       syncStats();
-      // Write directly from the transferred Buffer — no extra copy
       res.writeHead(200, { 'Content-Type': mimeType, 'Cache-Control': 'public, max-age=86400' });
       res.end(buffer);
-
     } catch (resvgErr) {
       recordResvgFail();
       syncStats();
-
       if (fallbackUrl) {
         try {
           recordWsrvFallback();
@@ -365,7 +313,6 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ error: resvgErr.message }));
       }
     }
-
   } catch (error) {
     await logError('Unhandled server error', error.message);
     if (!res.headersSent) {
@@ -376,30 +323,12 @@ const server = http.createServer(async (req, res) => {
 });
 
 // ── HTTP socket tuning ────────────────────────────────────────────────────────
-//
-// setNoDelay(true):
-//   Disables Nagle's algorithm.  Without this, the OS buffers small writes
-//   for up to 40 ms waiting to combine them.  For our use case (write a
-//   200–500 KB image then close) Nagle adds unnecessary latency on the
-//   final ACK round-trip.
-//
-// keepAliveTimeout 65 s:
-//   CF Workers / upstream proxies typically send keepalive probes every 60 s.
-//   Setting our timeout above 60 s ensures the connection stays open across
-//   those probes.  Without this, Node closes the socket just before the proxy
-//   reuses it, causing a TCP RST + reconnect on every 60th second.
-//
-// headersTimeout 66 s:
-//   Must exceed keepAliveTimeout to avoid Node closing a kept-alive connection
-//   before the client sends its next request header.
 
 server.keepAliveTimeout = 65_000;
 server.headersTimeout   = 66_000;
 server.requestTimeout   = 30_000;
 
-server.on('connection', socket => {
-  socket.setNoDelay(true); // flush immediately — no 40 ms Nagle delay
-});
+server.on('connection', socket => socket.setNoDelay(true));
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
 
@@ -407,8 +336,8 @@ server.on('connection', socket => {
   const resvgOpts = await buildResvgOpts();
   console.log('[resvg] Font config:', JSON.stringify(resvgOpts.font, null, 2));
 
-  // Spawn the pool — workers pre-warm their JIT during spawn
-  pool = new RenderPool(MAX_CONCURRENT, resvgOpts);
+  // Pass WORKER_PATH so RenderPool spawns workers next to node_modules/
+  pool = new RenderPool(WORKER_PATH, MAX_CONCURRENT, resvgOpts);
   console.log(`[pool] ${MAX_CONCURRENT} worker threads ready`);
 
   server.listen(PORT, '0.0.0.0', async () => {
