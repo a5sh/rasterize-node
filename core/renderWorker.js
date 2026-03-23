@@ -1,24 +1,32 @@
-// render-node/renderWorker.js   (also copy to node/renderWorker.js)
+// core/renderWorker.js
 //
-// IMPORTANT — this file must live in the SAME DIRECTORY as server.js / index.js,
-// not in core/.  Node.js resolves `import '@resvg/resvg-js'` relative to this
-// file's location.  Placing it next to server.js puts it next to node_modules/,
-// so the package is always found regardless of the project's root structure.
+// Worker thread for CPU-bound SVG → raster rendering.
+// Stays in core/ — no need to copy it anywhere.
 //
-// Lifecycle:
-//   1. Spawned by RenderPool with { resvgOpts } in workerData
-//   2. Pre-warms V8 JIT by rendering one poster-shaped SVG at startup
-//   3. Processes { jobId, svgText, format } messages, posts back
-//      { jobId, buffer (transferred ArrayBuffer), mimeType } or { jobId, error }
+// ── WHY createRequire ─────────────────────────────────────────────────────────
+// Node ESM resolves `import '@resvg/resvg-js'` relative to THIS file's path.
+// This file lives in core/, but node_modules/ is in render-node/ (or node/).
+// Walking up from core/ never reaches render-node/node_modules/.
+//
+// Fix: renderPool passes workerData.serverDir = the calling server's __dirname
+// (i.e. render-node/ or node/).  We use createRequire() with that directory
+// so @resvg/resvg-js is resolved from the correct node_modules — regardless
+// of where this worker script physically lives.
 
+import { createRequire }          from 'node:module';
 import { workerData, parentPort } from 'node:worker_threads';
-import { Resvg }                  from '@resvg/resvg-js';
+
+// Load @resvg/resvg-js from the server's own node_modules/
+// createRequire expects a file path (not a directory), so append /_.js
+const _require  = createRequire(workerData.serverDir + '/_.js');
+const { Resvg } = _require('@resvg/resvg-js');
 
 const OPTS = workerData.resvgOpts;
 
 // ── Pre-warm ──────────────────────────────────────────────────────────────────
-// V8 JIT-compiles Resvg's hot paths after the first render.  Running a dummy
-// render at spawn time means the very first real request hits compiled code.
+// Render one poster-shaped SVG at spawn time so V8 JIT-compiles the hot paths
+// before the first real request arrives. Non-fatal if it fails.
+
 const WARMUP_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="500" height="750" viewBox="0 0 500 750">
   <rect width="500" height="750" fill="#1a1a1a"/>
   <rect x="30" y="30" width="140" height="60" rx="12" fill="rgba(0,0,0,0.45)"/>
@@ -56,8 +64,7 @@ parentPort.on('message', ({ jobId, svgText, format }) => {
       mime = 'image/png';
     }
 
-    // slice() produces a standalone ArrayBuffer so postMessage can *transfer*
-    // it (zero-copy move) instead of structured-clone copying it.
+    // slice() → standalone ArrayBuffer → zero-copy postMessage transfer
     const ab = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
     parentPort.postMessage({ jobId, buffer: ab, mimeType: mime }, [ab]);
 
