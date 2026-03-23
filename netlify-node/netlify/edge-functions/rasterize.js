@@ -1,7 +1,9 @@
 import { initWasm, Resvg } from "npm:@resvg/resvg-wasm@2.6.2";
 import { processRequest } from "../../../core/logic.js";
+import { loadEdgeFont, injectFontIntoSvg, EDGE_FONT_FAMILY } from "../../../core/font.js";
 
 let wasmPromise = null;
+let fontBase64Promise = null;
 
 export default async (request, context) => {
     if (request.method === 'OPTIONS') {
@@ -20,6 +22,10 @@ export default async (request, context) => {
             .then(res => res.arrayBuffer())
             .then(buf => initWasm(buf));
     }
+    if (!fontBase64Promise) {
+        fontBase64Promise = loadEdgeFont();
+    }
+
     await wasmPromise;
 
     const getBodyText = async () => await request.text();
@@ -35,10 +41,17 @@ export default async (request, context) => {
     }
 
     try {
-        const resvg = new Resvg(processed.svgText, {
+        // Embed font as @font-face data URI so resvg-wasm can render text
+        const fontBase64 = await fontBase64Promise;
+        const svgText = injectFontIntoSvg(processed.svgText, fontBase64);
+
+        const resvg = new Resvg(svgText, {
             fitTo: { mode: "original" },
-            font: { loadSystemFonts: false },
-            imageRendering: 1
+            font: {
+                loadSystemFonts: false,
+                defaultFontFamily: EDGE_FONT_FAMILY,
+            },
+            imageRendering: 1,
         });
 
         return new Response(resvg.render().asPng(), {
