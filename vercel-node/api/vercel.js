@@ -9,7 +9,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Load font once at cold-start — serverless has a real filesystem
 const FONT_BUFFER = (() => {
     try {
-        return fs.readFileSync(path.join(__dirname, "../../core/NotoSans-Subset.ttf"));
+        return fs.readFileSync(path.join(__dirname, "../NotoSans-Subset.ttf"));
     } catch (e) {
         console.error("[rasterize] Font load failed:", e.message);
         return null;
