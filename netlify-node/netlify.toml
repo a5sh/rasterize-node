@@ -1,6 +1,13 @@
 [build]
   base = "netlify-node"
 
-[[edge_functions]]
-  path = "/*"
-  function = "rasterize"
+[functions]
+  directory = "netlify/functions"
+  node_bundler = "esbuild"
+  included_files = ["../core/NotoSans-Subset.ttf"]
+
+[[redirects]]
+  from = "/*"
+  to = "/.netlify/functions/rasterize"
+  status = 200
+  force = true
