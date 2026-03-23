@@ -91,17 +91,20 @@ export const handler = async (event, context) => {
     }
 
     try {
-        const svgText = await embedExternalImages(processed.svgText);
+        let svgText = await embedExternalImages(processed.svgText);
+
+        // Normalize SVG attributes to perfectly match the embedded Regular TTF
+        // Strips any bold/bolder requests and forces the exact font family name
+        svgText = svgText
+            .replace(/font-weight=(["']).*?\1/gi, 'font-weight="normal"')
+            .replace(/font-family=(["']).*?\1/gi, 'font-family="Noto Sans"');
 
         const resvg = new Resvg(svgText, {
             fitTo: { mode: "original" },
             font: {
-                loadSystemFonts: true,
+                loadSystemFonts: false,
                 defaultFontFamily: "Noto Sans",
-                sansSerifFamily: "Noto Sans",   // Maps 'sans-serif' from your SVG to Noto
-                serifFamily: "Noto Sans",       // Maps 'serif'
-                monospaceFamily: "Noto Sans",   // Maps 'monospace'
-                fontBuffers: [FONT_BUFFER],
+                fontBuffers: [FONT_BUFFER], // Keep as a Node Buffer
             },
             imageRendering: 1,
         });
