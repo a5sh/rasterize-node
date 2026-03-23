@@ -1,0 +1,11 @@
+{
+  "name": "rasterize-node",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node node/index.js"
+  },
+  "dependencies": {
+    "@resvg/resvg-js": "^2.6.2"
+  }
+}
