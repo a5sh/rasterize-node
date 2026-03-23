@@ -1,16 +1,15 @@
 import { Resvg } from "@resvg/resvg-js";
 import { processRequest } from "../../core/logic.js";
 import fs from "node:fs";
-import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-
-// Font is copied to vercel-node/NotoSans-Subset.ttf by the buildCommand in vercel.json.
-// __dirname = vercel-node/api/, so one level up lands on vercel-node/.
+// Font is copied to api/NotoSans-Subset.ttf by buildCommand in vercel.json.
+// new URL resolves relative to this file — no __dirname needed.
 const FONT_BUFFER = (() => {
     try {
-        return fs.readFileSync(path.join(__dirname, "NotoSans-Subset.ttf"));
+        return fs.readFileSync(
+            fileURLToPath(new URL("./NotoSans-Subset.ttf", import.meta.url))
+        );
     } catch (e) {
         console.error("[rasterize] Font load failed:", e.message);
         return null;
@@ -26,7 +25,6 @@ async function embedExternalImages(svgText) {
     const matches = [...svgText.matchAll(regex)];
     if (matches.length === 0) return svgText;
 
-    // Deduplicate URLs
     const uniqueUrls = [...new Set(matches.map(m => m[1]))];
 
     const replacements = await Promise.all(
@@ -39,7 +37,6 @@ async function embedExternalImages(svgText) {
                 if (!res.ok) return { url, dataUri: null };
                 const buf = await res.arrayBuffer();
                 const ct = res.headers.get("content-type") || "image/jpeg";
-                // Chunk-based btoa to avoid stack overflow on large images
                 const bytes = new Uint8Array(buf);
                 const CHUNK = 0x8000;
                 let binary = "";
@@ -55,7 +52,6 @@ async function embedExternalImages(svgText) {
 
     for (const { url, dataUri } of replacements) {
         if (!dataUri) continue;
-        // Replace all occurrences of this URL in the SVG
         svgText = svgText.split(`href="${url}"`).join(`href="${dataUri}"`);
     }
 
@@ -69,7 +65,6 @@ const CORS_HEADERS = {
 };
 
 export default async function handler(req, res) {
-    // Apply CORS headers to every response
     Object.entries(CORS_HEADERS).forEach(([k, v]) => res.setHeader(k, v));
 
     if (req.method === "OPTIONS") {
@@ -77,8 +72,6 @@ export default async function handler(req, res) {
     }
 
     const getBodyText = async () => {
-        // Vercel buffers the body for us in req.body when Content-Type is text/*
-        // For raw SVG posted without a recognised content-type, read the stream.
         if (typeof req.body === "string") return req.body;
         if (Buffer.isBuffer(req.body)) return req.body.toString("utf-8");
         return new Promise((resolve, reject) => {
@@ -110,10 +103,9 @@ export default async function handler(req, res) {
     }
 
     try {
-        // Embed any external image URLs before passing to resvg
         const svgText = await embedExternalImages(processed.svgText);
 
-        const resvgOpts = {
+        const resvg = new Resvg(svgText, {
             fitTo: { mode: "original" },
             font: {
                 loadSystemFonts: false,
@@ -121,14 +113,11 @@ export default async function handler(req, res) {
                 ...(FONT_BUFFER && { fontBuffers: [new Uint8Array(FONT_BUFFER)] }),
             },
             imageRendering: 1,
-        };
-
-        const resvg = new Resvg(svgText, resvgOpts);
-        const pngBuffer = resvg.render().asPng();
+        });
 
         res.setHeader("Content-Type", "image/png");
         res.setHeader("Cache-Control", "public, max-age=86400");
-        return res.status(200).send(Buffer.from(pngBuffer));
+        return res.status(200).send(Buffer.from(resvg.render().asPng()));
     } catch (error) {
         const msg = error instanceof Error
             ? error.message

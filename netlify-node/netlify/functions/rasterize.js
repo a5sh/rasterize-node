@@ -1,15 +1,14 @@
 import { Resvg } from "@resvg/resvg-js";
 import { processRequest } from "../../../core/logic.js";
 import fs from "node:fs";
-import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-
-// Load font once at cold-start — Lambda has a real filesystem
+// ESM-native path resolution — no __dirname needed
 const FONT_BUFFER = (() => {
     try {
-        return fs.readFileSync(path.join(__dirname, "../../../core/NotoSans-Subset.ttf"));
+        return fs.readFileSync(
+            fileURLToPath(new URL("../../../core/NotoSans-Subset.ttf", import.meta.url))
+        );
     } catch (e) {
         console.error("[rasterize] Font load failed:", e.message);
         return null;
@@ -25,7 +24,6 @@ async function embedExternalImages(svgText) {
     const matches = [...svgText.matchAll(regex)];
     if (matches.length === 0) return svgText;
 
-    // Deduplicate URLs
     const uniqueUrls = [...new Set(matches.map(m => m[1]))];
 
     const replacements = await Promise.all(
@@ -38,7 +36,6 @@ async function embedExternalImages(svgText) {
                 if (!res.ok) return { url, dataUri: null };
                 const buf = await res.arrayBuffer();
                 const ct = res.headers.get("content-type") || "image/jpeg";
-                // Chunk-based btoa to avoid stack overflow on large images
                 const bytes = new Uint8Array(buf);
                 const CHUNK = 0x8000;
                 let binary = "";
@@ -54,7 +51,6 @@ async function embedExternalImages(svgText) {
 
     for (const { url, dataUri } of replacements) {
         if (!dataUri) continue;
-        // Replace all occurrences of this URL in the SVG
         svgText = svgText.split(`href="${url}"`).join(`href="${dataUri}"`);
     }
 
@@ -72,7 +68,6 @@ export const handler = async (event, context) => {
         return { statusCode: 204, headers: CORS_HEADERS, body: "" };
     }
 
-    // Reconstruct a URL + normalise body for processRequest
     const reqUrl = `https://${event.headers.host}${event.path}${
         event.rawQuery ? "?" + event.rawQuery : ""
     }`;
@@ -80,15 +75,13 @@ export const handler = async (event, context) => {
         ? Buffer.from(event.body, "base64").toString("utf-8")
         : event.body || "";
 
-    const getBodyText = async () => bodyText;
-
     let processed;
     try {
         processed = await processRequest(
             reqUrl,
             event.httpMethod,
             event.headers,
-            getBodyText,
+            async () => bodyText,
             process.env
         );
     } catch (error) {
@@ -110,10 +103,9 @@ export const handler = async (event, context) => {
     }
 
     try {
-        // Embed any external image URLs before passing to resvg
         const svgText = await embedExternalImages(processed.svgText);
 
-        const resvgOpts = {
+        const resvg = new Resvg(svgText, {
             fitTo: { mode: "original" },
             font: {
                 loadSystemFonts: false,
@@ -121,10 +113,7 @@ export const handler = async (event, context) => {
                 ...(FONT_BUFFER && { fontBuffers: [new Uint8Array(FONT_BUFFER)] }),
             },
             imageRendering: 1,
-        };
-
-        const resvg = new Resvg(svgText, resvgOpts);
-        const pngBuffer = resvg.render().asPng();
+        });
 
         return {
             statusCode: 200,
@@ -133,7 +122,7 @@ export const handler = async (event, context) => {
                 "Cache-Control": "public, max-age=86400",
                 ...CORS_HEADERS,
             },
-            body: Buffer.from(pngBuffer).toString("base64"),
+            body: Buffer.from(resvg.render().asPng()).toString("base64"),
             isBase64Encoded: true,
         };
     } catch (error) {
