@@ -1,20 +1,7 @@
 import { Resvg } from "@resvg/resvg-js";
 import { processRequest } from "../../../core/logic.js";
-import fs from "node:fs";
-import { fileURLToPath } from "node:url";
-
-// Font committed at netlify-node/netlify/functions/NotoSans-Subset.ttf
-// — same directory as this file, no cross-boundary path needed.
-const FONT_BUFFER = (() => {
-    try {
-        return fs.readFileSync(
-            fileURLToPath(new URL("./NotoSans-Subset.ttf", import.meta.url))
-        );
-    } catch (e) {
-        console.error("[rasterize] Font load failed:", e.message);
-        return null;
-    }
-})();
+// Generated at build time by scripts/embed-font.mjs — always present, no fs I/O needed
+import { FONT_BUFFER } from "./font-data.js";
 
 /**
  * Find all external http(s) image hrefs in the SVG, fetch them,
@@ -111,7 +98,7 @@ export const handler = async (event, context) => {
             font: {
                 loadSystemFonts: false,
                 defaultFontFamily: "Noto Sans",
-                ...(FONT_BUFFER && { fontBuffers: [new Uint8Array(FONT_BUFFER)] }),
+                fontBuffers: [new Uint8Array(FONT_BUFFER)],
             },
             imageRendering: 1,
         });

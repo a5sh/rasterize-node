@@ -1,11 +1,11 @@
 {
+  "buildCommand": "node ../scripts/embed-font.mjs api/font-data.js",
   "rewrites": [
     { "source": "/(.*)", "destination": "/api/vercel" }
   ],
   "functions": {
     "api/vercel.js": {
-      "maxDuration": 10,
-      "includeFiles": "api/NotoSans-Subset.ttf"
+      "maxDuration": 10
     }
   }
 }

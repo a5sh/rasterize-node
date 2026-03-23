@@ -1,12 +1,13 @@
 [build]
-  base = "netlify-node"
+  base    = "netlify-node"
+  command = "node ../scripts/embed-font.mjs netlify/functions/font-data.js"
 
 [functions]
-  directory = "netlify/functions"
+  directory    = "netlify/functions"
   node_bundler = "nft"
 
 [[redirects]]
-  from = "/*"
-  to = "/.netlify/functions/rasterize"
+  from   = "/*"
+  to     = "/.netlify/functions/rasterize"
   status = 200
-  force = true
+  force  = true
