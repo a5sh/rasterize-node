@@ -7,6 +7,10 @@ type = "CompiledWasm"
 globs = ["**/*.wasm"]
 fallbacks = []
 
+[[rules]]
+type = "Data"
+globs = ["**/*.ttf"]
+
 [observability]
 [observability.logs]
 enabled = true
