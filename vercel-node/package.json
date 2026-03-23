@@ -1,6 +1,7 @@
 {
-  "name": "r-netlify",
+  "name": "bom-r-vercel",
   "private": true,
+  "type": "module",
   "dependencies": {
     "@resvg/resvg-js": "^2.6.2"
   }
