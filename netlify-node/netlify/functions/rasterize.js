@@ -3,11 +3,12 @@ import { processRequest } from "../../../core/logic.js";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 
-// ESM-native path resolution — no __dirname needed
+// Font committed at netlify-node/netlify/functions/NotoSans-Subset.ttf
+// — same directory as this file, no cross-boundary path needed.
 const FONT_BUFFER = (() => {
     try {
         return fs.readFileSync(
-            fileURLToPath(new URL("../../../core/NotoSans-Subset.ttf", import.meta.url))
+            fileURLToPath(new URL("./NotoSans-Subset.ttf", import.meta.url))
         );
     } catch (e) {
         console.error("[rasterize] Font load failed:", e.message);

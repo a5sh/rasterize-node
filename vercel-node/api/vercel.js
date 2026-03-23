@@ -3,8 +3,8 @@ import { processRequest } from "../../core/logic.js";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 
-// Font is copied to api/NotoSans-Subset.ttf by buildCommand in vercel.json.
-// new URL resolves relative to this file — no __dirname needed.
+// Font committed at vercel-node/api/NotoSans-Subset.ttf
+// — same directory as this file, no cross-boundary path needed.
 const FONT_BUFFER = (() => {
     try {
         return fs.readFileSync(
