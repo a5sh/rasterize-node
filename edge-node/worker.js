@@ -84,11 +84,7 @@ export default {
                 },
                 imageRendering: 1,
             };
-
-            // Only pass fontBuffer if it looks like a valid TTF (>20KB)
-            if (fontBuffer.byteLength > 20_000) {
-                resvgOpts.font.fontBuffers = [new Uint8Array(fontBuffer)];
-            }
+            resvgOpts.font.fontBuffers = [new Uint8Array(fontBuffer)];
 
             const resvg = new Resvg(svgText, resvgOpts);
             const pngBuffer = resvg.render().asPng();
