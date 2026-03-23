@@ -34,7 +34,7 @@ export default {
                 font: {
                     loadSystemFonts: false,
                     defaultFontFamily: "Noto Sans",
-                    fontBuffers: [fontBuffer],  // ArrayBuffer, zero decode overhead
+                    fontBuffers: [new Uint8Array(fontBuffer)],  // ArrayBuffer, zero decode overhead
                 },
                 imageRendering: 1,
             });
