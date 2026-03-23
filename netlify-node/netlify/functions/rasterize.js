@@ -96,8 +96,11 @@ export const handler = async (event, context) => {
         const resvg = new Resvg(svgText, {
             fitTo: { mode: "original" },
             font: {
-                loadSystemFonts: false,
+                loadSystemFonts: true,
                 defaultFontFamily: "Noto Sans",
+                sansSerifFamily: "Noto Sans",   // Maps 'sans-serif' from your SVG to Noto
+                serifFamily: "Noto Sans",       // Maps 'serif'
+                monospaceFamily: "Noto Sans",   // Maps 'monospace'
                 fontBuffers: [FONT_BUFFER],
             },
             imageRendering: 1,
