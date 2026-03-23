@@ -98,7 +98,7 @@ export const handler = async (event, context) => {
             font: {
                 loadSystemFonts: false,
                 defaultFontFamily: "Noto Sans",
-                fontBuffers: [new Uint8Array(FONT_BUFFER)],
+                fontBuffers: [FONT_BUFFER],
             },
             imageRendering: 1,
         });

@@ -97,7 +97,7 @@ export default async function handler(req, res) {
             font: {
                 loadSystemFonts: false,
                 defaultFontFamily: "Noto Sans",
-                fontBuffers: [new Uint8Array(FONT_BUFFER)],
+                fontBuffers: [FONT_BUFFER],
             },
             imageRendering: 1,
         });
