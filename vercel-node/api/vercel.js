@@ -1,5 +1,5 @@
 import { Resvg } from "@resvg/resvg-js";
-import { processRequest } from "../core/logic.js";
+import { processRequest } from "../../core/logic.js";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,7 +9,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Load font once at cold-start — serverless has a real filesystem
 const FONT_BUFFER = (() => {
     try {
-        return fs.readFileSync(path.join(__dirname, "../core/NotoSans-Subset.ttf"));
+        return fs.readFileSync(path.join(__dirname, "../../core/NotoSans-Subset.ttf"));
     } catch (e) {
         console.error("[rasterize] Font load failed:", e.message);
         return null;
