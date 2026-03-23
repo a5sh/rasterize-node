@@ -5,7 +5,7 @@
   "functions": {
     "api/vercel.js": {
       "maxDuration": 10,
-      "includeFiles": "../core/NotoSans-Subset.ttf"
+      "includeFiles": "NotoSans-Subset.ttf"
     }
   }
 }

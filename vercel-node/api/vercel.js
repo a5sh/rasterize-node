@@ -6,10 +6,11 @@ import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// Load font once at cold-start — serverless has a real filesystem
+// Font is copied to vercel-node/NotoSans-Subset.ttf by the buildCommand in vercel.json.
+// __dirname = vercel-node/api/, so one level up lands on vercel-node/.
 const FONT_BUFFER = (() => {
     try {
-        return fs.readFileSync(path.join(__dirname, "../NotoSans-Subset.ttf"));
+        return fs.readFileSync(path.join(__dirname, "NotoSans-Subset.ttf"));
     } catch (e) {
         console.error("[rasterize] Font load failed:", e.message);
         return null;
