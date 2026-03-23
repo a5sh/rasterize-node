@@ -1,8 +1,9 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { Resvg } from "@resvg/resvg-js";
 import { processRequest } from "../../../core/logic.js";
-// Generated at build time by scripts/embed-font.mjs into netlify-node/lib/font-data.js
 import { FONT_BUFFER } from "../../lib/font-data.js";
-
 /**
  * Find all external http(s) image hrefs in the SVG, fetch them,
  * and replace with inline base64 data URIs so resvg-js can render them.
@@ -91,20 +92,23 @@ export const handler = async (event, context) => {
     }
 
     try {
-        let svgText = await embedExternalImages(processed.svgText);
+        const svgText = await embedExternalImages(processed.svgText);
 
-        // Normalize SVG attributes to perfectly match the embedded Regular TTF
-        // Strips any bold/bolder requests and forces the exact font family name
-        svgText = svgText
-            .replace(/font-weight=(["']).*?\1/gi, 'font-weight="normal"')
-            .replace(/font-family=(["']).*?\1/gi, 'font-family="Noto Sans"');
+        // Write font to Lambda disk to bypass N-API memory pointer issues
+        const tmpFontPath = path.join(os.tmpdir(), "NotoSans-Subset.ttf");
+        if (!fs.existsSync(tmpFontPath)) {
+            fs.writeFileSync(tmpFontPath, FONT_BUFFER);
+        }
 
         const resvg = new Resvg(svgText, {
             fitTo: { mode: "original" },
             font: {
                 loadSystemFonts: false,
                 defaultFontFamily: "Noto Sans",
-                fontBuffers: [FONT_BUFFER], // Keep as a Node Buffer
+                sansSerifFamily: "Noto Sans",
+                serifFamily: "Noto Sans",
+                monospaceFamily: "Noto Sans",
+                fontFiles: [tmpFontPath], // Direct filesystem read
             },
             imageRendering: 1,
         });
