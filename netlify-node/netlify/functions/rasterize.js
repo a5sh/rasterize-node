@@ -1,7 +1,7 @@
 import { Resvg } from "@resvg/resvg-js";
 import { processRequest } from "../../../core/logic.js";
-// Generated at build time by scripts/embed-font.mjs — always present, no fs I/O needed
-import { FONT_BUFFER } from "./font-data.js";
+// Generated at build time by scripts/embed-font.mjs into netlify-node/lib/font-data.js
+import { FONT_BUFFER } from "../../lib/font-data.js";
 
 /**
  * Find all external http(s) image hrefs in the SVG, fetch them,

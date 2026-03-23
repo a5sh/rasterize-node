@@ -1,6 +1,6 @@
 [build]
   base    = "netlify-node"
-  command = "node ../scripts/embed-font.mjs netlify/functions/font-data.js"
+  command = "node ../scripts/embed-font.mjs lib/font-data.js"
 
 [functions]
   directory    = "netlify/functions"

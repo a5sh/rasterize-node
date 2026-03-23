@@ -1,5 +1,4 @@
 {
-  "buildCommand": "node ../scripts/embed-font.mjs api/font-data.js",
   "rewrites": [
     { "source": "/(.*)", "destination": "/api/vercel" }
   ],
