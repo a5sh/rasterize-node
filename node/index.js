@@ -21,10 +21,8 @@ import {
 const PORT           = process.env.PORT || 3000;
 const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT || 4, 10);
 
-// Absolute path to renderWorker.js — must be co-located with server.js so that
-// Node.js can resolve `import '@resvg/resvg-js'` relative to it (next to node_modules/).
-const WORKER_PATH = join(dirname(fileURLToPath(import.meta.url)), 'renderWorker.js');
-
+const __dir       = dirname(fileURLToPath(import.meta.url));
+const WORKER_PATH = join(__dir, '../core/renderWorker.js');
 // ── Font resolution ───────────────────────────────────────────────────────────
 
 const SYSTEM_FONT_DIRS = [
@@ -337,7 +335,7 @@ server.on('connection', socket => socket.setNoDelay(true));
   console.log('[resvg] Font config:', JSON.stringify(resvgOpts.font, null, 2));
 
   // Pass WORKER_PATH so RenderPool spawns workers next to node_modules/
-  pool = new RenderPool(WORKER_PATH, MAX_CONCURRENT, resvgOpts);
+  pool = new RenderPool(WORKER_PATH, __dir, MAX_CONCURRENT, resvgOpts);
   console.log(`[pool] ${MAX_CONCURRENT} worker threads ready`);
 
   server.listen(PORT, '0.0.0.0', async () => {

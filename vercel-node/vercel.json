@@ -4,7 +4,8 @@
   ],
   "functions": {
     "api/vercel.js": {
-      "maxDuration": 10
+      "maxDuration": 10,
+      "bodyParser": false
     }
   }
 }

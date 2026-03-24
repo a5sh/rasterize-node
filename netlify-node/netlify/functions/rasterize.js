@@ -95,9 +95,14 @@ export const handler = async (event, context) => {
         const svgText = await embedExternalImages(processed.svgText);
 
         // Write font to Lambda disk to bypass N-API memory pointer issues
-        const tmpFontPath = path.join(os.tmpdir(), "NotoSans-Subset.ttf");
+         const tmpFontPath = path.join(os.tmpdir(), "NotoSans-Subset.ttf");
         if (!fs.existsSync(tmpFontPath)) {
-            fs.writeFileSync(tmpFontPath, FONT_BUFFER);
+            try {
+                fs.writeFileSync(tmpFontPath, FONT_BUFFER);
+            } catch (writeErr) {
+                // Race: another concurrent invocation wrote it first — safe to ignore
+                if (!fs.existsSync(tmpFontPath)) throw writeErr;
+            }
         }
 
         const resvg = new Resvg(svgText, {
