@@ -59,43 +59,53 @@ export default async function handler(req, res) {
   }
 
   try {
-    // 1. Safely handle Vercel's auto-parsed body vs raw string body
+    // 1. Safely parse the body regardless of Vercel's auto-parsing behavior
     const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
-    let { svgUrl, svgText, format } = body;
+    let { svgText, svgUrl } = body || {};
 
-    // 2. Validate svgText presence and type
+    // 2. Fallback fetch: If svgText was stripped due to size limits, fetch it directly
+    if (!svgText && svgUrl) {
+      console.log(`[Fetch Fallback] Missing svgText, fetching from: ${svgUrl}`);
+      const fetchRes = await fetch(svgUrl, {
+        headers: { 'User-Agent': 'Vercel-Rasterizer/1.0' } // Helps bypass simple WAFs
+      });
+      svgText = await fetchRes.text();
+    }
+
     if (!svgText || typeof svgText !== 'string') {
-      console.error("[Validation Error] Missing or invalid svgText in payload.", {
-        receivedType: typeof svgText,
-        bodyKeys: Object.keys(body)
-      });
-      return res.status(400).json({ error: "Missing or invalid 'svgText' payload" });
+      return res.status(400).json({ error: "Missing or invalid svgText payload" });
     }
 
-    // 3. Strip leading whitespace/BOM and validate SVG signature
-    svgText = svgText.trim();
+    // 3. AGGRESSIVE SANITIZATION (The Fix for 1:1 Error)
+    svgText = svgText.trim(); // Removes leading/trailing spaces and newlines
+    if (svgText.charCodeAt(0) === 0xFEFF) {
+      svgText = svgText.slice(1); // Removes hidden BOM if present
+    }
+
+    // 4. Validate XML signature before passing to Rust engine
     if (!svgText.startsWith('<svg') && !svgText.startsWith('<?xml')) {
-      console.error("[Validation Error] svgText does not begin with valid SVG tags.", {
-        startOfPayload: svgText.substring(0, 50)
+      console.error("[Invalid Payload] First 150 chars:", svgText.substring(0, 150));
+      return res.status(400).json({ 
+        error: "Payload is not a valid SVG string", 
+        preview: svgText.substring(0, 50) 
       });
-      return res.status(400).json({ error: "Payload is not a valid SVG string" });
     }
 
-    // 4. Safe execution
+    // 5. Execute Rasterization
     const resvg = new Resvg(svgText, {
       font: { loadSystemFonts: false },
       fitTo: { mode: 'original' }
     });
-    
+
     const image = resvg.render();
-    const buffer = image.asPng(); // Or handle target format dynamically
+    const buffer = image.asPng();
 
     res.setHeader('Content-Type', 'image/png');
     res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
     return res.status(200).send(buffer);
 
   } catch (error) {
-    console.error("[Rasterization Error]", error.message, error.stack);
-    return res.status(500).json({ error: "Internal Server Error during rasterization" });
+    console.error("[Rasterize Error]", error.message, error.stack);
+    return res.status(500).json({ error: error.message });
   }
 }
