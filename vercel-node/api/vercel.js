@@ -1,4 +1,6 @@
 import { Resvg } from "@resvg/resvg-js";
+import { processRequest } from "../../core/logic.js";
+// Generated at build time by scripts/embed-font.mjs — always present, no fs I/O needed
 import { FONT_BUFFER } from "./font-data.js";
 
 /**
@@ -56,71 +58,98 @@ export default async function handler(req, res) {
         return res.status(204).end();
     }
 
-    if (req.method !== 'POST') {
-        return res.status(405).json({ error: 'Method Not Allowed' });
+    // Safely extract svgText from the JSON body (or fetch from svgUrl if missing)
+    const getBodyText = async () => {
+        let rawData;
+        
+        if (typeof req.body === "object" && req.body !== null) {
+            rawData = req.body;
+        } else if (typeof req.body === "string") {
+            rawData = req.body;
+        } else if (Buffer.isBuffer(req.body)) {
+            rawData = req.body.toString("utf-8");
+        } else {
+            rawData = await new Promise((resolve, reject) => {
+                let data = "";
+                req.on("data", chunk => (data += chunk));
+                req.on("end", () => resolve(data));
+                req.on("error", reject);
+            });
+        }
+
+        try {
+            const parsed = typeof rawData === "string" ? JSON.parse(rawData) : rawData;
+            
+            if (parsed && parsed.svgText) {
+                return parsed.svgText;
+            }
+            if (parsed && parsed.svgUrl) {
+                console.log(`[Fetch Fallback] Missing svgText, fetching from: ${parsed.svgUrl}`);
+                const fetchRes = await fetch(parsed.svgUrl, { headers: { 'User-Agent': 'Vercel-Rasterizer/1.0' } });
+                return await fetchRes.text();
+            }
+        } catch (e) {
+            // Not JSON, continue to return rawData below
+        }
+        
+        return typeof rawData === "string" ? rawData : JSON.stringify(rawData);
+    };
+
+    let processed;
+    try {
+        processed = await processRequest(
+            `https://${req.headers.host}${req.url}`,
+            req.method,
+            req.headers,
+            getBodyText,
+            process.env
+        );
+    } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        console.error("[rasterize] processRequest error:", msg);
+        return res.status(500).json({ error: msg });
+    }
+
+    if (processed.status !== 200 || !processed.svgText) {
+        res.setHeader("Content-Type", processed.contentType || "text/plain");
+        return res.status(processed.status).send(processed.body);
     }
 
     try {
-        // 1. Safely extract JSON payload
-        const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
-        let { svgText, svgUrl } = body || {};
+        let svgText = processed.svgText;
 
-        // Fallback fetch: If svgText was stripped due to size limits
-        if (!svgText && svgUrl) {
-            console.log(`[Fetch Fallback] Missing svgText, fetching from: ${svgUrl}`);
-            const fetchRes = await fetch(svgUrl, {
-                headers: { 'User-Agent': 'Vercel-Rasterizer/1.0' }
-            });
-            svgText = await fetchRes.text();
-        }
-
-        if (!svgText || typeof svgText !== 'string') {
-            return res.status(400).json({ error: "Missing or invalid svgText payload" });
-        }
-
-        // 2. AGGRESSIVE SANITIZATION: Fix the 1:1 error (BOM and Whitespace)
+        // AGGRESSIVE SANITIZATION: Prevents the Resvg 1:1 error crash
         svgText = svgText.trim();
         if (svgText.charCodeAt(0) === 0xFEFF) {
             svgText = svgText.slice(1);
         }
 
-        // 3. Normalize SVG attributes to perfectly match the embedded Regular TTF
+        svgText = await embedExternalImages(svgText);
+
+        // Normalize SVG attributes to perfectly match the embedded Regular TTF
+        // Strips any bold/bolder requests and forces the exact font family name
         svgText = svgText
             .replace(/font-weight=(["']).*?\1/gi, 'font-weight="normal"')
             .replace(/font-family=(["']).*?\1/gi, 'font-family="Noto Sans"');
 
-        // 4. Validate XML signature to prevent rust panics
-        if (!svgText.startsWith('<svg') && !svgText.startsWith('<?xml')) {
-            console.error("[Invalid Payload] First 150 chars:", svgText.substring(0, 150));
-            return res.status(400).json({ 
-                error: "Payload is not a valid SVG string", 
-                preview: svgText.substring(0, 50) 
-            });
-        }
-
-        // 5. Pre-process SVG: Embed external images securely
-        svgText = await embedExternalImages(svgText);
-
-        // 6. Execute Rasterization
         const resvg = new Resvg(svgText, {
-            fitTo: { mode: 'original' },
-            font: { 
-                loadSystemFonts: false,
-                defaultFontFamily: 'Noto Sans',
-                fontBuffers: [FONT_BUFFER] 
+            fitTo: { mode: "original" },
+            font: {
+                loadSystemFonts: true,
+                defaultFontFamily: "Noto Sans",
+                fontBuffers: [FONT_BUFFER], // Keep as a Node Buffer
             },
-            imageRendering: 1
+            imageRendering: 1,
         });
 
-        const image = resvg.render();
-        const buffer = image.asPng();
-
-        res.setHeader('Content-Type', 'image/png');
-        res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
-        return res.status(200).send(buffer);
-
+        res.setHeader("Content-Type", "image/png");
+        res.setHeader("Cache-Control", "public, max-age=86400");
+        return res.status(200).send(Buffer.from(resvg.render().asPng()));
     } catch (error) {
-        console.error("[Rasterize Error]", error.message, error.stack);
-        return res.status(500).json({ error: error.message });
+        const msg = error instanceof Error
+            ? error.message
+            : (typeof error === "string" ? error : JSON.stringify(error));
+        console.error("[rasterize] render error:", msg, error?.stack || "");
+        return res.status(500).json({ error: msg });
     }
 }
