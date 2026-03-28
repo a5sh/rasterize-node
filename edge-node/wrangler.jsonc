@@ -2,14 +2,35 @@
   "name": "rasterize",
   "main": "worker.js",
   "compatibility_date": "2025-03-07",
-  "compatibility_flags": ["nodejs_compat"],
-
-  // Wasm and TTF asset rules (kept from original wrangler.toml)
-  "rules": [
-    { "type": "CompiledWasm", "globs": ["**/*.wasm"] },
-    { "type": "Data",         "globs": ["**/*.ttf"]  }
+  "compatibility_flags": [
+    "nodejs_compat"
   ],
-  
+  "routes": [
+    {
+      "pattern": "r-cf.spicydevs.xyz",
+      "zone_name": "spicydevs.xyz",
+      "custom_domain": true
+    }
+  ],
+  "browser": {
+    "binding": "MYBROWSER"
+  },
+  "rules": [
+    {
+      "type": "CompiledWasm",
+      "globs": [
+        "**/*.wasm"
+      ],
+      "fallthrough": true
+    },
+    {
+      "type": "Data",
+      "globs": [
+        "**/*.ttf"
+      ],
+      "fallthrough": true
+    }
+  ],
   "observability": {
     "enabled": true,
     "head_sampling_rate": 1
