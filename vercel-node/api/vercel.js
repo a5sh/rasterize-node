@@ -1,92 +1,86 @@
-import { Resvg } from "@resvg/resvg-js";
+import { Resvg }          from "@resvg/resvg-js";
+import { writeFileSync, existsSync } from "node:fs";
 import { processRequest } from "../../core/logic.js";
+// Generated at build time by scripts/embed-font.mjs
+import { FONT_BUFFER } from "./font-data.js";
 
-// ── Font loading ──────────────────────────────────────────────────────────────
+// ── Font setup ────────────────────────────────────────────────────────────────
 //
-// Vercel Lambda runs on Amazon Linux which has no guaranteed system fonts.
-// We download NotoSans-Regular once per cold start and cache the Buffer so
-// every subsequent invocation in the same Lambda instance is instant.
+// ROOT CAUSE OF INVISIBLE TEXT:
+//   fontBuffers is a @resvg/resvg-wasm option only.
+//   @resvg/resvg-js (Node native binding) silently ignores it, so no font was
+//   ever loaded and resvg rendered all text as invisible missing-glyph boxes.
 //
-// This replaces the previous build-time embed approach (embed-font.mjs /
-// font-data.js) which broke silently when core/NotoSans-Subset.ttf was
-// absent from the repo.
+// FIX: write FONT_BUFFER to /tmp once per cold-start and pass the path via
+//   fontFiles — the correct API for the Node native binding.
 
-const FONT_TTF_URL =
-  "https://github.com/notofonts/notofonts.github.io/raw/main/fonts/NotoSans/hinted/ttf/NotoSans-Regular.ttf";
+const FONT_FAMILY    = "Noto Sans";
+const FONT_TEMP_PATH = "/tmp/NotoSans-Subset.ttf";
+let   fontFileReady  = false;
 
-const FONT_FAMILY = "Noto Sans";
-
-/** @type {Promise<Buffer|null>} — resolved once per cold start */
-let _fontPromise = null;
-
-function loadFont() {
-  if (_fontPromise) return _fontPromise;
-  _fontPromise = fetch(FONT_TTF_URL, { signal: AbortSignal.timeout(20_000) })
-    .then((r) => {
-      if (!r.ok) throw new Error(`Font fetch HTTP ${r.status}`);
-      return r.arrayBuffer();
-    })
-    .then((buf) => {
-      const buffer = Buffer.from(buf);
-      console.log(`[font] NotoSans ready (${(buffer.length / 1024).toFixed(0)} KB)`);
-      return buffer;
-    })
-    .catch((e) => {
-      console.error("[font] Font load failed:", e.message);
-      _fontPromise = null; // allow retry on next cold start
-      return null;
-    });
-  return _fontPromise;
+function ensureFontOnDisk() {
+  if (fontFileReady) return true;
+  if (!FONT_BUFFER?.length) {
+    console.error("[font] FONT_BUFFER is empty — did vercel-build run?");
+    return false;
+  }
+  try {
+    if (!existsSync(FONT_TEMP_PATH)) {
+      writeFileSync(FONT_TEMP_PATH, FONT_BUFFER);
+      console.log(`[font] Written ${FONT_BUFFER.length} B → ${FONT_TEMP_PATH}`);
+    }
+    fontFileReady = true;
+    return true;
+  } catch (e) {
+    console.error("[font] Could not write font to /tmp:", e.message);
+    return false;
+  }
 }
 
-// Kick off the download immediately at module load so it's ready (or nearly
-// ready) by the time the first real request arrives.
-loadFont();
+// Eager: run at module load so the file is ready before the first request.
+ensureFontOnDisk();
 
 // ── External image embedding ──────────────────────────────────────────────────
 
 async function embedExternalImages(svgText) {
-  const regex = /href="(https?:\/\/[^"]+)"/g;
+  const regex   = /href="(https?:\/\/[^"]+)"/g;
   const matches = [...svgText.matchAll(regex)];
-  if (matches.length === 0) return svgText;
+  if (!matches.length) return svgText;
 
-  const uniqueUrls = [...new Set(matches.map((m) => m[1]))];
+  const uniqueUrls = [...new Set(matches.map(m => m[1]))];
 
   const replacements = await Promise.all(
-    uniqueUrls.map(async (url) => {
+    uniqueUrls.map(async url => {
       try {
         const res = await fetch(url, {
           headers: { "User-Agent": "SpicyDevs-Rasterizer/2.0" },
-          signal: AbortSignal.timeout(8_000),
+          signal:  AbortSignal.timeout(8_000),
         });
         if (!res.ok) return { url, dataUri: null };
-        const buf = await res.arrayBuffer();
-        const ct = res.headers.get("content-type") || "image/jpeg";
+        const buf   = await res.arrayBuffer();
+        const ct    = res.headers.get("content-type") || "image/jpeg";
         const bytes = new Uint8Array(buf);
         const CHUNK = 0x8000;
-        let binary = "";
-        for (let i = 0; i < bytes.length; i += CHUNK) {
-          binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
-        }
-        return { url, dataUri: `data:${ct};base64,${btoa(binary)}` };
+        let bin = "";
+        for (let i = 0; i < bytes.length; i += CHUNK)
+          bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+        return { url, dataUri: `data:${ct};base64,${btoa(bin)}` };
       } catch {
         return { url, dataUri: null };
       }
     }),
   );
 
-  for (const { url, dataUri } of replacements) {
-    if (!dataUri) continue;
-    svgText = svgText.split(`href="${url}"`).join(`href="${dataUri}"`);
-  }
+  for (const { url, dataUri } of replacements)
+    if (dataUri) svgText = svgText.split(`href="${url}"`).join(`href="${dataUri}"`);
 
   return svgText;
 }
 
 // ── CORS ──────────────────────────────────────────────────────────────────────
 
-const CORS_HEADERS = {
-  "Access-Control-Allow-Origin": "*",
+const CORS = {
+  "Access-Control-Allow-Origin":  "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type",
 };
@@ -94,63 +88,46 @@ const CORS_HEADERS = {
 // ── Handler ───────────────────────────────────────────────────────────────────
 
 export default async function handler(req, res) {
-  Object.entries(CORS_HEADERS).forEach(([k, v]) => res.setHeader(k, v));
+  Object.entries(CORS).forEach(([k, v]) => res.setHeader(k, v));
+  if (req.method === "OPTIONS") return res.status(204).end();
 
-  if (req.method === "OPTIONS") {
-    return res.status(204).end();
-  }
-
-  // ── Body reader ────────────────────────────────────────────────────────────
   const getBodyText = async () => {
-    let rawData;
-
-    if (typeof req.body === "object" && req.body !== null) {
-      rawData = req.body;
-    } else if (typeof req.body === "string") {
-      rawData = req.body;
-    } else if (Buffer.isBuffer(req.body)) {
-      rawData = req.body.toString("utf-8");
-    } else {
-      rawData = await new Promise((resolve, reject) => {
-        let data = "";
-        req.on("data", (chunk) => (data += chunk));
-        req.on("end", () => resolve(data));
+    let raw;
+    if (typeof req.body === "object" && req.body !== null) raw = req.body;
+    else if (typeof req.body === "string")                  raw = req.body;
+    else if (Buffer.isBuffer(req.body))                     raw = req.body.toString("utf-8");
+    else {
+      raw = await new Promise((resolve, reject) => {
+        let d = "";
+        req.on("data",  c => (d += c));
+        req.on("end",   () => resolve(d));
         req.on("error", reject);
       });
     }
 
     try {
-      const parsed = typeof rawData === "string" ? JSON.parse(rawData) : rawData;
-
-      if (parsed && parsed.svgText) {
-        return parsed.svgText;
-      }
-      if (parsed && parsed.svgUrl) {
-        console.log(`[Fetch Fallback] Missing svgText, fetching from: ${parsed.svgUrl}`);
-        const fetchRes = await fetch(parsed.svgUrl, {
+      const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+      if (parsed?.svgText) return parsed.svgText;
+      if (parsed?.svgUrl) {
+        console.log(`[fallback] fetching SVG from: ${parsed.svgUrl}`);
+        const r = await fetch(parsed.svgUrl, {
           headers: { "User-Agent": "Vercel-Rasterizer/2.0" },
         });
-        return await fetchRes.text();
+        return r.text();
       }
-    } catch {
-      // Not JSON — fall through
-    }
+    } catch { /* not JSON */ }
 
-    return typeof rawData === "string" ? rawData : JSON.stringify(rawData);
+    return typeof raw === "string" ? raw : JSON.stringify(raw);
   };
 
-  // ── Route through shared logic ─────────────────────────────────────────────
   let processed;
   try {
     processed = await processRequest(
       `https://${req.headers.host}${req.url}`,
-      req.method,
-      req.headers,
-      getBodyText,
-      process.env,
+      req.method, req.headers, getBodyText, process.env,
     );
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
     console.error("[rasterize] processRequest error:", msg);
     return res.status(500).json({ error: msg });
   }
@@ -160,55 +137,45 @@ export default async function handler(req, res) {
     return res.status(processed.status).send(processed.body);
   }
 
-  // ── Render ─────────────────────────────────────────────────────────────────
   try {
     // Sanitize
     let svgText = processed.svgText.trim();
-    if (svgText.charCodeAt(0) === 0xfeff) svgText = svgText.slice(1);
+    if (svgText.charCodeAt(0) === 0xFEFF) svgText = svgText.slice(1);
 
     // Embed external images so resvg can render them
     svgText = await embedExternalImages(svgText);
 
-    // Await the font (already in-flight from module load; usually instant)
-    const fontBuffer = await loadFont();
-
-    if (!fontBuffer) {
-      // No font available — log and proceed; resvg may still render with
-      // loadSystemFonts:true as a last-ditch fallback on the Lambda host.
-      console.warn("[rasterize] Rendering without embedded font — text may be invisible");
-    }
-
-    // Force all text to use the loaded font family
+    // Normalise font attributes to exactly match the embedded subset.
+    // Strip explicit bold/bolder — the subset is single-weight; a weight
+    // mismatch causes resvg to skip the file and render text invisibly.
     svgText = svgText
-      .replace(/font-weight=(["'])(?:bold|bolder|\d+)\1/gi, 'font-weight="normal"')
+      .replace(/font-weight=(["'])(?:bold|bolder|\d{3,})\1/gi, 'font-weight="normal"')
       .replace(/font-family=(["']).*?\1/gi, `font-family="${FONT_FAMILY}"`);
 
-    const resvgOpts = {
+    const hasFontFile = ensureFontOnDisk();
+
+    const resvg = new Resvg(svgText, {
       fitTo: { mode: "original" },
       font: {
-        // Load system fonts as last resort; our buffer takes priority when present
-        loadSystemFonts: !fontBuffer,
+        loadSystemFonts:   false,
         defaultFontFamily: FONT_FAMILY,
-        sansSerifFamily: FONT_FAMILY,
-        ...(fontBuffer ? { fontBuffers: [fontBuffer] } : {}),
+        sansSerifFamily:   FONT_FAMILY,
+        // ↓ fontFiles is the correct option for @resvg/resvg-js (Node native).
+        //   fontBuffers only exists in @resvg/resvg-wasm.
+        ...(hasFontFile ? { fontFiles: [FONT_TEMP_PATH] } : {}),
       },
       imageRendering: 0,
-    };
+    });
 
-    const resvg = new Resvg(svgText, resvgOpts);
-    const png = Buffer.from(resvg.render().asPng());
-
-    res.setHeader("Content-Type", "image/png");
+    res.setHeader("Content-Type",  "image/png");
     res.setHeader("Cache-Control", "public, max-age=86400");
-    return res.status(200).send(png);
-  } catch (error) {
-    const msg =
-      error instanceof Error
-        ? error.message
-        : typeof error === "string"
-          ? error
-          : JSON.stringify(error);
-    console.error("[rasterize] render error:", msg, error?.stack || "");
+    return res.status(200).send(Buffer.from(resvg.render().asPng()));
+
+  } catch (e) {
+    const msg = e instanceof Error ? e.message
+              : typeof e === "string" ? e
+              : JSON.stringify(e);
+    console.error("[rasterize] render error:", msg, e?.stack ?? "");
     return res.status(500).json({ error: msg });
   }
 }
