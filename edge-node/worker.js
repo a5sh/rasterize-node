@@ -60,6 +60,9 @@ async function embedExternalImages(svgText) {
  *   quality  (optional) — JPEG quality 1-100, default 85 (only for jpeg)
  *   wait     (optional) — ms to wait after load before screenshot, default 0
  */
+/**
+ * /ss route — takes a headless browser screenshot of the given URL.
+ */
 async function handleScreenshot(request, env) {
     const { searchParams } = new URL(request.url);
 
@@ -71,7 +74,6 @@ async function handleScreenshot(request, env) {
         });
     }
 
-    // Validate the URL is well-formed before launching a browser
     let parsedUrl;
     try {
         parsedUrl = new URL(targetUrl);
@@ -83,8 +85,9 @@ async function handleScreenshot(request, env) {
         });
     }
 
-    const width    = Math.min(Math.max(parseInt(searchParams.get("width")  || "1280", 10), 320), 3840);
-    const height   = Math.min(Math.max(parseInt(searchParams.get("height") || "720",  10), 240), 2160);
+    // Default to 500x750 per strict requirements
+    const width    = Math.min(Math.max(parseInt(searchParams.get("width")  || "500", 10), 100), 3840);
+    const height   = Math.min(Math.max(parseInt(searchParams.get("height") || "750",  10), 100), 2160);
     const fullPage = searchParams.get("full") === "1";
     const format   = searchParams.get("format") === "jpeg" ? "jpeg" : "png";
     const quality  = Math.min(Math.max(parseInt(searchParams.get("quality") || "85", 10), 1), 100);
@@ -97,32 +100,40 @@ async function handleScreenshot(request, env) {
 
         await page.setViewport({ width, height });
 
-        // Block ads/trackers to speed up load and reduce noise
+        // Aggressively block non-essential resources for speed
         await page.setRequestInterception(true);
         page.on("request", (req) => {
-            const blocked = ["doubleclick.net", "googlesyndication.com", "adservice.google.com"];
-            if (blocked.some(h => req.url().includes(h))) {
+            const blockedHosts = ["doubleclick.net", "googlesyndication.com", "adservice.google.com", "google-analytics.com"];
+            const rType = req.resourceType();
+            
+            if (blockedHosts.some(h => req.url().includes(h)) || ["media", "websocket", "manifest"].includes(rType)) {
                 req.abort();
             } else {
                 req.continue();
             }
         });
 
+        // "load" is significantly faster than "networkidle2"
         await page.goto(parsedUrl.toString(), {
-            waitUntil: "networkidle2",
-            timeout: 25_000,
+            waitUntil: "load", 
+            timeout: 20_000,
         });
 
-        // Optional extra wait (e.g. for JS-driven animations)
         if (waitMs > 0) {
             await new Promise(r => setTimeout(r, waitMs));
         }
 
         const screenshotOpts = {
             type: format,
-            fullPage,
             ...(format === "jpeg" ? { quality } : {}),
         };
+
+        if (fullPage) {
+            screenshotOpts.fullPage = true;
+        } else {
+            // Explicitly clip exactly 500x750 from the top-left (0,0)
+            screenshotOpts.clip = { x: 0, y: 0, width, height };
+        }
 
         const imageBuffer = await page.screenshot(screenshotOpts);
 
@@ -144,7 +155,6 @@ async function handleScreenshot(request, env) {
             headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
         });
     } finally {
-        // Always close the browser — leaking sessions counts against your quota
         if (browser) await browser.close();
     }
 }
