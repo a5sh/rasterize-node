@@ -4,5 +4,8 @@
   "type": "module",
   "dependencies": {
     "@resvg/resvg-wasm": "^2.6.2"
+  },
+  "devDependencies": {
+    "@cloudflare/puppeteer": "^1.0.6"
   }
 }

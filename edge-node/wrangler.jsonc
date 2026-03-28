@@ -1,0 +1,24 @@
+{
+  "name": "rasterize",
+  "main": "worker.js",
+  "compatibility_date": "2025-03-07",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // Wasm and TTF asset rules (kept from original wrangler.toml)
+  "rules": [
+    { "type": "CompiledWasm", "globs": ["**/*.wasm"] },
+    { "type": "Data",         "globs": ["**/*.ttf"]  }
+  ],
+
+  // Browser Rendering binding for /ss route
+  "browser": [
+    {
+      "binding": "MYBROWSER"
+    }
+  ],
+
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  }
+}
