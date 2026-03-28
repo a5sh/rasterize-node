@@ -2,9 +2,6 @@
   "name": "bom-r-vercel",
   "private": true,
   "type": "module",
-  "scripts": {
-    "vercel-build": "node ../scripts/embed-font.mjs api/font-data.js"
-  },
   "dependencies": {
     "@resvg/resvg-js": "^2.6.2"
   }
