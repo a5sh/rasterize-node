@@ -54,78 +54,48 @@ const CORS_HEADERS = {
 };
 
 export default async function handler(req, res) {
-    Object.entries(CORS_HEADERS).forEach(([k, v]) => res.setHeader(k, v));
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method Not Allowed' });
+  }
 
-    if (req.method === "OPTIONS") {
-        return res.status(204).end();
+  try {
+    // 1. Safely handle Vercel's auto-parsed body vs raw string body
+    const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
+    let { svgUrl, svgText, format } = body;
+
+    // 2. Validate svgText presence and type
+    if (!svgText || typeof svgText !== 'string') {
+      console.error("[Validation Error] Missing or invalid svgText in payload.", {
+        receivedType: typeof svgText,
+        bodyKeys: Object.keys(body)
+      });
+      return res.status(400).json({ error: "Missing or invalid 'svgText' payload" });
     }
 
-    const getBodyText = async () => {
-        if (typeof req.body === "string") return req.body;
-        if (Buffer.isBuffer(req.body)) return req.body.toString("utf-8");
-        return new Promise((resolve, reject) => {
-            let data = "";
-            req.on("data", chunk => (data += chunk));
-            req.on("end", () => resolve(data));
-            req.on("error", reject);
-        });
-    };
-
-    let processed;
-    try {
-        processed = await processRequest(
-            `https://${req.headers.host}${req.url}`,
-            req.method,
-            req.headers,
-            getBodyText,
-            process.env
-        );
-    } catch (error) {
-        const msg = error instanceof Error ? error.message : String(error);
-        console.error("[rasterize] processRequest error:", msg);
-        return res.status(500).json({ error: msg });
+    // 3. Strip leading whitespace/BOM and validate SVG signature
+    svgText = svgText.trim();
+    if (!svgText.startsWith('<svg') && !svgText.startsWith('<?xml')) {
+      console.error("[Validation Error] svgText does not begin with valid SVG tags.", {
+        startOfPayload: svgText.substring(0, 50)
+      });
+      return res.status(400).json({ error: "Payload is not a valid SVG string" });
     }
 
-    if (processed.status !== 200 || !processed.svgText) {
-        res.setHeader("Content-Type", processed.contentType || "text/plain");
-        return res.status(processed.status).send(processed.body);
-    }
+    // 4. Safe execution
+    const resvg = new Resvg(svgText, {
+      font: { loadSystemFonts: false },
+      fitTo: { mode: 'original' }
+    });
+    
+    const image = resvg.render();
+    const buffer = image.asPng(); // Or handle target format dynamically
 
-    try {
-        const svgText = await embedExternalImages(processed.svgText);
+    res.setHeader('Content-Type', 'image/png');
+    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+    return res.status(200).send(buffer);
 
-        // Write font to Lambda disk to bypass N-API memory pointer issues
-         const tmpFontPath = path.join(os.tmpdir(), "NotoSans-Subset.ttf");
-        if (!fs.existsSync(tmpFontPath)) {
-            try {
-                fs.writeFileSync(tmpFontPath, FONT_BUFFER);
-            } catch (writeErr) {
-                // Race: another concurrent invocation wrote it first — safe to ignore
-                if (!fs.existsSync(tmpFontPath)) throw writeErr;
-            }
-        }
-
-        const resvg = new Resvg(svgText, {
-            fitTo: { mode: "original" },
-            font: {
-                loadSystemFonts: false,
-                defaultFontFamily: "Noto Sans",
-                sansSerifFamily: "Noto Sans",
-                serifFamily: "Noto Sans",
-                monospaceFamily: "Noto Sans",
-                fontFiles: [tmpFontPath], // Direct filesystem read
-            },
-            imageRendering: 1,
-        });
-
-        res.setHeader("Content-Type", "image/png");
-        res.setHeader("Cache-Control", "public, max-age=86400");
-        return res.status(200).send(Buffer.from(resvg.render().asPng()));
-    } catch (error) {
-        const msg = error instanceof Error
-            ? error.message
-            : (typeof error === "string" ? error : JSON.stringify(error));
-        console.error("[rasterize] render error:", msg, error?.stack || "");
-        return res.status(500).json({ error: msg });
-    }
+  } catch (error) {
+    console.error("[Rasterization Error]", error.message, error.stack);
+    return res.status(500).json({ error: "Internal Server Error during rasterization" });
+  }
 }
