@@ -76,10 +76,10 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: "Missing or invalid svgText payload" });
     }
 
-    // 3. AGGRESSIVE SANITIZATION (The Fix for 1:1 Error)
-    svgText = svgText.trim(); // Removes leading/trailing spaces and newlines
+    // 3. AGGRESSIVE SANITIZATION
+    svgText = svgText.trim(); 
     if (svgText.charCodeAt(0) === 0xFEFF) {
-      svgText = svgText.slice(1); // Removes hidden BOM if present
+      svgText = svgText.slice(1); 
     }
 
     // 4. Validate XML signature before passing to Rust engine
@@ -91,9 +91,12 @@ export default async function handler(req, res) {
       });
     }
 
-    // 5. Execute Rasterization
+    // 5. Execute Rasterization (Fixed Font Loading)
     const resvg = new Resvg(svgText, {
-      font: { loadSystemFonts: false },
+      font: { 
+        loadSystemFonts: false,
+        fontBuffers: [FONT_BUFFER] // Injecting the generated NotoSans subset
+      },
       fitTo: { mode: 'original' }
     });
 
