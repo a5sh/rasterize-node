@@ -54,61 +54,73 @@ const CORS_HEADERS = {
 };
 
 export default async function handler(req, res) {
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method Not Allowed' });
-  }
+    Object.entries(CORS_HEADERS).forEach(([k, v]) => res.setHeader(k, v));
 
-  try {
-    // 1. Safely parse the body regardless of Vercel's auto-parsing behavior
-    const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
-    let { svgText, svgUrl } = body || {};
-
-    // 2. Fallback fetch: If svgText was stripped due to size limits, fetch it directly
-    if (!svgText && svgUrl) {
-      console.log(`[Fetch Fallback] Missing svgText, fetching from: ${svgUrl}`);
-      const fetchRes = await fetch(svgUrl, {
-        headers: { 'User-Agent': 'Vercel-Rasterizer/1.0' } // Helps bypass simple WAFs
-      });
-      svgText = await fetchRes.text();
+    if (req.method === "OPTIONS") {
+        return res.status(204).end();
     }
 
-    if (!svgText || typeof svgText !== 'string') {
-      return res.status(400).json({ error: "Missing or invalid svgText payload" });
+    const getBodyText = async () => {
+        if (typeof req.body === "string") return req.body;
+        if (Buffer.isBuffer(req.body)) return req.body.toString("utf-8");
+        return new Promise((resolve, reject) => {
+            let data = "";
+            req.on("data", chunk => (data += chunk));
+            req.on("end", () => resolve(data));
+            req.on("error", reject);
+        });
+    };
+
+    let processed;
+    try {
+        processed = await processRequest(
+            `https://${req.headers.host}${req.url}`,
+            req.method,
+            req.headers,
+            getBodyText,
+            process.env
+        );
+    } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        console.error("[rasterize] processRequest error:", msg);
+        return res.status(500).json({ error: msg });
     }
 
-    // 3. AGGRESSIVE SANITIZATION
-    svgText = svgText.trim(); 
-    if (svgText.charCodeAt(0) === 0xFEFF) {
-      svgText = svgText.slice(1); 
+    if (processed.status !== 200 || !processed.svgText) {
+        res.setHeader("Content-Type", processed.contentType || "text/plain");
+        return res.status(processed.status).send(processed.body);
     }
 
-    // 4. Validate XML signature before passing to Rust engine
-    if (!svgText.startsWith('<svg') && !svgText.startsWith('<?xml')) {
-      console.error("[Invalid Payload] First 150 chars:", svgText.substring(0, 150));
-      return res.status(400).json({ 
-        error: "Payload is not a valid SVG string", 
-        preview: svgText.substring(0, 50) 
-      });
+    try {
+        const svgText = await embedExternalImages(processed.svgText);
+
+        // Write font to Lambda disk to bypass N-API memory pointer issues
+        const tmpFontPath = path.join(os.tmpdir(), "NotoSans-Subset.ttf");
+        if (!fs.existsSync(tmpFontPath)) {
+            fs.writeFileSync(tmpFontPath, FONT_BUFFER);
+        }
+
+        const resvg = new Resvg(svgText, {
+            fitTo: { mode: "original" },
+            font: {
+                loadSystemFonts: false,
+                defaultFontFamily: "Noto Sans",
+                sansSerifFamily: "Noto Sans",
+                serifFamily: "Noto Sans",
+                monospaceFamily: "Noto Sans",
+                fontFiles: [tmpFontPath], // Direct filesystem read
+            },
+            imageRendering: 1,
+        });
+
+        res.setHeader("Content-Type", "image/png");
+        res.setHeader("Cache-Control", "public, max-age=86400");
+        return res.status(200).send(Buffer.from(resvg.render().asPng()));
+    } catch (error) {
+        const msg = error instanceof Error
+            ? error.message
+            : (typeof error === "string" ? error : JSON.stringify(error));
+        console.error("[rasterize] render error:", msg, error?.stack || "");
+        return res.status(500).json({ error: msg });
     }
-
-    // 5. Execute Rasterization (Fixed Font Loading)
-    const resvg = new Resvg(svgText, {
-      font: { 
-        loadSystemFonts: false,
-        fontBuffers: [FONT_BUFFER] // Injecting the generated NotoSans subset
-      },
-      fitTo: { mode: 'original' }
-    });
-
-    const image = resvg.render();
-    const buffer = image.asPng();
-
-    res.setHeader('Content-Type', 'image/png');
-    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
-    return res.status(200).send(buffer);
-
-  } catch (error) {
-    console.error("[Rasterize Error]", error.message, error.stack);
-    return res.status(500).json({ error: error.message });
-  }
 }
