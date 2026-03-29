@@ -2,61 +2,70 @@
 //
 // Node.js Serverless Function — SVG → raster via @resvg/resvg-js.
 //
-// REQUEST SHAPES HANDLED
-// ──────────────────────
-// rasterBalancer.fetchNode() sends:
-//   POST /api/vercel
-//   Content-Type: application/json
-//   Body: { svgUrl, svgText, format }          ← single job
+// KEY FIXES vs previous version
+// ──────────────────────────────
+// 1. FONT: @resvg/resvg-js (native) does NOT support `fontBuffers` — that is a
+//    resvg-wasm-only option. Native resvg-js requires `fontFiles` (filesystem paths)
+//    or `fontDirs`. We write the TTF buffer to /tmp once at cold start and pass the
+//    path via `fontFiles`. Matches the working netlify handler pattern exactly.
 //
-// rasterBalancer.dispatchBulkRasterization() sends:
-//   POST /api/vercel
-//   Content-Type: application/json
-//   Body: { jobs: [{ id, svgText, svgUrl, format }, …] }  ← bulk
+// 2. INVALID URL: core/logic.js does `new URL(reqUrl)` which throws when passed a
+//    bare path like "/" or "/favicon.ico". Pass a full absolute URL constructed from
+//    req.headers.host. Also short-circuit non-rasterizer paths before reaching
+//    processRequest.
 //
-// Both arrive as application/json. The previous version only handled the
-// bulk shape and returned 400 for every single-job request.
-//
-// FONT LOADING
-// ────────────
-// fs.readFileSync at module-init (cold start), not per-request.
-// Font file must be committed at: vercel-node/api/notosans-subset.ttf
-// Degrades to invisible text (not crash) when absent.
+// REQUEST SHAPES (from rasterBalancer)
+// ─────────────────────────────────────
+// Single:  POST application/json  { svgText, svgUrl?, format? }
+// Bulk:    POST application/json  { jobs: [{ id, svgText, svgUrl?, format? }] }
 
-import http               from 'node:http';
-import { readFileSync }   from 'node:fs';
-import { fileURLToPath }  from 'node:url';
-import { dirname, join }  from 'node:path';
-import { Resvg }          from '@resvg/resvg-js';
+import http              from 'node:http';
+import fs                from 'node:fs';
+import os                from 'node:os';
+import { readFileSync }  from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+import { Resvg }         from '@resvg/resvg-js';
 import { processRequest } from '../../core/logic.js';
 
 // ── ESM __dirname shim ────────────────────────────────────────────────────────
 const __filename = fileURLToPath(import.meta.url);
 const __dirname  = dirname(__filename);
 
-// ── Font loading (cold-start, once per isolate) ───────────────────────────────
+// ── Font: read TTF from api/ dir, write to /tmp, keep path for resvg-js ───────
+//
+// @resvg/resvg-js (native N-API) resolves fonts from the filesystem only.
+// `fontBuffers` is a resvg-wasm option and is silently ignored here.
+// Writing to /tmp once at cold start is the correct pattern (same as netlify).
+
 const FONT_CANDIDATES = [
   'notosans-subset.ttf',
   'NotoSans-Subset.ttf',
   'NotoSans-subset.ttf',
   'notosans-subset.otf',
-  'notosans-subset',
+  'NotoSans-Regular.ttf',
 ];
 
-let fontBuffers = [];
+let tmpFontPath = null;
 
 for (const candidate of FONT_CANDIDATES) {
+  const src = join(__dirname, candidate);
   try {
-    const buf = readFileSync(join(__dirname, candidate));
-    fontBuffers = [buf];
-    console.log(`[font] Loaded "${candidate}" (${buf.length} bytes)`);
+    const buf = readFileSync(src);
+    const dst = join(os.tmpdir(), candidate);
+    // Write once; if a concurrent cold start already wrote it that's fine
+    if (!fs.existsSync(dst)) {
+      fs.writeFileSync(dst, buf);
+    }
+    tmpFontPath = dst;
+    console.log(`[font] Loaded "${candidate}" (${buf.length} bytes) → ${dst}`);
     break;
   } catch {
-    // try next
+    // not found, try next
   }
 }
 
-if (fontBuffers.length === 0) {
+if (!tmpFontPath) {
   console.warn(
     '[font] No font file found in vercel-node/api/ — text will be invisible.\n' +
     '       Commit one of: ' + FONT_CANDIDATES.join(', '),
@@ -64,18 +73,27 @@ if (fontBuffers.length === 0) {
 }
 
 // ── resvg options ─────────────────────────────────────────────────────────────
-const RESVG_OPTS = {
-  fitTo:          { mode: 'original' },
-  font: {
-    loadSystemFonts:   false,
-    fontBuffers,
-    defaultFontFamily: 'Noto Sans',
-    sansSerifFamily:   'Noto Sans',
-  },
-  imageRendering: 0,
-};
+// fontFiles (not fontBuffers) is the correct key for @resvg/resvg-js native.
+function buildResvgOpts() {
+  return {
+    fitTo:          { mode: 'original' },
+    imageRendering: 0,
+    font: {
+      loadSystemFonts:   false,
+      defaultFontFamily: 'Noto Sans',
+      sansSerifFamily:   'Noto Sans',
+      serifFamily:       'Noto Sans',
+      monospaceFamily:   'Noto Sans',
+      ...(tmpFontPath ? { fontFiles: [tmpFontPath] } : {}),
+    },
+  };
+}
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// Build once; resvg-js reads font files at Resvg() construction time
+const RESVG_OPTS = buildResvgOpts();
+console.log('[resvg] opts.font:', JSON.stringify(RESVG_OPTS.font));
+
+// ── Render helpers ────────────────────────────────────────────────────────────
 
 function renderToBuffer(svgText, format) {
   const resvg    = new Resvg(svgText, RESVG_OPTS);
@@ -108,7 +126,6 @@ async function fetchFromWsrv(svgUrl, format) {
   }
 }
 
-// Render a single { svgText, svgUrl, format } job and write to res.
 async function handleSingleJob(svgText, svgUrl, format, res) {
   try {
     const { buffer, mimeType } = renderToBuffer(svgText, format);
@@ -166,22 +183,35 @@ const server = http.createServer(async (req, res) => {
     return res.end();
   }
 
-  const urlObj = new URL(req.url, `http://${req.headers.host}`);
+  // Build a full absolute URL — required by core/logic.js new URL(reqUrl)
+  const host    = req.headers.host || 'localhost';
+  const fullUrl = `http://${host}${req.url}`;
+  const urlObj  = new URL(fullUrl);
 
+  // ── Health ────────────────────────────────────────────────────────────────
   if (urlObj.pathname === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
     return res.end(JSON.stringify({
-      status:      'ok',
-      version:     '2.2',
-      fontsLoaded: fontBuffers.length,
-      fontFamily:  fontBuffers.length ? 'Noto Sans' : null,
+      status:     'ok',
+      version:    '2.3',
+      fontFile:   tmpFontPath,
+      fontLoaded: tmpFontPath !== null,
     }));
+  }
+
+  // ── Short-circuit noise paths that would crash core/logic.js ─────────────
+  // Vercel health probes, browser favicon requests, root path pings.
+  // Return a clean 404 rather than letting them fall into processRequest.
+  const PASSTHROUGH_PATHS = ['/favicon.ico', '/favicon.png', '/robots.txt'];
+  if (PASSTHROUGH_PATHS.includes(urlObj.pathname) || urlObj.pathname === '/') {
+    res.writeHead(404, { 'Content-Type': 'text/plain' });
+    return res.end('Not Found');
   }
 
   try {
     const contentType = req.headers['content-type'] || '';
 
-    // ── JSON path: single job OR bulk ─────────────────────────────────────
+    // ── JSON path ─────────────────────────────────────────────────────────
     if (contentType.includes('application/json')) {
       const bodyStr = await readBodyString(req);
       if (!bodyStr) {
@@ -190,15 +220,13 @@ const server = http.createServer(async (req, res) => {
       }
 
       let payload;
-      try {
-        payload = JSON.parse(bodyStr);
-      } catch {
+      try { payload = JSON.parse(bodyStr); }
+      catch {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ error: 'Invalid JSON' }));
       }
 
-      // ── Single job ────────────────────────────────────────────────────
-      // Shape sent by rasterBalancer.fetchNode(): { svgText, svgUrl, format }
+      // Single job: { svgText, svgUrl?, format? }
       if (payload.svgText) {
         return handleSingleJob(
           payload.svgText,
@@ -208,8 +236,7 @@ const server = http.createServer(async (req, res) => {
         );
       }
 
-      // ── Bulk jobs ─────────────────────────────────────────────────────
-      // Shape sent by rasterBalancer.dispatchBulkRasterization(): { jobs: [] }
+      // Bulk jobs: { jobs: [] }
       if (!Array.isArray(payload.jobs)) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({
@@ -225,8 +252,8 @@ const server = http.createServer(async (req, res) => {
           if (job.svgUrl) {
             try {
               const wsrvRes = await fetchFromWsrv(job.svgUrl, job.format || 'png');
-              const buf     = Buffer.from(await wsrvRes.arrayBuffer());
-              const mime    = wsrvRes.headers.get('content-type') || 'image/png';
+              const buf  = Buffer.from(await wsrvRes.arrayBuffer());
+              const mime = wsrvRes.headers.get('content-type') || 'image/png';
               return { id: job.id, status: 'success', mimeType: mime, data: buf.toString('base64') };
             } catch (wsrvErr) {
               return {
@@ -244,9 +271,10 @@ const server = http.createServer(async (req, res) => {
       return res.end(JSON.stringify({ results }));
     }
 
-    // ── Legacy SVG / GET path ─────────────────────────────────────────────
+    // ── Legacy SVG / GET ?url= path ───────────────────────────────────────
+    // Pass the full absolute URL so core/logic.js new URL() doesn't throw.
     const processed = await processRequest(
-      req.url, req.method, req.headers,
+      fullUrl, req.method, req.headers,
       () => readBodyString(req),
       process.env,
     );
@@ -273,5 +301,5 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`[vercel-node] Listening on port ${PORT}`);
-  console.log(`[vercel-node] Font buffers: ${fontBuffers.length} (${fontBuffers[0]?.length ?? 0} bytes)`);
+  console.log(`[vercel-node] Font path: ${tmpFontPath ?? 'NOT FOUND'}`);
 });
