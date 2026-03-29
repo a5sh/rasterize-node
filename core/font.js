@@ -71,12 +71,16 @@ export function loadEdgeFont() {
  * @param {string}      fontFamily CSS font-family name to register
  * @returns {string} SVG with font embedded (or unchanged if fontBase64 is null)
  */
+// core/font.js
 export function injectFontIntoSvg(svgText, fontBase64, fontFamily = EDGE_FONT_FAMILY) {
   if (!fontBase64) return svgText;
 
+  // Added global CSS selectors for standard bold font weights
   const fontFace =
     `@font-face{font-family:'${fontFamily}';` +
-    `src:url('data:font/ttf;base64,${fontBase64}') format('truetype');}`;
+    `src:url('data:font/ttf;base64,${fontBase64}') format('truetype');} ` +
+    `text[font-weight="bold"], text[font-weight="bolder"], text[font-weight="600"], text[font-weight="700"], text[font-weight="800"], text[font-weight="900"] { ` +
+    `stroke: currentColor; stroke-width: 1.5px; stroke-linejoin: round; }`;
 
   if (svgText.includes('<style>')) {
     return svgText.replace('<style>', `<style>${fontFace}`);
