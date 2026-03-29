@@ -2,23 +2,32 @@
 //
 // Node.js Serverless Function — SVG → raster via @resvg/resvg-js.
 //
-// FONT LOADING STRATEGY
-// ─────────────────────
-// resvg-js needs explicit font buffers when loadSystemFonts=false.
-// Vercel bundles every file co-located with the function (same /api dir),
-// so we read the TTF directly with fs.readFileSync at module-init time
-// (cold start), not per-request. This eliminates the missing font-data.js
-// import that caused the ERR_MODULE_NOT_FOUND crash.
+// REQUEST SHAPES HANDLED
+// ──────────────────────
+// rasterBalancer.fetchNode() sends:
+//   POST /api/vercel
+//   Content-Type: application/json
+//   Body: { svgUrl, svgText, format }          ← single job
 //
-// The font file must be committed at: vercel-node/api/notosans-subset.ttf
-// If the file is absent the handler degrades to no-font (text invisible)
-// and logs a warning — it does NOT crash.
+// rasterBalancer.dispatchBulkRasterization() sends:
+//   POST /api/vercel
+//   Content-Type: application/json
+//   Body: { jobs: [{ id, svgText, svgUrl, format }, …] }  ← bulk
+//
+// Both arrive as application/json. The previous version only handled the
+// bulk shape and returned 400 for every single-job request.
+//
+// FONT LOADING
+// ────────────
+// fs.readFileSync at module-init (cold start), not per-request.
+// Font file must be committed at: vercel-node/api/notosans-subset.ttf
+// Degrades to invisible text (not crash) when absent.
 
-import http           from 'node:http';
-import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
-import { Resvg }       from '@resvg/resvg-js';
+import http               from 'node:http';
+import { readFileSync }   from 'node:fs';
+import { fileURLToPath }  from 'node:url';
+import { dirname, join }  from 'node:path';
+import { Resvg }          from '@resvg/resvg-js';
 import { processRequest } from '../../core/logic.js';
 
 // ── ESM __dirname shim ────────────────────────────────────────────────────────
@@ -26,15 +35,12 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname  = dirname(__filename);
 
 // ── Font loading (cold-start, once per isolate) ───────────────────────────────
-//
-// Try several candidate filenames in order so the handler works regardless
-// of whether the font was committed as .ttf, .otf, or without an extension.
 const FONT_CANDIDATES = [
   'notosans-subset.ttf',
+  'NotoSans-Subset.ttf',
+  'NotoSans-subset.ttf',
   'notosans-subset.otf',
   'notosans-subset',
-  'NotoSans-subset.ttf',
-  'NotoSans-subset.otf',
 ];
 
 let fontBuffers = [];
@@ -46,14 +52,14 @@ for (const candidate of FONT_CANDIDATES) {
     console.log(`[font] Loaded "${candidate}" (${buf.length} bytes)`);
     break;
   } catch {
-    // Not found — try next candidate
+    // try next
   }
 }
 
 if (fontBuffers.length === 0) {
   console.warn(
-    '[font] No font file found in /api — text will be invisible in rasterized output.\n' +
-    '       Commit one of these to vercel-node/api/: ' + FONT_CANDIDATES.join(', '),
+    '[font] No font file found in vercel-node/api/ — text will be invisible.\n' +
+    '       Commit one of: ' + FONT_CANDIDATES.join(', '),
   );
 }
 
@@ -61,41 +67,33 @@ if (fontBuffers.length === 0) {
 const RESVG_OPTS = {
   fitTo:          { mode: 'original' },
   font: {
-    loadSystemFonts: false,   // Vercel Lambda has no usable system fonts
-    fontBuffers,              // [] degrades gracefully (invisible text, no crash)
+    loadSystemFonts:   false,
+    fontBuffers,
+    defaultFontFamily: 'Noto Sans',
+    sansSerifFamily:   'Noto Sans',
   },
-  imageRendering: 0,          // 0 = optimizeQuality (same as render-node)
+  imageRendering: 0,
 };
 
-// ── Format → MIME ─────────────────────────────────────────────────────────────
-const MIME = {
-  png:  'image/png',
-  jpg:  'image/jpeg',
-  jpeg: 'image/jpeg',
-  webp: 'image/webp',
-};
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
-// ── Render SVG buffer ─────────────────────────────────────────────────────────
 function renderToBuffer(svgText, format) {
   const resvg    = new Resvg(svgText, RESVG_OPTS);
   const rendered = resvg.render();
-
   if ((format === 'jpg' || format === 'jpeg') && typeof rendered.asJpeg === 'function') {
-    return { buffer: rendered.asJpeg(85), mimeType: MIME.jpg };
+    return { buffer: rendered.asJpeg(85), mimeType: 'image/jpeg' };
   }
   if (format === 'webp' && typeof rendered.asWebp === 'function') {
-    return { buffer: rendered.asWebp(85), mimeType: MIME.webp };
+    return { buffer: rendered.asWebp(85), mimeType: 'image/webp' };
   }
-  return { buffer: rendered.asPng(), mimeType: MIME.png };
+  return { buffer: rendered.asPng(), mimeType: 'image/png' };
 }
 
-// ── wsrv.nl fallback ──────────────────────────────────────────────────────────
 async function fetchFromWsrv(svgUrl, format) {
   const url = new URL('https://wsrv.nl/');
   url.searchParams.set('url',    svgUrl);
-  url.searchParams.set('output', format === 'webp' ? 'webp' : format === 'png' ? 'png' : 'jpg');
+  url.searchParams.set('output', format === 'webp' ? 'webp' : (format === 'png' ? 'png' : 'jpg'));
   url.searchParams.set('q',      '100');
-
   const ac = new AbortController();
   const t  = setTimeout(() => ac.abort(), 6_000);
   try {
@@ -110,16 +108,51 @@ async function fetchFromWsrv(svgUrl, format) {
   }
 }
 
-// ── Request body reader ───────────────────────────────────────────────────────
-function readBody(req) {
-  return new Promise((resolve) => {
-    let body = '';
-    req.on('data', (chunk) => { body += chunk.toString(); });
-    req.on('end',  () => resolve(body));
+// Render a single { svgText, svgUrl, format } job and write to res.
+async function handleSingleJob(svgText, svgUrl, format, res) {
+  try {
+    const { buffer, mimeType } = renderToBuffer(svgText, format);
+    res.writeHead(200, {
+      'Content-Type':                mimeType,
+      'Cache-Control':               'public, max-age=86400',
+      'Access-Control-Allow-Origin': '*',
+    });
+    res.end(buffer);
+  } catch (resvgErr) {
+    console.error('[resvg] render failed:', resvgErr.message);
+    if (svgUrl) {
+      try {
+        const wsrvRes = await fetchFromWsrv(svgUrl, format);
+        const buf  = Buffer.from(await wsrvRes.arrayBuffer());
+        const mime = wsrvRes.headers.get('content-type') || 'image/png';
+        res.writeHead(200, {
+          'Content-Type':                mime,
+          'Cache-Control':               'public, max-age=86400',
+          'Access-Control-Allow-Origin': '*',
+        });
+        res.end(buf);
+        return;
+      } catch (wsrvErr) {
+        res.writeHead(502, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+        res.end(JSON.stringify({ error: `resvg: ${resvgErr.message} | wsrv: ${wsrvErr.message}` }));
+        return;
+      }
+    }
+    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: resvgErr.message }));
+  }
+}
+
+function readBodyString(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on('data',  c => chunks.push(c));
+    req.on('end',   () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('error', reject);
   });
 }
 
-// ── HTTP server (used by Vercel Node.js serverless runtime) ───────────────────
+// ── HTTP server ───────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 
 const server = http.createServer(async (req, res) => {
@@ -133,44 +166,67 @@ const server = http.createServer(async (req, res) => {
     return res.end();
   }
 
-  try {
-    const reqUrl     = `http://${req.headers.host}${req.url}`;
-    const urlObj     = new URL(reqUrl);
-    const getBodyText = () => readBody(req);
+  const urlObj = new URL(req.url, `http://${req.headers.host}`);
 
-    // ── Bulk path (JSON body with jobs array) ─────────────────────────────
+  if (urlObj.pathname === '/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+    return res.end(JSON.stringify({
+      status:      'ok',
+      version:     '2.2',
+      fontsLoaded: fontBuffers.length,
+      fontFamily:  fontBuffers.length ? 'Noto Sans' : null,
+    }));
+  }
+
+  try {
     const contentType = req.headers['content-type'] || '';
+
+    // ── JSON path: single job OR bulk ─────────────────────────────────────
     if (contentType.includes('application/json')) {
-      const bodyStr = await getBodyText();
+      const bodyStr = await readBodyString(req);
+      if (!bodyStr) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: 'Empty body' }));
+      }
+
       let payload;
       try {
         payload = JSON.parse(bodyStr);
       } catch {
         res.writeHead(400, { 'Content-Type': 'application/json' });
-        return res.end(JSON.stringify({ error: 'Invalid JSON body' }));
+        return res.end(JSON.stringify({ error: 'Invalid JSON' }));
       }
 
+      // ── Single job ────────────────────────────────────────────────────
+      // Shape sent by rasterBalancer.fetchNode(): { svgText, svgUrl, format }
+      if (payload.svgText) {
+        return handleSingleJob(
+          payload.svgText,
+          payload.svgUrl || null,
+          payload.format || 'png',
+          res,
+        );
+      }
+
+      // ── Bulk jobs ─────────────────────────────────────────────────────
+      // Shape sent by rasterBalancer.dispatchBulkRasterization(): { jobs: [] }
       if (!Array.isArray(payload.jobs)) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
-        return res.end(JSON.stringify({ error: "Expected JSON object with a 'jobs' array" }));
+        return res.end(JSON.stringify({
+          error: 'Expected { svgText } for single render or { jobs: [] } for bulk',
+        }));
       }
 
       const results = await Promise.all(payload.jobs.map(async (job) => {
         try {
           const { buffer, mimeType } = renderToBuffer(job.svgText, job.format || 'png');
-          return {
-            id:       job.id,
-            status:   'success',
-            mimeType,
-            data:     buffer.toString('base64'),
-          };
+          return { id: job.id, status: 'success', mimeType, data: buffer.toString('base64') };
         } catch (resvgErr) {
-          // Attempt wsrv fallback if a source URL was provided
           if (job.svgUrl) {
             try {
               const wsrvRes = await fetchFromWsrv(job.svgUrl, job.format || 'png');
-              const buf  = Buffer.from(await wsrvRes.arrayBuffer());
-              const mime = wsrvRes.headers.get('content-type') || 'image/png';
+              const buf     = Buffer.from(await wsrvRes.arrayBuffer());
+              const mime    = wsrvRes.headers.get('content-type') || 'image/png';
               return { id: job.id, status: 'success', mimeType: mime, data: buf.toString('base64') };
             } catch (wsrvErr) {
               return {
@@ -188,9 +244,11 @@ const server = http.createServer(async (req, res) => {
       return res.end(JSON.stringify({ results }));
     }
 
-    // ── Single path ───────────────────────────────────────────────────────
+    // ── Legacy SVG / GET path ─────────────────────────────────────────────
     const processed = await processRequest(
-      reqUrl, req.method, req.headers, getBodyText, process.env,
+      req.url, req.method, req.headers,
+      () => readBodyString(req),
+      process.env,
     );
 
     if (processed.status !== 200 || !processed.svgText) {
@@ -202,41 +260,18 @@ const server = http.createServer(async (req, res) => {
 
     const format      = urlObj.searchParams.get('format') || 'png';
     const fallbackUrl = urlObj.searchParams.get('fallback_url') || null;
-
-    try {
-      const { buffer, mimeType } = renderToBuffer(processed.svgText, format);
-      res.writeHead(200, {
-        'Content-Type':  mimeType,
-        'Cache-Control': 'public, max-age=86400',
-      });
-      return res.end(buffer);
-    } catch (resvgErr) {
-      if (fallbackUrl) {
-        try {
-          const wsrvRes = await fetchFromWsrv(fallbackUrl, format);
-          const buf  = Buffer.from(await wsrvRes.arrayBuffer());
-          const mime = wsrvRes.headers.get('content-type') || 'image/png';
-          res.writeHead(200, { 'Content-Type': mime, 'Cache-Control': 'public, max-age=86400' });
-          return res.end(buf);
-        } catch (wsrvErr) {
-          res.writeHead(502, { 'Content-Type': 'application/json' });
-          return res.end(JSON.stringify({
-            error: `resvg: ${resvgErr.message} | wsrv: ${wsrvErr.message}`,
-          }));
-        }
-      }
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ error: resvgErr.message }));
-    }
+    return handleSingleJob(processed.svgText, fallbackUrl, format, res);
 
   } catch (error) {
     console.error('[vercel-node] Unhandled error:', error);
-    res.writeHead(500, { 'Content-Type': 'application/json' });
+    if (!res.headersSent) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+    }
     res.end(JSON.stringify({ error: error.message }));
   }
 });
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`[vercel-node] Listening on port ${PORT}`);
-  console.log(`[vercel-node] Font buffers loaded: ${fontBuffers.length}`);
+  console.log(`[vercel-node] Font buffers: ${fontBuffers.length} (${fontBuffers[0]?.length ?? 0} bytes)`);
 });
