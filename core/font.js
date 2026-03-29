@@ -75,12 +75,12 @@ export function loadEdgeFont() {
 export function injectFontIntoSvg(svgText, fontBase64, fontFamily = EDGE_FONT_FAMILY) {
   if (!fontBase64) return svgText;
 
-  // Added global CSS selectors for standard bold font weights
+  // Added paint-order and changed stroke-width to an em-relative value
   const fontFace =
     `@font-face{font-family:'${fontFamily}';` +
     `src:url('data:font/ttf;base64,${fontBase64}') format('truetype');} ` +
     `text[font-weight="bold"], text[font-weight="bolder"], text[font-weight="600"], text[font-weight="700"], text[font-weight="800"], text[font-weight="900"] { ` +
-    `stroke: currentColor; stroke-width: 1.5px; stroke-linejoin: round; }`;
+    `stroke: currentColor; stroke-width: 0.08em; stroke-linejoin: round; paint-order: stroke fill; }`;
 
   if (svgText.includes('<style>')) {
     return svgText.replace('<style>', `<style>${fontFace}`);

@@ -28,20 +28,20 @@ export async function processRequest(reqUrl, method, headers, getBodyText, env) 
 
     // --- NEW: Faux Bold Synthesis ---
     // Safely parse text tags requesting bold weights (600-900 or 'bold')
+    // --- UPDATED: Faux Bold Synthesis ---
     svgText = svgText.replace(
         /(<text[^>]*?)(>.*?<\/text>)/gi,
         (match, openingTag, innerText) => {
             const isBold = /font-weight=["']?(bold|bolder|[6-9]00)["']?/i.test(openingTag);
             if (!isBold) return match;
 
-            // Extract the fill color to use as the stroke color
             const fillMatch = openingTag.match(/fill=["']([^"']+)["']/i);
             
-            // Apply stroke if fill exists and stroke isn't already defined
             if (fillMatch && !openingTag.includes('stroke=')) {
                 const fillStr = fillMatch[1];
-                // stroke-linejoin="round" is critical to prevent sharp artifacts on text corners
-                openingTag += ` stroke="${fillStr}" stroke-width="1.5" stroke-linejoin="round"`;
+                // 1. stroke-width="0.08em": Dynamically scales thickness (8% of font size). Adjust 0.08 to 0.1 for extreme bold.
+                // 2. paint-order="stroke fill": Draws stroke UNDER the fill, preserving letter integrity.
+                openingTag += ` stroke="${fillStr}" stroke-width="0.08em" stroke-linejoin="round" paint-order="stroke fill"`;
             }
             return openingTag + innerText;
         }
