@@ -38,31 +38,21 @@ const __dirname  = dirname(__filename);
 // `fontBuffers` is a resvg-wasm option and is silently ignored here.
 // Writing to /tmp once at cold start is the correct pattern (same as netlify).
 
-const FONT_CANDIDATES = [
-  'notosans-subset.ttf',
-  'NotoSans-Subset.ttf',
-  'NotoSans-subset.ttf',
-  'notosans-subset.otf',
-  'NotoSans-Regular.ttf',
-];
-
+// Replace the FONT_CANDIDATES loop block with this statically analyzable path:
 let tmpFontPath = null;
+const candidate = 'NotoSans-Subset.ttf';
+const src = join(__dirname, candidate);
 
-for (const candidate of FONT_CANDIDATES) {
-  const src = join(__dirname, candidate);
-  try {
-    const buf = readFileSync(src);
-    const dst = join(os.tmpdir(), candidate);
-    // Write once; if a concurrent cold start already wrote it that's fine
-    if (!fs.existsSync(dst)) {
-      fs.writeFileSync(dst, buf);
-    }
-    tmpFontPath = dst;
-    console.log(`[font] Loaded "${candidate}" (${buf.length} bytes) → ${dst}`);
-    break;
-  } catch {
-    // not found, try next
+try {
+  const buf = readFileSync(src);
+  const dst = join(os.tmpdir(), candidate);
+  if (!fs.existsSync(dst)) {
+    fs.writeFileSync(dst, buf);
   }
+  tmpFontPath = dst;
+  console.log(`[font] Loaded "${candidate}" (${buf.length} bytes) → ${dst}`);
+} catch (e) {
+  console.warn('[font] Failed to load NotoSans-Subset.ttf:', e.message);
 }
 
 if (!tmpFontPath) {
