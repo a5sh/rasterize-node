@@ -1,142 +1,261 @@
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
-import { Resvg } from "@resvg/resvg-js";
-import { processRequest } from "../../../core/logic.js";
-import { FONT_BUFFER } from "../../lib/font-data.js";
-/**
- * Find all external http(s) image hrefs in the SVG, fetch them,
- * and replace with inline base64 data URIs so resvg-js can render them.
- */
-async function embedExternalImages(svgText) {
-    const regex = /href="(https?:\/\/[^"]+)"/g;
-    const matches = [...svgText.matchAll(regex)];
-    if (matches.length === 0) return svgText;
+// netlify-node/netlify/functions/rasterize.js
+//
+// Netlify serverless function — SVG → raster via @resvg/resvg-js.
+//
+// Aligned with vercel-node/api/vercel.js:
+//   • fontFiles path (not fontBuffers — N-API native requires filesystem)
+//   • Atomic /tmp font write (write-then-ignore-if-exists race)
+//   • Handles { svgText, svgUrl?, format? } single JSON payload
+//   • Handles { jobs: [] } bulk JSON payload
+//   • wsrv.nl fallback on any resvg failure
 
-    const uniqueUrls = [...new Set(matches.map(m => m[1]))];
+import fs               from 'node:fs';
+import os               from 'node:os';
+import path             from 'node:path';
+import { Resvg }        from '@resvg/resvg-js';
+import { FONT_BUFFER }  from '../../lib/font-data.js';
 
-    const replacements = await Promise.all(
-        uniqueUrls.map(async (url) => {
-            try {
-                const res = await fetch(url, {
-                    headers: { "User-Agent": "SpicyDevs-Rasterizer/2.0" },
-                    signal: AbortSignal.timeout(8_000),
-                });
-                if (!res.ok) return { url, dataUri: null };
-                const buf = await res.arrayBuffer();
-                const ct = res.headers.get("content-type") || "image/jpeg";
-                const bytes = new Uint8Array(buf);
-                const CHUNK = 0x8000;
-                let binary = "";
-                for (let i = 0; i < bytes.length; i += CHUNK) {
-                    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
-                }
-                return { url, dataUri: `data:${ct};base64,${btoa(binary)}` };
-            } catch {
-                return { url, dataUri: null };
-            }
-        })
-    );
+// ── Font: write to /tmp once; subsequent invocations reuse the file ──────────
+//
+// @resvg/resvg-js (native N-API) uses fontFiles (filesystem paths), NOT
+// fontBuffers (that option is resvg-wasm only). Write the buffer to /tmp
+// at cold start; use write-then-check to avoid a TOCTOU race between
+// concurrent Lambda invocations.
 
-    for (const { url, dataUri } of replacements) {
-        if (!dataUri) continue;
-        svgText = svgText.split(`href="${url}"`).join(`href="${dataUri}"`);
-    }
+const TMP_FONT_PATH = path.join(os.tmpdir(), 'NotoSans-Subset.ttf');
 
-    return svgText;
+function ensureFont() {
+  try {
+    fs.writeFileSync(TMP_FONT_PATH, FONT_BUFFER);   // overwrite is fine — idempotent
+  } catch (e) {
+    // Only a problem if the file still doesn't exist after the write attempt
+    if (!fs.existsSync(TMP_FONT_PATH)) throw e;
+  }
 }
 
-const CORS_HEADERS = {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type",
+// Initialise once at module load (cold start); does not re-run on warm invocations
+let fontReady = false;
+try {
+  ensureFont();
+  fontReady = true;
+} catch (e) {
+  console.error('[font] Failed to write font to /tmp:', e.message);
+}
+
+// ── resvg options ─────────────────────────────────────────────────────────────
+const RESVG_OPTS = {
+  fitTo:          { mode: 'original' },
+  imageRendering: 0,
+  font: {
+    loadSystemFonts:   false,
+    defaultFontFamily: 'Noto Sans',
+    sansSerifFamily:   'Noto Sans',
+    serifFamily:       'Noto Sans',
+    monospaceFamily:   'Noto Sans',
+    ...(fontReady ? { fontFiles: [TMP_FONT_PATH] } : {}),
+  },
 };
 
-export const handler = async (event, context) => {
-    if (event.httpMethod === "OPTIONS") {
-        return { statusCode: 204, headers: CORS_HEADERS, body: "" };
-    }
+// ── Render helpers ────────────────────────────────────────────────────────────
 
-    const reqUrl = `https://${event.headers.host}${event.path}${
-        event.rawQuery ? "?" + event.rawQuery : ""
-    }`;
-    const bodyText = event.isBase64Encoded
-        ? Buffer.from(event.body, "base64").toString("utf-8")
-        : event.body || "";
+function renderToBuffer(svgText, format) {
+  const resvg    = new Resvg(svgText, RESVG_OPTS);
+  const rendered = resvg.render();
+  if ((format === 'jpg' || format === 'jpeg') && typeof rendered.asJpeg === 'function') {
+    return { buffer: rendered.asJpeg(85), mimeType: 'image/jpeg' };
+  }
+  if (format === 'webp' && typeof rendered.asWebp === 'function') {
+    return { buffer: rendered.asWebp(85), mimeType: 'image/webp' };
+  }
+  return { buffer: rendered.asPng(), mimeType: 'image/png' };
+}
 
-    let processed;
-    try {
-        processed = await processRequest(
-            reqUrl,
-            event.httpMethod,
-            event.headers,
-            async () => bodyText,
-            process.env
-        );
-    } catch (error) {
-        const msg = error instanceof Error ? error.message : String(error);
-        console.error("[rasterize] processRequest error:", msg);
-        return {
-            statusCode: 500,
-            headers: { "Content-Type": "application/json", ...CORS_HEADERS },
-            body: JSON.stringify({ error: msg }),
-        };
-    }
+async function fetchFromWsrv(svgUrl, format) {
+  const url = new URL('https://wsrv.nl/');
+  url.searchParams.set('url',    svgUrl);
+  url.searchParams.set('output', format === 'webp' ? 'webp' : format === 'png' ? 'png' : 'jpg');
+  url.searchParams.set('q',      '100');
+  const ac = new AbortController();
+  const t  = setTimeout(() => ac.abort(), 6_000);
+  try {
+    const res = await fetch(url.toString(), {
+      signal:  ac.signal,
+      headers: { 'User-Agent': 'SpicyDevs-Rasterizer/2.0' },
+    });
+    if (!res.ok) throw new Error(`wsrv.nl returned ${res.status}`);
+    return res;
+  } finally {
+    clearTimeout(t);
+  }
+}
 
-    if (processed.status !== 200 || !processed.svgText) {
-        return {
-            statusCode: processed.status,
-            headers: { "Content-Type": processed.contentType || "text/plain", ...CORS_HEADERS },
-            body: processed.body,
-        };
-    }
+// ── Netlify response helpers ──────────────────────────────────────────────────
 
-    try {
-        const svgText = await embedExternalImages(processed.svgText);
+const CORS = {
+  'Access-Control-Allow-Origin':  '*',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type',
+};
 
-        // Write font to Lambda disk to bypass N-API memory pointer issues
-         const tmpFontPath = path.join(os.tmpdir(), "NotoSans-Subset.ttf");
-        if (!fs.existsSync(tmpFontPath)) {
-            try {
-                fs.writeFileSync(tmpFontPath, FONT_BUFFER);
-            } catch (writeErr) {
-                // Race: another concurrent invocation wrote it first — safe to ignore
-                if (!fs.existsSync(tmpFontPath)) throw writeErr;
-            }
+function jsonResp(statusCode, body) {
+  return {
+    statusCode,
+    headers: { 'Content-Type': 'application/json', ...CORS },
+    body:    JSON.stringify(body),
+  };
+}
+
+function imageResp(buffer, mimeType) {
+  return {
+    statusCode:       200,
+    headers:          { 'Content-Type': mimeType, 'Cache-Control': 'public, max-age=86400', ...CORS },
+    body:             Buffer.from(buffer).toString('base64'),
+    isBase64Encoded:  true,
+  };
+}
+
+// ── Handler ───────────────────────────────────────────────────────────────────
+
+export const handler = async (event) => {
+  // OPTIONS preflight
+  if (event.httpMethod === 'OPTIONS') {
+    return { statusCode: 204, headers: CORS, body: '' };
+  }
+
+  // Health check
+  const pathname = (event.path || '/').split('?')[0];
+  if (pathname === '/health') {
+    return jsonResp(200, {
+      status:     'ok',
+      version:    '2.3',
+      fontReady,
+      fontFile:   TMP_FONT_PATH,
+    });
+  }
+
+  const contentType = event.headers['content-type'] || '';
+
+  // ── JSON path (single or bulk) ─────────────────────────────────────────────
+  if (contentType.includes('application/json')) {
+    const bodyStr = event.isBase64Encoded
+      ? Buffer.from(event.body, 'base64').toString('utf-8')
+      : (event.body || '');
+
+    if (!bodyStr) return jsonResp(400, { error: 'Empty body' });
+
+    let payload;
+    try { payload = JSON.parse(bodyStr); }
+    catch { return jsonResp(400, { error: 'Invalid JSON' }); }
+
+    // ── Single job: { svgText, svgUrl?, format? } ──────────────────────────
+    if (payload.svgText) {
+      const fmt = payload.format || 'png';
+      try {
+        const { buffer, mimeType } = renderToBuffer(payload.svgText, fmt);
+        return imageResp(buffer, mimeType);
+      } catch (resvgErr) {
+        console.error('[resvg] single render failed:', resvgErr.message);
+        const svgFallback = payload.svgUrl || null;
+        if (svgFallback) {
+          try {
+            const wsrvRes = await fetchFromWsrv(svgFallback, fmt);
+            const buf  = Buffer.from(await wsrvRes.arrayBuffer());
+            const mime = wsrvRes.headers.get('content-type') || 'image/png';
+            return imageResp(buf, mime);
+          } catch (wsrvErr) {
+            return jsonResp(502, {
+              error: `resvg: ${resvgErr.message} | wsrv: ${wsrvErr.message}`,
+            });
+          }
         }
-
-        const resvg = new Resvg(svgText, {
-            fitTo: { mode: "original" },
-            font: {
-                loadSystemFonts: false,
-                defaultFontFamily: "Noto Sans",
-                sansSerifFamily: "Noto Sans",
-                serifFamily: "Noto Sans",
-                monospaceFamily: "Noto Sans",
-                fontFiles: [tmpFontPath], // Direct filesystem read
-            },
-            imageRendering: 1,
-        });
-
-        return {
-            statusCode: 200,
-            headers: {
-                "Content-Type": "image/png",
-                "Cache-Control": "public, max-age=86400",
-                ...CORS_HEADERS,
-            },
-            body: Buffer.from(resvg.render().asPng()).toString("base64"),
-            isBase64Encoded: true,
-        };
-    } catch (error) {
-        const msg = error instanceof Error
-            ? error.message
-            : (typeof error === "string" ? error : JSON.stringify(error));
-        console.error("[rasterize] render error:", msg, error?.stack || "");
-        return {
-            statusCode: 500,
-            headers: { "Content-Type": "application/json", ...CORS_HEADERS },
-            body: JSON.stringify({ error: msg }),
-        };
+        return jsonResp(500, { error: resvgErr.message });
+      }
     }
+
+    // ── Bulk path: { jobs: [] } ────────────────────────────────────────────
+    if (!Array.isArray(payload.jobs)) {
+      return jsonResp(400, {
+        error: "Expected { svgText } for single render or { jobs: [] } for bulk",
+      });
+    }
+
+    const results = await Promise.all(payload.jobs.map(async (job) => {
+      const fmt = job.format || 'png';
+      try {
+        const { buffer, mimeType } = renderToBuffer(job.svgText, fmt);
+        return { id: job.id, status: 'success', mimeType, data: Buffer.from(buffer).toString('base64') };
+      } catch (resvgErr) {
+        if (job.svgUrl) {
+          try {
+            const wsrvRes = await fetchFromWsrv(job.svgUrl, fmt);
+            const buf  = Buffer.from(await wsrvRes.arrayBuffer());
+            const mime = wsrvRes.headers.get('content-type') || 'image/png';
+            return { id: job.id, status: 'success', mimeType: mime, data: buf.toString('base64') };
+          } catch (wsrvErr) {
+            return {
+              id:     job.id,
+              status: 'error',
+              error:  `resvg: ${resvgErr.message} | wsrv: ${wsrvErr.message}`,
+            };
+          }
+        }
+        return { id: job.id, status: 'error', error: resvgErr.message };
+      }
+    }));
+
+    return {
+      statusCode: 200,
+      headers:    { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...CORS },
+      body:       JSON.stringify({ results }),
+    };
+  }
+
+  // ── Legacy: GET ?url= or POST raw SVG body ──────────────────────────────
+  const params    = new URLSearchParams(event.rawQuery || '');
+  const format    = params.get('format') || 'png';
+  const svgFallback = params.get('fallback_url') || null;
+
+  let svgText;
+
+  if (event.httpMethod === 'GET') {
+    const targetUrl = params.get('url');
+    if (!targetUrl) return jsonResp(400, { error: 'Missing ?url= parameter' });
+    try {
+      const res = await fetch(targetUrl, {
+        headers: { 'User-Agent': 'SpicyDevs-Rasterizer/2.0' },
+        signal:  AbortSignal.timeout(8_000),
+      });
+      if (!res.ok) return jsonResp(502, { error: `SVG fetch failed: ${res.status}` });
+      svgText = await res.text();
+    } catch (e) {
+      return jsonResp(502, { error: `SVG fetch threw: ${e.message}` });
+    }
+  } else if (event.httpMethod === 'POST') {
+    svgText = event.isBase64Encoded
+      ? Buffer.from(event.body, 'base64').toString('utf-8')
+      : (event.body || '');
+    if (!svgText) return jsonResp(400, { error: 'Empty SVG body' });
+  } else {
+    return jsonResp(405, { error: 'Method not allowed' });
+  }
+
+  try {
+    const { buffer, mimeType } = renderToBuffer(svgText, format);
+    return imageResp(buffer, mimeType);
+  } catch (resvgErr) {
+    console.error('[resvg] legacy render failed:', resvgErr.message);
+    if (svgFallback) {
+      try {
+        const wsrvRes = await fetchFromWsrv(svgFallback, format);
+        const buf  = Buffer.from(await wsrvRes.arrayBuffer());
+        const mime = wsrvRes.headers.get('content-type') || 'image/png';
+        return imageResp(buf, mime);
+      } catch (wsrvErr) {
+        return jsonResp(502, {
+          error: `resvg: ${resvgErr.message} | wsrv: ${wsrvErr.message}`,
+        });
+      }
+    }
+    return jsonResp(500, { error: resvgErr.message });
+  }
 };

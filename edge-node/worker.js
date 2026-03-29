@@ -3,9 +3,102 @@ import resvgWasm from "@resvg/resvg-wasm/index_bg.wasm";
 import fontBuffer from "../core/NotoSans-Subset.ttf";
 import { processRequest } from "../core/logic.js";
 import puppeteer from "@cloudflare/puppeteer";
+// Replace the module-level flag + init block with this:
 
-let wasmInitialized = false;
+let wasmInitialized   = false;
+let wasmInitPromise   = null;   // shared across concurrent cold-start requests
 
+function getWasm() {
+  if (wasmInitialized) return Promise.resolve();
+  if (wasmInitPromise) return wasmInitPromise;
+
+  wasmInitPromise = initWasm(resvgWasm)
+    .then(() => {
+      wasmInitialized = true;
+      console.log('[wasm] resvg-wasm initialised');
+    })
+    .catch((e) => {
+      // Reset so the next request retries — but cap retries via the promise reference
+      wasmInitPromise = null;
+      throw e;
+    });
+
+  return wasmInitPromise;
+}
+
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+
+    // ── Screenshot route — does not need WASM ────────────────────────────────
+    if (url.pathname === '/ss') {
+      return handleScreenshot(request, env);
+    }
+
+    // ── WASM init (once; shared across concurrent requests) ──────────────────
+    try {
+      await getWasm();
+    } catch (e) {
+      console.error('[wasm] init failed:', e.message);
+      return new Response(JSON.stringify({ error: `WASM init failed: ${e.message}` }), {
+        status:  503,
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+      });
+    }
+
+    // ── rest of the existing fetch handler (unchanged) ────────────────────────
+    const getBodyText = async () => await request.text();
+    const processed = await processRequest(
+      request.url, request.method, request.headers, getBodyText, env
+    );
+
+    if (processed.status !== 200 || !processed.svgText) {
+      return new Response(processed.body, {
+        status:  processed.status,
+        headers: { 'Content-Type': processed.contentType || 'text/plain', 'Access-Control-Allow-Origin': '*' },
+      });
+    }
+
+    try {
+      const svgText = await embedExternalImages(processed.svgText);
+
+      const resvgOpts = {
+        fitTo: { mode: 'original' },
+        font:  {
+          loadSystemFonts:   false,
+          defaultFontFamily: 'Noto Sans',
+          fontBuffers:       [new Uint8Array(fontBuffer)],
+        },
+        imageRendering: 1,
+      };
+
+      const resvg     = new Resvg(svgText, resvgOpts);
+      const pngBuffer = resvg.render().asPng();
+
+      const response = new Response(pngBuffer, {
+        status:  200,
+        headers: {
+          'Content-Type':                'image/png',
+          'Cache-Control':               'public, max-age=86400',
+          'Access-Control-Allow-Origin': '*',
+        },
+      });
+
+      if (request.method === 'GET') {
+        ctx.waitUntil(caches.default.put(request, response.clone()));
+      }
+      return response;
+
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      console.error('[rasterize] render error:', msg);
+      return new Response(JSON.stringify({ error: msg }), {
+        status:  500,
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+      });
+    }
+  },
+};
 /**
  * Find all external http(s) image hrefs in the SVG, fetch them,
  * and replace with inline base64 data URIs so resvg-wasm can render them.
@@ -158,79 +251,3 @@ async function handleScreenshot(request, env) {
         if (browser) await browser.close();
     }
 }
-
-export default {
-    async fetch(request, env, ctx) {
-        const url = new URL(request.url);
-
-        // ── Screenshot route ────────────────────────────────────────────────
-        if (url.pathname === "/ss") {
-            return handleScreenshot(request, env);
-        }
-
-        // ── Existing SVG rasterization routes ──────────────────────────────
-        if (!wasmInitialized) {
-            await initWasm(resvgWasm);
-            wasmInitialized = true;
-        }
-
-        const getBodyText = async () => await request.text();
-        const processed = await processRequest(
-            request.url, request.method, request.headers, getBodyText, env
-        );
-
-        if (processed.status !== 200 || !processed.svgText) {
-            return new Response(processed.body, {
-                status: processed.status,
-                headers: {
-                    "Content-Type": processed.contentType || "text/plain",
-                    "Access-Control-Allow-Origin": "*",
-                }
-            });
-        }
-
-        try {
-            const svgText = await embedExternalImages(processed.svgText);
-
-            const resvgOpts = {
-                fitTo: { mode: "original" },
-                font: {
-                    loadSystemFonts: false,
-                    defaultFontFamily: "Noto Sans",
-                },
-                imageRendering: 1,
-            };
-            resvgOpts.font.fontBuffers = [new Uint8Array(fontBuffer)];
-
-            const resvg = new Resvg(svgText, resvgOpts);
-            const pngBuffer = resvg.render().asPng();
-
-            const response = new Response(pngBuffer, {
-                status: 200,
-                headers: {
-                    "Content-Type": "image/png",
-                    "Cache-Control": "public, max-age=86400",
-                    "Access-Control-Allow-Origin": "*",
-                }
-            });
-
-            if (request.method === "GET") {
-                ctx.waitUntil(caches.default.put(request, response.clone()));
-            }
-            return response;
-
-        } catch (error) {
-            const msg = error instanceof Error
-                ? error.message
-                : (typeof error === "string" ? error : JSON.stringify(error));
-            console.error("[rasterize] render error:", msg, error?.stack || "");
-            return new Response(JSON.stringify({ error: msg }), {
-                status: 500,
-                headers: {
-                    "Content-Type": "application/json",
-                    "Access-Control-Allow-Origin": "*",
-                }
-            });
-        }
-    }
-};

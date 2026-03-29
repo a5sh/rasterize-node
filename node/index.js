@@ -195,59 +195,101 @@ const server = http.createServer(async (req, res) => {
     const bodyBuf = req.method === 'POST' ? await readBody(req) : null;
     syncStats();
 
-    // ── Bulk path ─────────────────────────────────────────────────────────────
-    if (req.headers['content-type'] === 'application/json') {
-      if (!bodyBuf?.length) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        return res.end(JSON.stringify({ error: 'Empty body' }));
-      }
+   // ── JSON path (single OR bulk) ────────────────────────────────────────────
+if (req.headers['content-type'] === 'application/json') {
+  if (!bodyBuf?.length) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ error: 'Empty body' }));
+  }
 
-      let payload;
-      try { payload = JSON.parse(bodyBuf); }
-      catch {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        return res.end(JSON.stringify({ error: 'Invalid JSON' }));
-      }
+  let payload;
+  try { payload = JSON.parse(bodyBuf); }
+  catch {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ error: 'Invalid JSON' }));
+  }
 
-      if (!Array.isArray(payload.jobs)) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        return res.end(JSON.stringify({ error: "Expected JSON object with a 'jobs' array" }));
-      }
-
-      const results = await Promise.all(payload.jobs.map(async job => {
-        const t0  = Date.now();
-        const fmt = job.format || 'png';
+  // ── Single job: { svgText, svgUrl?, format? } ───────────────────────────
+  // rasterBalancer.fetchNode() sends this shape for all normal poster requests.
+  if (payload.svgText) {
+    const fmt = payload.format || format || 'png';
+    const t0  = Date.now();
+    try {
+      const { buffer, mimeType } = await pool.render(payload.svgText, fmt);
+      recordJobDuration(Date.now() - t0);
+      syncStats();
+      res.writeHead(200, { 'Content-Type': mimeType, 'Cache-Control': 'public, max-age=86400' });
+      return res.end(buffer);
+    } catch (resvgErr) {
+      recordResvgFail();
+      syncStats();
+      const svgFallback = payload.svgUrl || fallbackUrl;
+      if (svgFallback) {
         try {
-          const { buffer, mimeType } = await pool.render(job.svgText, fmt);
+          recordWsrvFallback();
+          const wsrvRes = await fetchFromWsrv(svgFallback, fmt);
           recordJobDuration(Date.now() - t0);
-          syncStats();
-          return { id: job.id, status: 'success', mimeType, data: buffer.toString('base64') };
-        } catch (resvgErr) {
-          recordResvgFail();
-          if (job.svgUrl) {
-            try {
-              recordWsrvFallback();
-              const wsrvRes = await fetchFromWsrv(job.svgUrl, fmt);
-              recordJobDuration(Date.now() - t0);
-              const buf  = Buffer.from(await wsrvRes.arrayBuffer());
-              const mime = wsrvRes.headers.get('content-type') || 'image/png';
-              return { id: job.id, status: 'success', mimeType: mime, data: buf.toString('base64') };
-            } catch (wsrvErr) {
-              const msg = `resvg: ${resvgErr.message} | wsrv: ${wsrvErr.message}`;
-              await logError('Bulk job failed', msg, [{ name: 'Job ID', value: String(job.id), inline: true }]);
-              return { id: job.id, status: 'error', error: msg };
-            }
-          }
-          await logError('Bulk job failed (no fallback URL)', resvgErr.message, [
-            { name: 'Job ID', value: String(job.id), inline: true },
-          ]);
-          return { id: job.id, status: 'error', error: resvgErr.message };
+          const buf  = Buffer.from(await wsrvRes.arrayBuffer());
+          const mime = wsrvRes.headers.get('content-type') || 'image/png';
+          res.writeHead(200, { 'Content-Type': mime, 'Cache-Control': 'public, max-age=86400' });
+          return res.end(buf);
+        } catch (wsrvErr) {
+          const msg = `resvg: ${resvgErr.message} | wsrv: ${wsrvErr.message}`;
+          await logError('Single JSON job failed', msg, [{ name: 'Format', value: fmt, inline: true }]);
+          res.writeHead(502, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ error: msg }));
         }
-      }));
-
-      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
-      return res.end(JSON.stringify({ results }));
+      }
+      await logError('Single JSON job failed (no fallback)', resvgErr.message, [
+        { name: 'Format', value: fmt, inline: true },
+      ]);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: resvgErr.message }));
     }
+  }
+
+  // ── Bulk path: { jobs: [] } ──────────────────────────────────────────────
+  if (!Array.isArray(payload.jobs)) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({
+      error: "Expected { svgText } for single render or { jobs: [] } for bulk",
+    }));
+  }
+
+  const results = await Promise.all(payload.jobs.map(async job => {
+    const t0  = Date.now();
+    const fmt = job.format || 'png';
+    try {
+      const { buffer, mimeType } = await pool.render(job.svgText, fmt);
+      recordJobDuration(Date.now() - t0);
+      syncStats();
+      return { id: job.id, status: 'success', mimeType, data: buffer.toString('base64') };
+    } catch (resvgErr) {
+      recordResvgFail();
+      if (job.svgUrl) {
+        try {
+          recordWsrvFallback();
+          const wsrvRes = await fetchFromWsrv(job.svgUrl, fmt);
+          recordJobDuration(Date.now() - t0);
+          const buf  = Buffer.from(await wsrvRes.arrayBuffer());
+          const mime = wsrvRes.headers.get('content-type') || 'image/png';
+          return { id: job.id, status: 'success', mimeType: mime, data: buf.toString('base64') };
+        } catch (wsrvErr) {
+          const msg = `resvg: ${resvgErr.message} | wsrv: ${wsrvErr.message}`;
+          await logError('Bulk job failed', msg, [{ name: 'Job ID', value: String(job.id), inline: true }]);
+          return { id: job.id, status: 'error', error: msg };
+        }
+      }
+      await logError('Bulk job failed (no fallback URL)', resvgErr.message, [
+        { name: 'Job ID', value: String(job.id), inline: true },
+      ]);
+      return { id: job.id, status: 'error', error: resvgErr.message };
+    }
+  }));
+
+  res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+  return res.end(JSON.stringify({ results }));
+}
 
     // ── Single path ───────────────────────────────────────────────────────────
     let svgText;
