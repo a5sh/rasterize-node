@@ -1,11 +1,11 @@
 {
-  "name": "rasterize-vps",
+  "name": "euc-r-render",
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "node ../scripts/build.mjs vps",
+    "build": "node ../scripts/build.mjs render",
     "start": "node server.js",
-    "prestart": "node ../scripts/build.mjs vps"
+    "prestart": "node ../scripts/build.mjs render"
   },
   "dependencies": {
     "@resvg/resvg-js": "^2.6.2"

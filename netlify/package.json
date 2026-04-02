@@ -1,9 +1,9 @@
 {
-  "name": "us-r-vercel",
+  "name": "r-netlify",
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "node ../scripts/build.mjs vercel"
+    "build": "node ../scripts/build.mjs netlify"
   },
   "dependencies": {
     "@resvg/resvg-js": "^2.6.2"

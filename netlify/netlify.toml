@@ -1,7 +1,7 @@
 [build]
   # Netlify "Base directory" must be set to "netlify" in the Netlify UI (or netlify.toml base field).
   # Build runs from  repo-root/netlify/  so ../scripts is one level up to repo root.
-  command = "node ../scripts/build.mjs netlify"
+  command = "npm install && node ../scripts/build.mjs netlify"
 
 [functions]
   directory    = "functions"
