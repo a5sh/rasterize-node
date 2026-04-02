@@ -12,19 +12,25 @@
 // output across the whole fleet.
 //
 // This file is copied to {platform}/lib/ by scripts/build.mjs at deploy time.
-// NotoSans-Subset.ttf is copied alongside it so the path.join(__dirname, …)
+// NotoSans-Subset.ttf is copied alongside it so the path.join(_moduleDir, …)
 // reference resolves correctly in both local dev and production bundles.
+//
+// NOTE: We intentionally avoid declaring __dirname here because Lambda/NFT
+// environments inject it as a global in CJS bundles, causing a redeclaration
+// SyntaxError at runtime.
 
 import fs   from 'node:fs';
 import os   from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
+// Use a non-conflicting name so this module is safe in both ESM and
+// NFT-bundled CJS Lambda contexts where __dirname is already a global.
+const _moduleDir = path.dirname(fileURLToPath(import.meta.url));
 
 // Resolved once at module load; null if the font file is missing.
 const FONT_SRC = (() => {
-  const p = path.join(__dirname, 'NotoSans-Subset.ttf');
+  const p = path.join(_moduleDir, 'NotoSans-Subset.ttf');
   try {
     fs.accessSync(p, fs.constants.R_OK);
     return p;
