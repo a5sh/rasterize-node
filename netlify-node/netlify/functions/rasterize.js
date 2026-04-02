@@ -10,7 +10,7 @@ import os               from 'node:os';
 import path             from 'node:path';
 import { Resvg }        from '@resvg/resvg-js';
 import { FONT_BUFFER }  from '../../lib/font-data.js';
-import { applyFauxBold } from '../../core/fauxBold.js';
+import { applyFauxBold } from '../../lib/fauxBold.js';
 
 // ── Font setup ────────────────────────────────────────────────────────────────
 const TMP_FONT_PATH = path.join(os.tmpdir(), 'NotoSans-Subset.ttf');
