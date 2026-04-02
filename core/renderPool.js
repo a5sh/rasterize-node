@@ -2,24 +2,15 @@
 //
 // Fixed-size pool of worker_threads for CPU-bound SVG → raster rendering.
 //
-// ── Package resolution ────────────────────────────────────────────────────────
-// renderWorker.js lives in core/ but node_modules/ is in render-node/ (or node/).
-// We pass serverDir (the calling server's __dirname) via workerData so the
-// worker can use createRequire(serverDir) to find @resvg/resvg-js correctly.
+// Constructor:  new RenderPool(workerPath, serverDir, size, resvgOpts)
 //
-// Constructor signature:
-//   new RenderPool(workerPath, serverDir, size, resvgOpts)
-//
-//   workerPath — absolute path to core/renderWorker.js
-//   serverDir  — dirname(fileURLToPath(import.meta.url)) from server.js/index.js
+//   workerPath — absolute path to core/renderWorker.js (or lib/renderWorker.js)
+//   serverDir  — dirname of the calling server file so workers can resolve
+//                @resvg/resvg-js from the correct node_modules via createRequire
 //   size       — number of worker threads (= MAX_CONCURRENT)
-//   resvgOpts  — serialisable font/render config
+//   resvgOpts  — serialisable font/render config from sharedRender.buildResvgOpts()
 //
-// ── Crash-restart backoff ─────────────────────────────────────────────────────
-// Without backoff, a broken import causes instant respawn → spawn storm → OOM.
-// Each worker slot gets exponential backoff: 200ms → 400ms → … → 30s cap.
-// Workers that stay alive >5s reset their failure count on next crash.
-// MAX_PENDING_RESPAWNS=2 hard-caps queued respawns across all slots.
+// Crash-restart uses exponential backoff (200 ms → 30 s) to prevent spawn storms.
 
 import { Worker } from 'node:worker_threads';
 
@@ -50,10 +41,7 @@ export class RenderPool {
   _spawn(slot) {
     const spawnedAt = Date.now();
     const w = new Worker(this._workerPath, {
-      workerData: {
-        resvgOpts: this._resvgOpts,
-        serverDir: this._serverDir,  // ← passed to createRequire in worker
-      },
+      workerData: { resvgOpts: this._resvgOpts, serverDir: this._serverDir },
     });
     w._busy = false;
     w._wid  = ++this._seq;

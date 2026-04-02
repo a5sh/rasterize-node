@@ -1,0 +1,12 @@
+{
+  "buildCommand": "node ../../scripts/build.mjs vercel",
+  "rewrites": [
+    { "source": "/(.*)", "destination": "/api/rasterize" }
+  ],
+  "functions": {
+    "api/rasterize.js": {
+      "maxDuration": 10,
+      "includeFiles": "lib/**"
+    }
+  }
+}
