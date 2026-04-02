@@ -1,10 +1,13 @@
 [build]
-  base    = "netlify-node"
-  command = "node ../scripts/embed-font.mjs lib/font-data.js"
+  # Netlify "Base directory" must be set to "netlify" in the Netlify UI (or netlify.toml base field).
+  # Build runs from  repo-root/netlify/  so ../scripts is one level up to repo root.
+  command = "node ../scripts/build.mjs netlify"
 
 [functions]
-  directory    = "netlify/functions"
+  directory    = "functions"
   node_bundler = "nft"
+  # Tell NFT to include the TTF so sharedRender.js can read it at lambda runtime.
+  included_files = ["lib/NotoSans-Subset.ttf"]
 
 [[redirects]]
   from   = "/*"

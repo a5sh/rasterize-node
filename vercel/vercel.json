@@ -1,5 +1,5 @@
 {
-  "buildCommand": "node ../../scripts/build.mjs vercel",
+  "buildCommand": "node ../scripts/build.mjs vercel",
   "rewrites": [
     { "source": "/(.*)", "destination": "/api/rasterize" }
   ],

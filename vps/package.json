@@ -1,9 +1,11 @@
 {
-  "name": "rasterize-node",
+  "name": "rasterize-vps",
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node index.js"
+    "build": "node ../scripts/build.mjs vps",
+    "start": "node server.js",
+    "prestart": "node ../scripts/build.mjs vps"
   },
   "dependencies": {
     "@resvg/resvg-js": "^2.6.2"
