@@ -1,6 +1,8 @@
+// core/logic.js
+import { applyFauxBold } from './fauxBold.js';
+
 const ALLOWED_HOSTS = ["api.spicydevs.xyz", "posters.spicydevs.xyz", "rpdb.padhaiaayush.workers.dev"];
 
-// core/logic.js
 export async function processRequest(reqUrl, method, headers, getBodyText, env) {
     const url = new URL(reqUrl);
 
@@ -13,12 +15,11 @@ export async function processRequest(reqUrl, method, headers, getBodyText, env) 
     if (method === "POST") {
         svgText = await getBodyText();
         if (!svgText) return { status: 400, body: "Empty SVG body", contentType: "text/plain" };
-    } 
+    }
     else if (method === "GET") {
         const targetSvgUrl = url.searchParams.get("url");
         if (!targetSvgUrl) return { status: 400, body: "Missing ?url= parameter", contentType: "text/plain" };
 
-        const targetUrlObj = new URL(targetSvgUrl);
         const svgRes = await fetch(targetSvgUrl, { headers: { "User-Agent": "SpicyDevs-Rasterizer/2.0" } });
         if (!svgRes.ok) throw new Error(`SVG fetch failed: ${svgRes.status}`);
         svgText = await svgRes.text();
@@ -26,26 +27,11 @@ export async function processRequest(reqUrl, method, headers, getBodyText, env) 
         return { status: 405, body: "Method not allowed", contentType: "text/plain" };
     }
 
-    // --- NEW: Faux Bold Synthesis ---
-    // Safely parse text tags requesting bold weights (600-900 or 'bold')
-    // --- UPDATED: Faux Bold Synthesis ---
-    svgText = svgText.replace(
-        /(<text[^>]*?)(>.*?<\/text>)/gi,
-        (match, openingTag, innerText) => {
-            const isBold = /font-weight=["']?(bold|bolder|[6-9]00)["']?/i.test(openingTag);
-            if (!isBold) return match;
-
-            const fillMatch = openingTag.match(/fill=["']([^"']+)["']/i);
-            
-            if (fillMatch && !openingTag.includes('stroke=')) {
-                const fillStr = fillMatch[1];
-                // 1. stroke-width="0.08em": Dynamically scales thickness (8% of font size). Adjust 0.08 to 0.1 for extreme bold.
-                // 2. paint-order="stroke fill": Draws stroke UNDER the fill, preserving letter integrity.
-                openingTag += ` stroke="${fillStr}" stroke-width="0.08em" stroke-linejoin="round" paint-order="stroke fill"`;
-            }
-            return openingTag + innerText;
-        }
-    );
+    // --- Faux Bold Synthesis ---
+    // The edge-node ships only NotoSans-Regular.ttf (no bold variant).
+    // applyFauxBold() adds a calibrated stroke (0.035em) that visually
+    // matches librsvg/wsrv.nl's genuine bold rendering without over-bolding.
+    svgText = applyFauxBold(svgText);
 
     return { status: 200, svgText };
 }

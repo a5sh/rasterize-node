@@ -1,39 +1,28 @@
 // netlify-node/netlify/functions/rasterize.js
 //
-// Netlify serverless function — SVG → raster via @resvg/resvg-js.
-//
-// Aligned with vercel-node/api/vercel.js:
-//   • fontFiles path (not fontBuffers — N-API native requires filesystem)
-//   • Atomic /tmp font write (write-then-ignore-if-exists race)
-//   • Handles { svgText, svgUrl?, format? } single JSON payload
-//   • Handles { jobs: [] } bulk JSON payload
-//   • wsrv.nl fallback on any resvg failure
+// CHANGES vs previous version
+// ─────────────────────────────
+// • FAUX BOLD: applyFauxBold() applied before every renderToBuffer() call.
+//   NotoSans-Subset.ttf is Regular-only; without this, bold text renders thin.
 
 import fs               from 'node:fs';
 import os               from 'node:os';
 import path             from 'node:path';
 import { Resvg }        from '@resvg/resvg-js';
 import { FONT_BUFFER }  from '../../lib/font-data.js';
+import { applyFauxBold } from '../../core/fauxBold.js';
 
-// ── Font: write to /tmp once; subsequent invocations reuse the file ──────────
-//
-// @resvg/resvg-js (native N-API) uses fontFiles (filesystem paths), NOT
-// fontBuffers (that option is resvg-wasm only). Write the buffer to /tmp
-// at cold start; use write-then-check to avoid a TOCTOU race between
-// concurrent Lambda invocations.
-
+// ── Font setup ────────────────────────────────────────────────────────────────
 const TMP_FONT_PATH = path.join(os.tmpdir(), 'NotoSans-Subset.ttf');
 
 function ensureFont() {
   try {
-    fs.writeFileSync(TMP_FONT_PATH, FONT_BUFFER);   // overwrite is fine — idempotent
+    fs.writeFileSync(TMP_FONT_PATH, FONT_BUFFER);
   } catch (e) {
-    // Only a problem if the file still doesn't exist after the write attempt
     if (!fs.existsSync(TMP_FONT_PATH)) throw e;
   }
 }
 
-// Initialise once at module load (cold start); does not re-run on warm invocations
 let fontReady = false;
 try {
   ensureFont();
@@ -42,7 +31,6 @@ try {
   console.error('[font] Failed to write font to /tmp:', e.message);
 }
 
-// ── resvg options ─────────────────────────────────────────────────────────────
 const RESVG_OPTS = {
   fitTo:          { mode: 'original' },
   imageRendering: 0,
@@ -59,7 +47,9 @@ const RESVG_OPTS = {
 // ── Render helpers ────────────────────────────────────────────────────────────
 
 function renderToBuffer(svgText, format) {
-  const resvg    = new Resvg(svgText, RESVG_OPTS);
+  // Apply faux bold before rendering — netlify ships Regular TTF only.
+  const processedSvg = applyFauxBold(svgText);
+  const resvg    = new Resvg(processedSvg, RESVG_OPTS);
   const rendered = resvg.render();
   if ((format === 'jpg' || format === 'jpeg') && typeof rendered.asJpeg === 'function') {
     return { buffer: rendered.asJpeg(85), mimeType: 'image/jpeg' };
@@ -89,8 +79,6 @@ async function fetchFromWsrv(svgUrl, format) {
   }
 }
 
-// ── Netlify response helpers ──────────────────────────────────────────────────
-
 const CORS = {
   'Access-Control-Allow-Origin':  '*',
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
@@ -117,25 +105,18 @@ function imageResp(buffer, mimeType) {
 // ── Handler ───────────────────────────────────────────────────────────────────
 
 export const handler = async (event) => {
-  // OPTIONS preflight
   if (event.httpMethod === 'OPTIONS') {
     return { statusCode: 204, headers: CORS, body: '' };
   }
 
-  // Health check
   const pathname = (event.path || '/').split('?')[0];
   if (pathname === '/health') {
-    return jsonResp(200, {
-      status:     'ok',
-      version:    '2.3',
-      fontReady,
-      fontFile:   TMP_FONT_PATH,
-    });
+    return jsonResp(200, { status: 'ok', version: '2.3', fontReady, fontFile: TMP_FONT_PATH });
   }
 
   const contentType = event.headers['content-type'] || '';
 
-  // ── JSON path (single or bulk) ─────────────────────────────────────────────
+  // ── JSON path ─────────────────────────────────────────────────────────────
   if (contentType.includes('application/json')) {
     const bodyStr = event.isBase64Encoded
       ? Buffer.from(event.body, 'base64').toString('utf-8')
@@ -147,7 +128,7 @@ export const handler = async (event) => {
     try { payload = JSON.parse(bodyStr); }
     catch { return jsonResp(400, { error: 'Invalid JSON' }); }
 
-    // ── Single job: { svgText, svgUrl?, format? } ──────────────────────────
+    // Single job
     if (payload.svgText) {
       const fmt = payload.format || 'png';
       try {
@@ -163,20 +144,16 @@ export const handler = async (event) => {
             const mime = wsrvRes.headers.get('content-type') || 'image/png';
             return imageResp(buf, mime);
           } catch (wsrvErr) {
-            return jsonResp(502, {
-              error: `resvg: ${resvgErr.message} | wsrv: ${wsrvErr.message}`,
-            });
+            return jsonResp(502, { error: `resvg: ${resvgErr.message} | wsrv: ${wsrvErr.message}` });
           }
         }
         return jsonResp(500, { error: resvgErr.message });
       }
     }
 
-    // ── Bulk path: { jobs: [] } ────────────────────────────────────────────
+    // Bulk
     if (!Array.isArray(payload.jobs)) {
-      return jsonResp(400, {
-        error: "Expected { svgText } for single render or { jobs: [] } for bulk",
-      });
+      return jsonResp(400, { error: 'Expected { svgText } for single render or { jobs: [] } for bulk' });
     }
 
     const results = await Promise.all(payload.jobs.map(async (job) => {
@@ -192,11 +169,7 @@ export const handler = async (event) => {
             const mime = wsrvRes.headers.get('content-type') || 'image/png';
             return { id: job.id, status: 'success', mimeType: mime, data: buf.toString('base64') };
           } catch (wsrvErr) {
-            return {
-              id:     job.id,
-              status: 'error',
-              error:  `resvg: ${resvgErr.message} | wsrv: ${wsrvErr.message}`,
-            };
+            return { id: job.id, status: 'error', error: `resvg: ${resvgErr.message} | wsrv: ${wsrvErr.message}` };
           }
         }
         return { id: job.id, status: 'error', error: resvgErr.message };
@@ -205,14 +178,14 @@ export const handler = async (event) => {
 
     return {
       statusCode: 200,
-      headers:    { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...CORS },
-      body:       JSON.stringify({ results }),
+      headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...CORS },
+      body: JSON.stringify({ results }),
     };
   }
 
-  // ── Legacy: GET ?url= or POST raw SVG body ──────────────────────────────
-  const params    = new URLSearchParams(event.rawQuery || '');
-  const format    = params.get('format') || 'png';
+  // ── Legacy: GET ?url= or POST raw SVG body ────────────────────────────────
+  const params      = new URLSearchParams(event.rawQuery || '');
+  const format      = params.get('format') || 'png';
   const svgFallback = params.get('fallback_url') || null;
 
   let svgText;
@@ -251,9 +224,7 @@ export const handler = async (event) => {
         const mime = wsrvRes.headers.get('content-type') || 'image/png';
         return imageResp(buf, mime);
       } catch (wsrvErr) {
-        return jsonResp(502, {
-          error: `resvg: ${resvgErr.message} | wsrv: ${wsrvErr.message}`,
-        });
+        return jsonResp(502, { error: `resvg: ${resvgErr.message} | wsrv: ${wsrvErr.message}` });
       }
     }
     return jsonResp(500, { error: resvgErr.message });
