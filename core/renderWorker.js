@@ -48,6 +48,8 @@ try {
 
 const EXTERNAL_IMG_RE = /href="(https?:\/\/[^"]+)"/g;
 const FETCH_TIMEOUT_MS = 6_000;
+// In embedExternalImages(), replace the fetch call with:
+import { getCachedPoster, setCachedPoster } from './cache.js';
 
 async function embedExternalImages(svgText) {
   const matches = [...svgText.matchAll(EXTERNAL_IMG_RE)];
@@ -57,18 +59,25 @@ async function embedExternalImages(svgText) {
 
   const replacements = await Promise.all(
     uniqueUrls.map(async url => {
+      // Check poster cache first
+      const cached = getCachedPoster(url);
+      if (cached) {
+        return { url, dataUri: `data:${cached.ct};base64,${cached.data.toString('base64')}` };
+      }
+
       const ac = new AbortController();
       const t  = setTimeout(() => ac.abort(), FETCH_TIMEOUT_MS);
       try {
-        const res = await fetch(url, {
-          signal:  ac.signal,
-          headers: { 'User-Agent': 'SpicyDevs-Rasterizer/4.0' },
-        });
+        const res = await fetch(url, { signal: ac.signal, headers: { 'User-Agent': 'SpicyDevs-Rasterizer/4.0' } });
         clearTimeout(t);
         if (!res.ok) return { url, dataUri: null };
 
-        const buf = Buffer.from(await res.arrayBuffer());
-        const ct  = res.headers.get('content-type') || 'image/jpeg';
+        const buf  = Buffer.from(await res.arrayBuffer());
+        const ct   = res.headers.get('content-type') || 'image/jpeg';
+
+        // Cache the poster
+        setCachedPoster(url, buf, ct);
+
         return { url, dataUri: `data:${ct};base64,${buf.toString('base64')}` };
       } catch {
         clearTimeout(t);
@@ -78,38 +87,48 @@ async function embedExternalImages(svgText) {
   );
 
   for (const { url, dataUri } of replacements) {
-    if (dataUri) {
-      svgText = svgText.split(`href="${url}"`).join(`href="${dataUri}"`);
-    }
+    if (dataUri) svgText = svgText.split(`href="${url}"`).join(`href="${dataUri}"`);
   }
   return svgText;
 }
 
 // ── Message handler ───────────────────────────────────────────────────────────
+// In renderWorker.js message handler:
+
+const _renderCache = new Map();        // svgHash:format → { png: Buffer, mime: string, expiry: number }
+const RENDER_CACHE_TTL  = 3 * 60_000; // 3 minutes
+const MAX_RENDER_CACHE  = 50;          // 50 cached renders
 
 parentPort.on('message', async ({ jobId, svgText, format }) => {
   try {
-    // Step 1: embed external poster images (no-op if already base64)
-    const embedded = await embedExternalImages(svgText);
+    const svgHash  = crypto.createHash('sha1').update(svgText + format).digest('hex').slice(0, 16);
+    const cached   = _renderCache.get(svgHash);
 
-    // Step 2: apply faux bold
+    if (cached && Date.now() < cached.expiry) {
+      const ab = cached.png.buffer.slice(cached.png.byteOffset, cached.png.byteOffset + cached.png.byteLength);
+      parentPort.postMessage({ jobId, buffer: ab, mimeType: cached.mime }, [ab]);
+      return;
+    }
+
+    const embedded  = await embedExternalImages(svgText);
     const processed = applyFauxBold(embedded);
-
-    // Step 3: render
-    const resvg    = new Resvg(processed, OPTS);
-    const rendered = resvg.render();
+    const resvg     = new Resvg(processed, OPTS);
+    const rendered  = resvg.render();
 
     let buf, mime;
     if ((format === 'jpg' || format === 'jpeg') && typeof rendered.asJpeg === 'function') {
-      buf  = rendered.asJpeg(85);
-      mime = 'image/jpeg';
+      buf = rendered.asJpeg(85); mime = 'image/jpeg';
     } else if (format === 'webp' && typeof rendered.asWebp === 'function') {
-      buf  = rendered.asWebp(85);
-      mime = 'image/webp';
+      buf = rendered.asWebp(85); mime = 'image/webp';
     } else {
-      buf  = rendered.asPng();
-      mime = 'image/png';
+      buf = rendered.asPng(); mime = 'image/png';
     }
+
+    // Store in render cache
+    if (_renderCache.size >= MAX_RENDER_CACHE) {
+      _renderCache.delete(_renderCache.keys().next().value);
+    }
+    _renderCache.set(svgHash, { png: buf, mime, expiry: Date.now() + RENDER_CACHE_TTL });
 
     const ab = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
     parentPort.postMessage({ jobId, buffer: ab, mimeType: mime }, [ab]);
