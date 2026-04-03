@@ -23,9 +23,36 @@ import { buildResvgOpts } from '../lib/sharedRender.js';
 const RESVG_OPTS = buildResvgOpts();
 
 // ── Render ────────────────────────────────────────────────────────────────────
+// Add the embed helper below `const RESVG_OPTS = buildResvgOpts();`
+async function embedExternalImages(svgText) {
+  const matches = [...svgText.matchAll(/href="(https?:\/\/[^"]+)"/g)];
+  if (matches.length === 0) return svgText;
 
-function renderToBuffer(svgText, format) {
-  const processed = applyFauxBold(svgText);
+  const uniqueUrls = [...new Set(matches.map(m => m[1]))];
+  const replacements = await Promise.all(
+    uniqueUrls.map(async url => {
+      try {
+        const res = await fetch(url, { signal: AbortSignal.timeout(6000), headers: { 'User-Agent': 'SpicyDevs-Rasterizer/4.0' } });
+        if (!res.ok) return { url, dataUri: null };
+        const buf = Buffer.from(await res.arrayBuffer());
+        const ct = res.headers.get('content-type') || 'image/jpeg';
+        return { url, dataUri: `data:${ct};base64,${buf.toString('base64')}` };
+      } catch {
+        return { url, dataUri: null };
+      }
+    })
+  );
+
+  for (const { url, dataUri } of replacements) {
+    if (dataUri) svgText = svgText.split(`href="${url}"`).join(`href="${dataUri}"`);
+  }
+  return svgText;
+}
+
+// Update `renderToBuffer`:
+async function renderToBuffer(svgText, format) {
+  const embedded  = await embedExternalImages(svgText);
+  const processed = applyFauxBold(embedded);
   const resvg     = new Resvg(processed, RESVG_OPTS);
   const rendered  = resvg.render();
   if ((format === 'jpg' || format === 'jpeg') && typeof rendered.asJpeg === 'function') {
@@ -96,7 +123,7 @@ export const handler = async (event) => {
     if (payload.svgText) {
       const fmt = payload.format || format;
       try {
-        const { buffer, mimeType } = renderToBuffer(payload.svgText, fmt);
+        const { buffer, mimeType } = await renderToBuffer(payload.svgText, fmt);
         return imageResp(buffer, mimeType);
       } catch (resvgErr) {
         if (payload.svgUrl) {
@@ -121,7 +148,7 @@ export const handler = async (event) => {
     const results = await Promise.all(payload.jobs.map(async job => {
       const fmt = job.format || 'png';
       try {
-        const { buffer, mimeType } = renderToBuffer(job.svgText, fmt);
+        const { buffer, mimeType } = await renderToBuffer(job.svgText, fmt);
         return { id: job.id, status: 'success', mimeType, data: Buffer.from(buffer).toString('base64') };
       } catch (resvgErr) {
         if (job.svgUrl) {
@@ -162,7 +189,7 @@ export const handler = async (event) => {
   }
 
   try {
-    const { buffer, mimeType } = renderToBuffer(svgText, format);
+    const { buffer, mimeType } = await renderToBuffer(svgText, format);
     return imageResp(buffer, mimeType);
   } catch (resvgErr) {
     const fallback = params.get('fallback_url');

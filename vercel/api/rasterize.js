@@ -17,10 +17,36 @@ import { buildResvgOpts } from '../lib/sharedRender.js';
 
 const RESVG_OPTS = buildResvgOpts();
 
-// ── Render helpers ────────────────────────────────────────────────────────────
+// Add this helper function below `const RESVG_OPTS = buildResvgOpts();`
+async function embedExternalImages(svgText) {
+  const matches = [...svgText.matchAll(/href="(https?:\/\/[^"]+)"/g)];
+  if (matches.length === 0) return svgText;
 
-function renderToBuffer(svgText, format) {
-  const processed = applyFauxBold(svgText);
+  const uniqueUrls = [...new Set(matches.map(m => m[1]))];
+  const replacements = await Promise.all(
+    uniqueUrls.map(async url => {
+      try {
+        const res = await fetch(url, { signal: AbortSignal.timeout(6000), headers: { 'User-Agent': 'SpicyDevs-Rasterizer/4.0' } });
+        if (!res.ok) return { url, dataUri: null };
+        const buf = Buffer.from(await res.arrayBuffer());
+        const ct = res.headers.get('content-type') || 'image/jpeg';
+        return { url, dataUri: `data:${ct};base64,${buf.toString('base64')}` };
+      } catch {
+        return { url, dataUri: null };
+      }
+    })
+  );
+
+  for (const { url, dataUri } of replacements) {
+    if (dataUri) svgText = svgText.split(`href="${url}"`).join(`href="${dataUri}"`);
+  }
+  return svgText;
+}
+
+// Modify `renderToBuffer` to be async:
+async function renderToBuffer(svgText, format) {
+  const embedded  = await embedExternalImages(svgText);
+  const processed = applyFauxBold(embedded);
   const resvg     = new Resvg(processed, RESVG_OPTS);
   const rendered  = resvg.render();
   if ((format === 'jpg' || format === 'jpeg') && typeof rendered.asJpeg === 'function') {
@@ -66,7 +92,7 @@ function streamBuffer(res, buffer, mimeType) {
 
 async function handleSingleJob(svgText, svgUrl, format, res) {
   try {
-    const { buffer, mimeType } = renderToBuffer(svgText, format);
+    const { buffer, mimeType } = await renderToBuffer(svgText, format);
     streamBuffer(res, buffer, mimeType);
   } catch (resvgErr) {
     if (svgUrl) {
@@ -146,7 +172,7 @@ const server = http.createServer(async (req, res) => {
         const batch = await Promise.all(slice.map(async job => {
           const fmt = job.format || 'png';
           try {
-            const { buffer, mimeType } = renderToBuffer(job.svgText, fmt);
+            const { buffer, mimeType } = await renderToBuffer(job.svgText, fmt);
             return { id: job.id, status: 'success', mimeType, data: buffer.toString('base64') };
           } catch (resvgErr) {
             if (job.svgUrl) {
