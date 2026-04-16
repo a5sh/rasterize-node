@@ -12,6 +12,7 @@ import path, { dirname, join }  from 'node:path';
 import { fileURLToPath }        from 'node:url';
 import { RenderPool }           from './lib/renderPool.js';
 import { buildResvgOpts }       from './lib/sharedRender.js';
+import { generatePosterFromBackdrop } from './lib/b2p.js';
 import {
   stats, logError, notifyOnline, notifyOffline,
   recordRequest, recordJobDuration, recordResvgFail, recordWsrvFallback,
@@ -32,10 +33,11 @@ async function fetchFromWsrv(svgUrl, format) {
   const t  = setTimeout(() => ac.abort(), 6_000);
   try {
     const res = await fetch(u.toString(), { signal: ac.signal, headers: { 'User-Agent': 'SpicyDevs-Rasterizer/3.0' } });
-    clearTimeout(t);
     if (!res.ok) throw new Error(`wsrv.nl returned ${res.status}`);
     return res;
-  } catch (e) { clearTimeout(t); throw e; }
+  } finally {
+    clearTimeout(t);
+  }
 }
 
 function readBody(req) {
@@ -95,6 +97,34 @@ const server = http.createServer(async (req, res) => {
     const bodyBuf     = req.method === 'POST' ? await readBody(req) : null;
     syncStats();
 
+    // ── Backdrop to Poster Route ────────────────────────────────────────────
+    if (pathname === '/b2p') {
+      let imageUrl = params.get('url');
+
+      if (req.method === 'POST') {
+        if (req.headers['content-type']?.includes('application/json')) {
+          try { imageUrl = JSON.parse(bodyBuf).url || imageUrl; } catch {}
+        } else if (bodyBuf?.length) {
+          imageUrl = bodyBuf.toString('utf8').trim() || imageUrl;
+        }
+      }
+
+      if (!imageUrl) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: 'Missing url parameter or body content' }));
+      }
+
+      const t0 = Date.now();
+      const { buffer, mimeType } = await generatePosterFromBackdrop(imageUrl, format);
+
+      recordJobDuration(Date.now() - t0);
+      syncStats();
+
+      res.writeHead(200, { 'Content-Type': mimeType, 'Cache-Control': 'public, max-age=86400' });
+      return res.end(buffer);
+    }
+
+    // ── JSON path ───────────────────────────────────────────────────────────
     if (req.headers['content-type'] === 'application/json') {
       if (!bodyBuf?.length) { res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ error: 'Empty body' })); }
       let payload;
@@ -165,6 +195,7 @@ const server = http.createServer(async (req, res) => {
       return res.end(JSON.stringify({ results }));
     }
 
+    // ── Legacy path ─────────────────────────────────────────────────────────
     let svgText;
     if (req.method === 'POST') {
       if (!bodyBuf?.length) { res.writeHead(400, { 'Content-Type': 'text/plain' }); return res.end('Empty SVG body'); }
