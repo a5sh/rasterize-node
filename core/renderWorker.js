@@ -1,21 +1,9 @@
-// core/renderWorker.js
-//
-// Worker thread: SVG → raster via @resvg/resvg-js.
-//
-// KEY CHANGE: Message handler is now async to support embedExternalImages().
-// When the SVG contains href="https://..." image references (URL-based poster),
-// we fetch and embed them as base64 before passing to resvg, which cannot
-// resolve external URLs on its own.
-//
-// This keeps the HTTP transfer from CF Worker → rasterizer tiny (~5-10KB SVG
-// instead of 300-600KB with base64-embedded poster), and the rasterizer fetches
-// the poster image directly from TMDB's CDN which is globally distributed.
-//
-// FAUX BOLD is applied here so all pool-based platforms are covered.
+// core/renderWorker.js — corrected import order
 
 import { createRequire }          from 'node:module';
 import { workerData, parentPort } from 'node:worker_threads';
 import { applyFauxBold }          from './fauxBold.js';
+import { getCachedPoster, setCachedPoster } from './cache.js';  // ← moved here
 
 const _require  = createRequire(workerData.serverDir + '/_.js');
 const { Resvg } = _require('@resvg/resvg-js');
@@ -48,9 +36,6 @@ try {
 
 const EXTERNAL_IMG_RE = /href="(https?:\/\/[^"]+)"/g;
 const FETCH_TIMEOUT_MS = 6_000;
-// In embedExternalImages(), replace the fetch call with:
-import { getCachedPoster, setCachedPoster } from './cache.js';
-
 async function embedExternalImages(svgText) {
   const matches = [...svgText.matchAll(EXTERNAL_IMG_RE)];
   if (matches.length === 0) return svgText;
