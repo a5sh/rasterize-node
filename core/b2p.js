@@ -31,17 +31,19 @@ export async function generatePosterFromBackdrop(imageUrl, format = 'jpeg') {
   const outputFormat = format === 'png' ? 'png' : format === 'webp' ? 'webp' : 'jpeg';
 
   // 2. Process via sharp using attention-based smart cropping
-  const buffer = await sharp(imgBuffer)
+   const buffer = await sharp(imgBuffer)
     .resize({
       width: 500,
       height: 750,
       fit: sharp.fit.cover,
       position: sharp.strategy.attention,
-      withoutEnlargement: true // Protects against upscaling blur on low-res inputs
+      // withoutEnlargement intentionally removed:
+      // small backdrops (< 750px tall) must be upscaled to fill 500×750.
     })
-    .toFormat(outputFormat, { quality: 85, progressive: true })
+    .toFormat(outputFormat, { quality: 85 })
+    // progressive: true removed — interlaced JPEG renders scan lines
+    // top-to-bottom in browsers, which looks broken for on-the-fly output.
     .toBuffer();
-
   const result = { buffer, mimeType: `image/${outputFormat}` };
 
   // 3. Update LRU Cache
