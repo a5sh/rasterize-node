@@ -6,7 +6,7 @@
 // WASM is initialised once at module load (Lambda cold start) via a
 // Promise; subsequent warm invocations skip re-init.
 
-import { initWasm, Resvg } from '@resvg/resvg-wasm';
+import { initWasm, Resvg } from '@resvg/resvg-js';
 import { readFileSync }     from 'node:fs';
 import { dirname, join }    from 'node:path';
 import { fileURLToPath }    from 'node:url';
