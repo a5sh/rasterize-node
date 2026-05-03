@@ -1,232 +1,201 @@
 // vercel/api/rasterize.js
 //
-// Vercel Serverless Function — SVG → raster via @resvg/resvg-js.
+// FIXED v5 — Proper Vercel serverless handler.
+// The previous version called http.createServer() which Vercel's runtime
+// never invokes — it expects an exported default async function.
 //
-// lib/ is populated by vercelBuild (see package.json / vercel.json) which runs:
-//   node ../../scripts/build.mjs vercel
+// Handler contract:
+//   export default async function handler(req, res)
+//   req = Node.js IncomingMessage  (has .method, .url, .headers)
+//   res = Node.js ServerResponse   (writeHead / end)
 //
-// FONT + BOLD STRATEGY (same on every platform)
-// ──────────────────────────────────────────────
-// • NotoSans-Subset.ttf (Regular only) via sharedRender.buildResvgOpts().
-// • applyFauxBold() synthesises bold via 0.035em stroke — matches wsrv.nl.
+// Accepts the same wire protocol as every other node in the fleet:
+//   POST /             raw SVG body  (Content-Type: image/svg+xml)
+//   POST /             JSON body     (Content-Type: application/json)
+//   GET  /?url=<url>   fetch+render
+//   GET  /health
 
-import http              from 'node:http';
 import { Resvg }         from '@resvg/resvg-js';
-import { applyFauxBold }  from '../lib/fauxBold.js';
+import { applyFauxBold } from '../lib/fauxBold.js';
 import { buildResvgOpts } from '../lib/sharedRender.js';
 
 const RESVG_OPTS = buildResvgOpts();
 
-// Add this helper function below `const RESVG_OPTS = buildResvgOpts();`
+// ── Vercel function config ────────────────────────────────────────────────────
+export const config = { maxDuration: 10 };
+
+// ── CORS headers ──────────────────────────────────────────────────────────────
+const CORS = {
+  'Access-Control-Allow-Origin':  '*',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, X-Format',
+};
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
 async function embedExternalImages(svgText) {
   const matches = [...svgText.matchAll(/href="(https?:\/\/[^"]+)"/g)];
-  if (matches.length === 0) return svgText;
-
-  const uniqueUrls = [...new Set(matches.map(m => m[1]))];
-  const replacements = await Promise.all(
-    uniqueUrls.map(async url => {
-      try {
-        const res = await fetch(url, { signal: AbortSignal.timeout(6000), headers: { 'User-Agent': 'SpicyDevs-Rasterizer/4.0' } });
-        if (!res.ok) return { url, dataUri: null };
-        const buf = Buffer.from(await res.arrayBuffer());
-        const ct = res.headers.get('content-type') || 'image/jpeg';
-        return { url, dataUri: `data:${ct};base64,${buf.toString('base64')}` };
-      } catch {
-        return { url, dataUri: null };
-      }
-    })
-  );
-
-  for (const { url, dataUri } of replacements) {
+  if (!matches.length) return svgText;
+  const unique = [...new Set(matches.map(m => m[1]))];
+  const reps   = await Promise.all(unique.map(async url => {
+    try {
+      const res = await fetch(url, {
+        signal:  AbortSignal.timeout(6000),
+        headers: { 'User-Agent': 'SpicyDevs-Rasterizer/5.0' },
+      });
+      if (!res.ok) return { url, dataUri: null };
+      const buf = Buffer.from(await res.arrayBuffer());
+      const ct  = res.headers.get('content-type') || 'image/jpeg';
+      return { url, dataUri: `data:${ct};base64,${buf.toString('base64')}` };
+    } catch { return { url, dataUri: null }; }
+  }));
+  for (const { url, dataUri } of reps)
     if (dataUri) svgText = svgText.split(`href="${url}"`).join(`href="${dataUri}"`);
-  }
   return svgText;
 }
 
-// Modify `renderToBuffer` to be async:
 async function renderToBuffer(svgText, format) {
   const embedded  = await embedExternalImages(svgText);
   const processed = applyFauxBold(embedded);
   const resvg     = new Resvg(processed, RESVG_OPTS);
   const rendered  = resvg.render();
-  if ((format === 'jpg' || format === 'jpeg') && typeof rendered.asJpeg === 'function') {
+  if ((format === 'jpg' || format === 'jpeg') && typeof rendered.asJpeg === 'function')
     return { buffer: rendered.asJpeg(85), mimeType: 'image/jpeg' };
-  }
-  if (format === 'webp' && typeof rendered.asWebp === 'function') {
+  if (format === 'webp' && typeof rendered.asWebp === 'function')
     return { buffer: rendered.asWebp(85), mimeType: 'image/webp' };
-  }
   return { buffer: rendered.asPng(), mimeType: 'image/png' };
 }
 
-async function fetchFromWsrv(svgUrl, format) {
-  const u = new URL('https://wsrv.nl/');
-  u.searchParams.set('url',    svgUrl);
-  u.searchParams.set('output', format === 'webp' ? 'webp' : format === 'png' ? 'png' : 'jpg');
-  u.searchParams.set('q',      '100');
-  const ac = new AbortController();
-  const t  = setTimeout(() => ac.abort(), 6_000);
-  try {
-    const res = await fetch(u.toString(), { signal: ac.signal, headers: { 'User-Agent': 'SpicyDevs-Rasterizer/3.0' } });
-    if (!res.ok) throw new Error(`wsrv.nl returned ${res.status}`);
-    return res;
-  } finally { clearTimeout(t); }
-}
-
-// ── Response helpers ──────────────────────────────────────────────────────────
-
-const CORS = {
-  'Access-Control-Allow-Origin':  '*',
-  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type',
-  'Cache-Control':                'public, max-age=86400',
-};
-
-function streamBuffer(res, buffer, mimeType) {
-  res.writeHead(200, { 'Content-Type': mimeType, ...CORS });
-  const CHUNK = 65536;
-  for (let i = 0; i < buffer.length; i += CHUNK) {
-    res.write(buffer.subarray(i, i + CHUNK));
-  }
-  res.end();
-}
-
-async function handleSingleJob(svgText, svgUrl, format, res) {
-  try {
-    const { buffer, mimeType } = await renderToBuffer(svgText, format);
-    streamBuffer(res, buffer, mimeType);
-  } catch (resvgErr) {
-    if (svgUrl) {
-      try {
-        const wsrvRes = await fetchFromWsrv(svgUrl, format);
-        const buf  = Buffer.from(await wsrvRes.arrayBuffer());
-        const mime = wsrvRes.headers.get('content-type') || 'image/png';
-        streamBuffer(res, buf, mime);
-        return;
-      } catch (wsrvErr) {
-        res.writeHead(502, { 'Content-Type': 'application/json', ...CORS });
-        res.end(JSON.stringify({ error: `resvg: ${resvgErr.message} | wsrv: ${wsrvErr.message}` }));
-        return;
-      }
-    }
-    res.writeHead(500, { 'Content-Type': 'application/json', ...CORS });
-    res.end(JSON.stringify({ error: resvgErr.message }));
-  }
-}
-
-function readBodyString(req) {
+function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
-    req.on('data',  c => chunks.push(c));
-    req.on('end',   () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('data', c  => chunks.push(c));
+    req.on('end',  () => resolve(Buffer.concat(chunks)));
     req.on('error', reject);
   });
 }
 
-// ── HTTP server ───────────────────────────────────────────────────────────────
+function sendJson(res, status, body) {
+  const payload = JSON.stringify(body);
+  res.writeHead(status, { 'Content-Type': 'application/json', ...CORS });
+  res.end(payload);
+}
 
-const PORT = process.env.PORT || 3000;
+function sendImage(res, buffer, mimeType) {
+  res.writeHead(200, {
+    'Content-Type':   mimeType,
+    'Cache-Control':  'public, max-age=86400',
+    'X-Node':         'vercel',
+    ...CORS,
+  });
+  res.end(Buffer.from(buffer));
+}
 
-const server = http.createServer(async (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
+// ── Main handler (exported — Vercel calls this) ───────────────────────────────
 
+export default async function handler(req, res) {
+  // CORS headers on every response
+  Object.entries(CORS).forEach(([k, v]) => res.setHeader(k, v));
+
+  // Preflight
   if (req.method === 'OPTIONS') {
-    res.writeHead(204, { 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type' });
+    res.writeHead(204);
     return res.end();
   }
 
-  const host   = req.headers.host || 'localhost';
-  const urlObj = new URL(`http://${host}${req.url}`);
+  const url    = new URL(req.url, `https://${req.headers.host || 'vercel.app'}`);
+  const format = (
+    req.headers['x-format'] ||
+    url.searchParams.get('format') ||
+    'png'
+  ).toLowerCase();
 
-  if (urlObj.pathname === '/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
-    return res.end(JSON.stringify({ status: 'ok', version: '3.0', node: 'vercel', fontReady: RESVG_OPTS.font?.fontFiles?.length > 0 }));
+  // Health check
+  if (url.pathname === '/health') {
+    return sendJson(res, 200, {
+      status:    'ok',
+      version:   '5.0',
+      node:      'vercel',
+      fontReady: !!(RESVG_OPTS.font?.fontFiles?.length),
+    });
   }
 
-  try {
-    const ct = req.headers['content-type'] || '';
+  // ── POST ────────────────────────────────────────────────────────────────
+  if (req.method === 'POST') {
+    const ct      = req.headers['content-type'] || '';
+    const bodyBuf = await readBody(req);
 
-    // ── JSON path ───────────────────────────────────────────────────────────
+    // JSON body
     if (ct.includes('application/json')) {
-      const bodyStr = await readBodyString(req);
-      if (!bodyStr) { res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ error: 'Empty body' })); }
+      if (!bodyBuf.length) return sendJson(res, 400, { error: 'Empty body' });
 
       let payload;
-      try { payload = JSON.parse(bodyStr); }
-      catch { res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ error: 'Invalid JSON' })); }
+      try   { payload = JSON.parse(bodyBuf); }
+      catch { return sendJson(res, 400, { error: 'Invalid JSON' }); }
 
-      // Single
+      // Single job
       if (payload.svgText) {
-        return handleSingleJob(payload.svgText, payload.svgUrl || null, payload.format || 'png', res);
+        const fmt = payload.format || format;
+        try {
+          const { buffer, mimeType } = await renderToBuffer(payload.svgText, fmt);
+          return sendImage(res, buffer, mimeType);
+        } catch (e) {
+          return sendJson(res, 500, { error: e.message });
+        }
       }
 
-      // Bulk
-      if (!Array.isArray(payload.jobs)) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        return res.end(JSON.stringify({ error: 'Expected { svgText } or { jobs: [] }' }));
-      }
-
-      const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT || '4', 10);
-      const results = [];
-      for (let i = 0; i < payload.jobs.length; i += MAX_CONCURRENT) {
-        const slice = payload.jobs.slice(i, i + MAX_CONCURRENT);
-        const batch = await Promise.all(slice.map(async job => {
-          const fmt = job.format || 'png';
-          try {
-            const { buffer, mimeType } = await renderToBuffer(job.svgText, fmt);
-            return { id: job.id, status: 'success', mimeType, data: buffer.toString('base64') };
-          } catch (resvgErr) {
-            if (job.svgUrl) {
-              try {
-                const wsrvRes = await fetchFromWsrv(job.svgUrl, fmt);
-                const buf  = Buffer.from(await wsrvRes.arrayBuffer());
-                const mime = wsrvRes.headers.get('content-type') || 'image/png';
-                return { id: job.id, status: 'success', mimeType: mime, data: buf.toString('base64') };
-              } catch (wsrvErr) {
-                return { id: job.id, status: 'error', error: `resvg: ${resvgErr.message} | wsrv: ${wsrvErr.message}` };
-              }
+      // Bulk jobs
+      if (Array.isArray(payload.jobs)) {
+        const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT || '4', 10);
+        const results = [];
+        for (let i = 0; i < payload.jobs.length; i += MAX_CONCURRENT) {
+          const slice = payload.jobs.slice(i, i + MAX_CONCURRENT);
+          const batch = await Promise.all(slice.map(async job => {
+            const fmt = job.format || 'png';
+            try {
+              const { buffer, mimeType } = await renderToBuffer(job.svgText, fmt);
+              return { id: job.id, status: 'success', mimeType, data: Buffer.from(buffer).toString('base64') };
+            } catch (e) {
+              return { id: job.id, status: 'error', error: e.message };
             }
-            return { id: job.id, status: 'error', error: resvgErr.message };
-          }
-        }));
-        results.push(...batch);
+          }));
+          results.push(...batch);
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...CORS });
+        return res.end(JSON.stringify({ results }));
       }
 
-      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
-      return res.end(JSON.stringify({ results }));
+      return sendJson(res, 400, { error: "Expected { svgText } or { jobs: [] }" });
     }
 
-    // ── Legacy SVG path ─────────────────────────────────────────────────────
-    const format      = urlObj.searchParams.get('format') || 'png';
-    const fallbackUrl = urlObj.searchParams.get('fallback_url') || null;
-
-    let svgText;
-    if (req.method === 'GET') {
-      const targetUrl = urlObj.searchParams.get('url');
-      if (!targetUrl) { res.writeHead(400, { 'Content-Type': 'text/plain' }); return res.end('Missing ?url= parameter'); }
-      const r = await fetch(targetUrl, { headers: { 'User-Agent': 'SpicyDevs-Rasterizer/3.0' }, signal: AbortSignal.timeout(8_000) });
-      if (!r.ok) { res.writeHead(502, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ error: `SVG fetch failed: ${r.status}` })); }
-      svgText = await r.text();
-    } else if (req.method === 'POST') {
-      svgText = await readBodyString(req);
-      if (!svgText) { res.writeHead(400, { 'Content-Type': 'text/plain' }); return res.end('Empty SVG body'); }
-    } else {
-      res.writeHead(405, { 'Content-Type': 'text/plain' }); return res.end('Method not allowed');
+    // Raw SVG body
+    if (!bodyBuf.length) return sendJson(res, 400, { error: 'Empty SVG body' });
+    const svgText = bodyBuf.toString('utf8');
+    try {
+      const { buffer, mimeType } = await renderToBuffer(svgText, format);
+      return sendImage(res, buffer, mimeType);
+    } catch (e) {
+      return sendJson(res, 500, { error: e.message });
     }
-
-    return handleSingleJob(svgText, fallbackUrl, format, res);
-
-  } catch (error) {
-    if (!res.headersSent) res.writeHead(500, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: error.message }));
   }
-});
 
-server.keepAliveTimeout = 65_000;
-server.headersTimeout   = 66_000;
-server.requestTimeout   = 30_000;
-server.on('connection', s => s.setNoDelay(true));
+  // ── GET ─────────────────────────────────────────────────────────────────
+  if (req.method === 'GET') {
+    const targetUrl = url.searchParams.get('url');
+    if (!targetUrl) return sendJson(res, 400, { error: 'Missing ?url= parameter' });
+    try {
+      const r = await fetch(targetUrl, {
+        signal:  AbortSignal.timeout(8000),
+        headers: { 'User-Agent': 'SpicyDevs-Rasterizer/5.0' },
+      });
+      if (!r.ok) return sendJson(res, 502, { error: `SVG fetch failed: ${r.status}` });
+      const svgText = await r.text();
+      const { buffer, mimeType } = await renderToBuffer(svgText, format);
+      return sendImage(res, buffer, mimeType);
+    } catch (e) {
+      return sendJson(res, 502, { error: e.message });
+    }
+  }
 
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[vercel-node] Listening on :${PORT}`);
-  console.log(`[vercel-node] Font: ${RESVG_OPTS.font?.fontFiles?.[0] ?? 'NOT FOUND'}`);
-});
+  return sendJson(res, 405, { error: 'Method not allowed' });
+}

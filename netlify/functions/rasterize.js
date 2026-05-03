@@ -1,84 +1,73 @@
 // netlify/functions/rasterize.js
 //
-// Netlify Function — SVG → raster via @resvg/resvg-js.
+// FIXED v5 — Switched to @resvg/resvg-wasm to eliminate native-binary
+// compatibility issues with Netlify's Lambda environment.
 //
-// lib/ is populated by the build command:
-//   node ../../scripts/build.mjs netlify
-// which copies core/{fauxBold,sharedRender,renderPool,renderWorker,NotoSans-Subset.ttf}
-// into netlify/lib/.
-//
-// FONT + BOLD STRATEGY (same on every platform)
-// ──────────────────────────────────────────────
-// • NotoSans-Subset.ttf (Regular only) — no system bold variants loaded.
-// • applyFauxBold() synthesises bold via a calibrated 0.035em stroke so
-//   output matches wsrv.nl/librsvg reference visually on all nodes.
+// WASM is initialised once at module load (Lambda cold start) via a
+// Promise; subsequent warm invocations skip re-init.
 
-import fs               from 'node:fs';
-import os               from 'node:os';
-import path             from 'node:path';
-import { Resvg }        from '@resvg/resvg-js';
-import { applyFauxBold } from '../lib/fauxBold.js';
-import { buildResvgOpts } from '../lib/sharedRender.js';
+import { initWasm, Resvg } from '@resvg/resvg-wasm';
+import { readFileSync }     from 'node:fs';
+import { dirname, join }    from 'node:path';
+import { fileURLToPath }    from 'node:url';
+import { applyFauxBold }    from '../lib/fauxBold.js';
+import { buildResvgOpts }   from '../lib/sharedRender.js';
 
+const __dir      = dirname(fileURLToPath(import.meta.url));
 const RESVG_OPTS = buildResvgOpts();
 
-// ── Render ────────────────────────────────────────────────────────────────────
-// Add the embed helper below `const RESVG_OPTS = buildResvgOpts();`
+// ── WASM init (once per Lambda container) ─────────────────────────────────────
+// The .wasm file is included via netlify.toml → included_files.
+let wasmReady   = false;
+let wasmPromise = null;
+
+function ensureWasm() {
+  if (wasmReady)   return Promise.resolve();
+  if (wasmPromise) return wasmPromise;
+  wasmPromise = (async () => {
+    // Path: functions/ → ../ → node_modules/
+    const wasmPath = join(__dir, '..', 'node_modules', '@resvg', 'resvg-wasm', 'index_bg.wasm');
+    const wasmData = readFileSync(wasmPath);
+    await initWasm(wasmData);
+    wasmReady = true;
+  })().catch(e => { wasmPromise = null; throw e; });
+  return wasmPromise;
+}
+
+// ── Render helpers ────────────────────────────────────────────────────────────
+
 async function embedExternalImages(svgText) {
   const matches = [...svgText.matchAll(/href="(https?:\/\/[^"]+)"/g)];
-  if (matches.length === 0) return svgText;
-
-  const uniqueUrls = [...new Set(matches.map(m => m[1]))];
-  const replacements = await Promise.all(
-    uniqueUrls.map(async url => {
-      try {
-        const res = await fetch(url, { signal: AbortSignal.timeout(6000), headers: { 'User-Agent': 'SpicyDevs-Rasterizer/4.0' } });
-        if (!res.ok) return { url, dataUri: null };
-        const buf = Buffer.from(await res.arrayBuffer());
-        const ct = res.headers.get('content-type') || 'image/jpeg';
-        return { url, dataUri: `data:${ct};base64,${buf.toString('base64')}` };
-      } catch {
-        return { url, dataUri: null };
-      }
-    })
-  );
-
-  for (const { url, dataUri } of replacements) {
+  if (!matches.length) return svgText;
+  const unique = [...new Set(matches.map(m => m[1]))];
+  const reps   = await Promise.all(unique.map(async url => {
+    try {
+      const res = await fetch(url, {
+        signal:  AbortSignal.timeout(6000),
+        headers: { 'User-Agent': 'SpicyDevs-Rasterizer/5.0' },
+      });
+      if (!res.ok) return { url, dataUri: null };
+      const buf = Buffer.from(await res.arrayBuffer());
+      const ct  = res.headers.get('content-type') || 'image/jpeg';
+      return { url, dataUri: `data:${ct};base64,${buf.toString('base64')}` };
+    } catch { return { url, dataUri: null }; }
+  }));
+  for (const { url, dataUri } of reps)
     if (dataUri) svgText = svgText.split(`href="${url}"`).join(`href="${dataUri}"`);
-  }
   return svgText;
 }
 
-// Update `renderToBuffer`:
 async function renderToBuffer(svgText, format) {
+  await ensureWasm();
   const embedded  = await embedExternalImages(svgText);
   const processed = applyFauxBold(embedded);
   const resvg     = new Resvg(processed, RESVG_OPTS);
   const rendered  = resvg.render();
-  if ((format === 'jpg' || format === 'jpeg') && typeof rendered.asJpeg === 'function') {
+  if ((format === 'jpg' || format === 'jpeg') && typeof rendered.asJpeg === 'function')
     return { buffer: rendered.asJpeg(85), mimeType: 'image/jpeg' };
-  }
-  if (format === 'webp' && typeof rendered.asWebp === 'function') {
+  if (format === 'webp' && typeof rendered.asWebp === 'function')
     return { buffer: rendered.asWebp(85), mimeType: 'image/webp' };
-  }
   return { buffer: rendered.asPng(), mimeType: 'image/png' };
-}
-
-async function fetchFromWsrv(svgUrl, format) {
-  const u = new URL('https://wsrv.nl/');
-  u.searchParams.set('url',    svgUrl);
-  u.searchParams.set('output', format === 'webp' ? 'webp' : format === 'png' ? 'png' : 'jpg');
-  u.searchParams.set('q',      '100');
-  const ac = new AbortController();
-  const t  = setTimeout(() => ac.abort(), 6_000);
-  try {
-    const res = await fetch(u.toString(), {
-      signal:  ac.signal,
-      headers: { 'User-Agent': 'SpicyDevs-Rasterizer/3.0' },
-    });
-    if (!res.ok) throw new Error(`wsrv.nl returned ${res.status}`);
-    return res;
-  } finally { clearTimeout(t); }
 }
 
 // ── Response helpers ──────────────────────────────────────────────────────────
@@ -86,37 +75,50 @@ async function fetchFromWsrv(svgUrl, format) {
 const CORS = {
   'Access-Control-Allow-Origin':  '*',
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type',
+  'Access-Control-Allow-Headers': 'Content-Type, X-Format',
 };
 
-const jsonResp  = (code, body) => ({ statusCode: code, headers: { 'Content-Type': 'application/json', ...CORS }, body: JSON.stringify(body) });
-const imageResp = (buf, mime)  => ({ statusCode: 200, headers: { 'Content-Type': mime, 'Cache-Control': 'public, max-age=86400', ...CORS }, body: Buffer.from(buf).toString('base64'), isBase64Encoded: true });
+const jsonResp  = (code, body)    => ({ statusCode: code, headers: { 'Content-Type': 'application/json', ...CORS }, body: JSON.stringify(body) });
+const imageResp = (buf, mime)     => ({
+  statusCode:      200,
+  headers:         { 'Content-Type': mime, 'Cache-Control': 'public, max-age=86400', 'X-Node': 'netlify', ...CORS },
+  body:            Buffer.from(buf).toString('base64'),
+  isBase64Encoded: true,
+});
 
-// ── Handler ───────────────────────────────────────────────────────────────────
+// ── Lambda handler ────────────────────────────────────────────────────────────
 
 export const handler = async (event) => {
   if (event.httpMethod === 'OPTIONS') return { statusCode: 204, headers: CORS, body: '' };
 
   const pathname = (event.path || '/').split('?')[0];
+  const params   = new URLSearchParams(event.rawQuery || '');
+  const format   = (
+    event.headers['x-format'] ||
+    params.get('format') ||
+    'png'
+  ).toLowerCase();
 
+  // Health check
   if (pathname === '/health') {
-    return jsonResp(200, { status: 'ok', version: '3.0', node: 'netlify', fontReady: RESVG_OPTS.font?.fontFiles?.length > 0 });
+    return jsonResp(200, {
+      status:    'ok',
+      version:   '5.0',
+      node:      'netlify',
+      wasmReady,
+    });
   }
-
-  const ct      = event.headers['content-type'] || '';
-  const params  = new URLSearchParams(event.rawQuery || '');
-  const format  = params.get('format') || 'png';
 
   const rawBody = event.isBase64Encoded
     ? Buffer.from(event.body || '', 'base64').toString('utf-8')
     : (event.body || '');
 
-  // ── JSON path ─────────────────────────────────────────────────────────────
-  if (ct.includes('application/json')) {
+  // ── JSON body ──────────────────────────────────────────────────────────
+  if ((event.headers['content-type'] || '').includes('application/json')) {
     if (!rawBody) return jsonResp(400, { error: 'Empty body' });
 
     let payload;
-    try { payload = JSON.parse(rawBody); }
+    try   { payload = JSON.parse(rawBody); }
     catch { return jsonResp(400, { error: 'Invalid JSON' }); }
 
     // Single job
@@ -125,84 +127,56 @@ export const handler = async (event) => {
       try {
         const { buffer, mimeType } = await renderToBuffer(payload.svgText, fmt);
         return imageResp(buffer, mimeType);
-      } catch (resvgErr) {
-        if (payload.svgUrl) {
-          try {
-            const wsrvRes = await fetchFromWsrv(payload.svgUrl, fmt);
-            const buf  = Buffer.from(await wsrvRes.arrayBuffer());
-            const mime = wsrvRes.headers.get('content-type') || 'image/png';
-            return imageResp(buf, mime);
-          } catch (wsrvErr) {
-            return jsonResp(502, { error: `resvg: ${resvgErr.message} | wsrv: ${wsrvErr.message}` });
-          }
-        }
-        return jsonResp(500, { error: resvgErr.message });
+      } catch (e) {
+        return jsonResp(500, { error: e.message });
       }
     }
 
-    // Bulk
-    if (!Array.isArray(payload.jobs)) {
-      return jsonResp(400, { error: 'Expected { svgText } or { jobs: [] }' });
+    // Bulk jobs
+    if (Array.isArray(payload.jobs)) {
+      const results = await Promise.all(payload.jobs.map(async job => {
+        const fmt = job.format || 'png';
+        try {
+          const { buffer, mimeType } = await renderToBuffer(job.svgText, fmt);
+          return { id: job.id, status: 'success', mimeType, data: Buffer.from(buffer).toString('base64') };
+        } catch (e) {
+          return { id: job.id, status: 'error', error: e.message };
+        }
+      }));
+      return { statusCode: 200, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...CORS }, body: JSON.stringify({ results }) };
     }
 
-    const results = await Promise.all(payload.jobs.map(async job => {
-      const fmt = job.format || 'png';
-      try {
-        const { buffer, mimeType } = await renderToBuffer(job.svgText, fmt);
-        return { id: job.id, status: 'success', mimeType, data: Buffer.from(buffer).toString('base64') };
-      } catch (resvgErr) {
-        if (job.svgUrl) {
-          try {
-            const wsrvRes = await fetchFromWsrv(job.svgUrl, fmt);
-            const buf  = Buffer.from(await wsrvRes.arrayBuffer());
-            const mime = wsrvRes.headers.get('content-type') || 'image/png';
-            return { id: job.id, status: 'success', mimeType: mime, data: buf.toString('base64') };
-          } catch (wsrvErr) {
-            return { id: job.id, status: 'error', error: `resvg: ${resvgErr.message} | wsrv: ${wsrvErr.message}` };
-          }
-        }
-        return { id: job.id, status: 'error', error: resvgErr.message };
-      }
-    }));
-
-    return { statusCode: 200, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...CORS }, body: JSON.stringify({ results }) };
+    return jsonResp(400, { error: 'Expected { svgText } or { jobs: [] }' });
   }
 
-  // ── Legacy: GET ?url= or POST raw SVG ─────────────────────────────────────
-  let svgText;
-
+  // ── GET ?url= ──────────────────────────────────────────────────────────
   if (event.httpMethod === 'GET') {
     const targetUrl = params.get('url');
     if (!targetUrl) return jsonResp(400, { error: 'Missing ?url= parameter' });
     try {
-      const res = await fetch(targetUrl, { headers: { 'User-Agent': 'SpicyDevs-Rasterizer/3.0' }, signal: AbortSignal.timeout(8_000) });
-      if (!res.ok) return jsonResp(502, { error: `SVG fetch failed: ${res.status}` });
-      svgText = await res.text();
+      const r = await fetch(targetUrl, {
+        signal:  AbortSignal.timeout(8000),
+        headers: { 'User-Agent': 'SpicyDevs-Rasterizer/5.0' },
+      });
+      if (!r.ok) return jsonResp(502, { error: `SVG fetch failed: ${r.status}` });
+      const svgText = await r.text();
+      const { buffer, mimeType } = await renderToBuffer(svgText, format);
+      return imageResp(buffer, mimeType);
     } catch (e) {
-      return jsonResp(502, { error: `SVG fetch threw: ${e.message}` });
+      return jsonResp(502, { error: e.message });
     }
-  } else if (event.httpMethod === 'POST') {
-    if (!rawBody) return jsonResp(400, { error: 'Empty SVG body' });
-    svgText = rawBody;
-  } else {
-    return jsonResp(405, { error: 'Method not allowed' });
   }
 
-  try {
-    const { buffer, mimeType } = await renderToBuffer(svgText, format);
-    return imageResp(buffer, mimeType);
-  } catch (resvgErr) {
-    const fallback = params.get('fallback_url');
-    if (fallback) {
-      try {
-        const wsrvRes = await fetchFromWsrv(fallback, format);
-        const buf  = Buffer.from(await wsrvRes.arrayBuffer());
-        const mime = wsrvRes.headers.get('content-type') || 'image/png';
-        return imageResp(buf, mime);
-      } catch (wsrvErr) {
-        return jsonResp(502, { error: `resvg: ${resvgErr.message} | wsrv: ${wsrvErr.message}` });
-      }
+  // ── POST raw SVG ───────────────────────────────────────────────────────
+  if (event.httpMethod === 'POST') {
+    if (!rawBody) return jsonResp(400, { error: 'Empty SVG body' });
+    try {
+      const { buffer, mimeType } = await renderToBuffer(rawBody, format);
+      return imageResp(buffer, mimeType);
+    } catch (e) {
+      return jsonResp(500, { error: e.message });
     }
-    return jsonResp(500, { error: resvgErr.message });
   }
+
+  return jsonResp(405, { error: 'Method not allowed' });
 };
