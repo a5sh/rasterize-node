@@ -1,25 +1,30 @@
 // vercel/api/rasterize.js
 //
-// FIXED v5 — Proper Vercel serverless handler.
-// The previous version called http.createServer() which Vercel's runtime
-// never invokes — it expects an exported default async function.
+// v6 — Icon placeholder expansion + bandwidth optimisations
+// ─────────────────────────────────────────────────────────────────────────────
+// KEY CHANGES
+//   • expandIconPlaceholder() — replaces <!--ICONS:key1,key2--> with real
+//     <symbol> elements fetched once from api.spicydevs.xyz/data/icons and
+//     cached in module-level memory for the lifetime of the Lambda container.
+//   • warmIconCache() called eagerly at module load (during cold start) so
+//     icon data is ready before the first request arrives.
+//   • X-Node: 'vercel-usw' header for balancer attribution.
 //
-// Handler contract:
-//   export default async function handler(req, res)
-//   req = Node.js IncomingMessage  (has .method, .url, .headers)
-//   res = Node.js ServerResponse   (writeHead / end)
-//
-// Accepts the same wire protocol as every other node in the fleet:
-//   POST /             raw SVG body  (Content-Type: image/svg+xml)
-//   POST /             JSON body     (Content-Type: application/json)
-//   GET  /?url=<url>   fetch+render
-//   GET  /health
+// PAYLOAD SIZE (per request to this node)
+//   Before: ~320 KB  (base64 poster + ~20 KB icon symbols in every SVG)
+//   After:  ~10 KB   (proxied poster URL + 40-byte icon placeholder)
+//   Savings: ~97% reduction in fast-origin-transfer usage
 
-import { Resvg }         from '@resvg/resvg-js';
-import { applyFauxBold } from '../lib/fauxBold.js';
-import { buildResvgOpts } from '../lib/sharedRender.js';
+import { Resvg }                             from '@resvg/resvg-js';
+import { applyFauxBold }                     from '../lib/fauxBold.js';
+import { buildResvgOpts }                    from '../lib/sharedRender.js';
+import { expandIconPlaceholder, warmIconCache } from '../lib/iconCache.js';
 
 const RESVG_OPTS = buildResvgOpts();
+
+// Warm the icon cache during the cold-start module evaluation phase.
+// Fire-and-forget — errors are already logged inside warmIconCache().
+warmIconCache();
 
 // ── Vercel function config ────────────────────────────────────────────────────
 export const config = { maxDuration: 10 };
@@ -31,17 +36,17 @@ const CORS = {
   'Access-Control-Allow-Headers': 'Content-Type, X-Format',
 };
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
+// ── Embed external poster URL references as base64 ────────────────────────────
+// Called after icon expansion so the regex doesn't touch icon paths.
 async function embedExternalImages(svgText) {
   const matches = [...svgText.matchAll(/href="(https?:\/\/[^"]+)"/g)];
   if (!matches.length) return svgText;
   const unique = [...new Set(matches.map(m => m[1]))];
-  const reps   = await Promise.all(unique.map(async url => {
+  const reps = await Promise.all(unique.map(async url => {
     try {
       const res = await fetch(url, {
-        signal:  AbortSignal.timeout(6000),
-        headers: { 'User-Agent': 'SpicyDevs-Rasterizer/5.0' },
+        signal:  AbortSignal.timeout(8_000),
+        headers: { 'User-Agent': 'SpicyDevs-Rasterizer/6.0' },
       });
       if (!res.ok) return { url, dataUri: null };
       const buf = Buffer.from(await res.arrayBuffer());
@@ -54,11 +59,18 @@ async function embedExternalImages(svgText) {
   return svgText;
 }
 
+// ── Full render pipeline ──────────────────────────────────────────────────────
 async function renderToBuffer(svgText, format) {
-  const embedded  = await embedExternalImages(svgText);
-  const processed = applyFauxBold(embedded);
-  const resvg     = new Resvg(processed, RESVG_OPTS);
-  const rendered  = resvg.render();
+  // 1. Expand icon placeholder (<!--ICONS:imdb,rt_fresh-->) from cached data
+  const withIcons  = await expandIconPlaceholder(svgText);
+  // 2. Embed proxied poster URL as base64 so resvg can render it
+  const embedded   = await embedExternalImages(withIcons);
+  // 3. Synthesise faux-bold so Regular-only NotoSans looks visually bold
+  const processed  = applyFauxBold(embedded);
+  // 4. Render
+  const resvg      = new Resvg(processed, RESVG_OPTS);
+  const rendered   = resvg.render();
+
   if ((format === 'jpg' || format === 'jpeg') && typeof rendered.asJpeg === 'function')
     return { buffer: rendered.asJpeg(85), mimeType: 'image/jpeg' };
   if (format === 'webp' && typeof rendered.asWebp === 'function')
@@ -66,6 +78,7 @@ async function renderToBuffer(svgText, format) {
   return { buffer: rendered.asPng(), mimeType: 'image/png' };
 }
 
+// ── Body reader ───────────────────────────────────────────────────────────────
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -75,6 +88,7 @@ function readBody(req) {
   });
 }
 
+// ── Response helpers ──────────────────────────────────────────────────────────
 function sendJson(res, status, body) {
   const payload = JSON.stringify(body);
   res.writeHead(status, { 'Content-Type': 'application/json', ...CORS });
@@ -85,23 +99,17 @@ function sendImage(res, buffer, mimeType) {
   res.writeHead(200, {
     'Content-Type':   mimeType,
     'Cache-Control':  'public, max-age=86400',
-    'X-Node':         'vercel',
+    'X-Node':         'vercel-usw',
     ...CORS,
   });
   res.end(Buffer.from(buffer));
 }
 
 // ── Main handler (exported — Vercel calls this) ───────────────────────────────
-
 export default async function handler(req, res) {
-  // CORS headers on every response
   Object.entries(CORS).forEach(([k, v]) => res.setHeader(k, v));
 
-  // Preflight
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204);
-    return res.end();
-  }
+  if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
 
   const url    = new URL(req.url, `https://${req.headers.host || 'vercel.app'}`);
   const format = (
@@ -110,13 +118,15 @@ export default async function handler(req, res) {
     'png'
   ).toLowerCase();
 
-  // Health check
+  // Health check — expose icon cache status
   if (url.pathname === '/health') {
+    const { iconCacheStatus } = await import('../lib/iconCache.js');
     return sendJson(res, 200, {
       status:    'ok',
-      version:   '5.0',
-      node:      'vercel',
+      version:   '6.0',
+      node:      'vercel-usw',
       fontReady: !!(RESVG_OPTS.font?.fontFiles?.length),
+      iconCache: iconCacheStatus(),
     });
   }
 
@@ -125,7 +135,7 @@ export default async function handler(req, res) {
     const ct      = req.headers['content-type'] || '';
     const bodyBuf = await readBody(req);
 
-    // JSON body
+    // JSON body (single job or bulk)
     if (ct.includes('application/json')) {
       if (!bodyBuf.length) return sendJson(res, 400, { error: 'Empty body' });
 
@@ -165,10 +175,10 @@ export default async function handler(req, res) {
         return res.end(JSON.stringify({ results }));
       }
 
-      return sendJson(res, 400, { error: "Expected { svgText } or { jobs: [] }" });
+      return sendJson(res, 400, { error: 'Expected { svgText } or { jobs: [] }' });
     }
 
-    // Raw SVG body
+    // Raw SVG body (preferred path — image/svg+xml or text/plain)
     if (!bodyBuf.length) return sendJson(res, 400, { error: 'Empty SVG body' });
     const svgText = bodyBuf.toString('utf8');
     try {
@@ -179,14 +189,14 @@ export default async function handler(req, res) {
     }
   }
 
-  // ── GET ─────────────────────────────────────────────────────────────────
+  // ── GET ?url= ───────────────────────────────────────────────────────────
   if (req.method === 'GET') {
     const targetUrl = url.searchParams.get('url');
     if (!targetUrl) return sendJson(res, 400, { error: 'Missing ?url= parameter' });
     try {
       const r = await fetch(targetUrl, {
-        signal:  AbortSignal.timeout(8000),
-        headers: { 'User-Agent': 'SpicyDevs-Rasterizer/5.0' },
+        signal:  AbortSignal.timeout(8_000),
+        headers: { 'User-Agent': 'SpicyDevs-Rasterizer/6.0' },
       });
       if (!r.ok) return sendJson(res, 502, { error: `SVG fetch failed: ${r.status}` });
       const svgText = await r.text();

@@ -1,23 +1,24 @@
 // cloudflare/worker.js
 //
-// CHANGES v4
+// CHANGES v5
 // ─────────────────────────────────────────────────────────────────────────────
-// • Accepts requests at BOTH '/' root (from service binding) AND '/api/vercel'
-//   (from HTTP callers that still use the old path) — backward compatible.
-// • Reads X-Format header to support png/jpg/webp output from raw SVG body.
-// • Adds X-Queue-Depth: 0 response header (single-threaded CF WASM, always 0)
-//   so the balancer can trust the signal.
-// • embedExternalImages() now runs BEFORE applyFauxBold() — same as renderWorker.
+// • Expands <!--ICONS:key1,key2--> placeholder using bundled ICONS before render.
+//   This keeps the SVG payload sent by the main Worker lean (~40 bytes vs ~20 KB)
+//   while the rasterizer still receives full icon <symbol> elements.
+// • expandIconPlaceholderSync() uses the bundled assets/icons.js — no fetch.
+// • All prior v4 behaviour preserved (service binding + HTTP, X-Format, etc.)
 
-import { initWasm, Resvg }   from '@resvg/resvg-wasm';
-import resvgWasm              from '@resvg/resvg-wasm/index_bg.wasm';
-import fontBuffer             from '../core/NotoSans-Subset.ttf';
-import { applyFauxBold }      from '../core/fauxBold.js';
-import puppeteer              from '@cloudflare/puppeteer';
+import { initWasm, Resvg }              from '@resvg/resvg-wasm';
+import resvgWasm                        from '@resvg/resvg-wasm/index_bg.wasm';
+import fontBuffer                       from '../core/NotoSans-Subset.ttf';
+import { applyFauxBold }                from '../core/fauxBold.js';
+import { expandIconPlaceholderSync }    from '../core/iconCache.js';
+import { ICONS }                        from '../assets/icons.js';
+import puppeteer                        from '@cloudflare/puppeteer';
 
 // ── WASM init ─────────────────────────────────────────────────────────────────
 
-let wasmReady = false;
+let wasmReady   = false;
 let wasmPromise = null;
 
 function ensureWasm() {
@@ -50,17 +51,14 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // Health check
     if (url.pathname === '/health') {
-      return jsonOk({ status: 'ok', version: '4.0', node: 'cloudflare', queueDepth: 0 });
+      return jsonOk({ status: 'ok', version: '5.0', node: 'cloudflare', queueDepth: 0 });
     }
 
-    // Screenshot endpoint
     if (url.pathname === '/ss') {
       return handleScreenshot(request, env);
     }
 
-    // CORS preflight
     if (request.method === 'OPTIONS') {
       return new Response(null, {
         status: 204,
@@ -72,9 +70,7 @@ export default {
       });
     }
 
-    // ── Rasterization routes ───────────────────────────────────────────────
-    // Accepts: '/', '/api/vercel', or any path not matching the above
-    // This makes both the service binding (sends to '/') and HTTP callers work.
+    // ── Rasterisation routes ───────────────────────────────────────────────
 
     try {
       await ensureWasm();
@@ -82,7 +78,6 @@ export default {
       return jsonError(503, `WASM init failed: ${e.message}`);
     }
 
-    // Resolve format — X-Format header takes precedence, then ?format= param, then 'png'
     const formatHeader = request.headers.get('X-Format') || '';
     const formatParam  = url.searchParams.get('format')  || '';
     const format       = (['png','jpg','jpeg','webp'].find(f => f === (formatHeader || formatParam).toLowerCase())) || 'png';
@@ -92,25 +87,21 @@ export default {
 
     if (request.method === 'POST') {
       const ct = request.headers.get('content-type') || '';
-
       if (ct.includes('application/json')) {
         let payload;
         try   { payload = await request.json(); }
         catch { return jsonError(400, 'Invalid JSON'); }
-
         if (!payload?.svgText) return jsonError(400, 'Expected { svgText }');
         svgText = payload.svgText;
       } else {
-        // Raw SVG body (image/svg+xml or text/plain) — preferred path
         svgText = await request.text();
         if (!svgText?.trim()) return jsonError(400, 'Empty body');
       }
-
     } else if (request.method === 'GET') {
       const targetUrl = url.searchParams.get('url');
       if (!targetUrl) return jsonError(400, 'Missing ?url= parameter');
       try {
-        const r = await fetch(targetUrl, { headers: { 'User-Agent': 'SpicyDevs-Rasterizer/4.0' } });
+        const r = await fetch(targetUrl, { headers: { 'User-Agent': 'SpicyDevs-Rasterizer/5.0' } });
         if (!r.ok) return jsonError(502, `SVG fetch failed: ${r.status}`);
         svgText = await r.text();
       } catch (e) {
@@ -122,15 +113,19 @@ export default {
 
     // ── Render ─────────────────────────────────────────────────────────────
     try {
-      const embedded  = await embedExternalImages(svgText);
-      const processed = applyFauxBold(embedded);
-      const resvg     = new Resvg(processed, RESVG_OPTS);
-      const rendered  = resvg.render();
+      // 1. Expand icon placeholder using bundled ICONS (sync, no fetch needed)
+      const withIcons  = expandIconPlaceholderSync(svgText, ICONS);
+      // 2. Embed external poster image URLs as base64
+      const embedded   = await embedExternalImages(withIcons);
+      // 3. Faux-bold synthesis
+      const processed  = applyFauxBold(embedded);
+      // 4. Render
+      const resvg      = new Resvg(processed, RESVG_OPTS);
+      const rendered   = resvg.render();
 
       let imageBuffer, mimeType;
 
-      if ((format === 'jpg' || format === 'jpeg')) {
-        // WASM build may not have asJpeg; fall back to PNG
+      if (format === 'jpg' || format === 'jpeg') {
         imageBuffer = typeof rendered.asJpeg === 'function' ? rendered.asJpeg(85) : rendered.asPng();
         mimeType    = typeof rendered.asJpeg === 'function' ? 'image/jpeg'        : 'image/png';
       } else if (format === 'webp') {
@@ -152,7 +147,6 @@ export default {
         },
       });
 
-      // Cache GET responses at the edge
       if (request.method === 'GET') {
         ctx.waitUntil(caches.default.put(request, response.clone()));
       }
@@ -182,7 +176,7 @@ function jsonError(status, message) {
 
 /**
  * Embed external http(s) image hrefs as inline base64 data URIs.
- * Runs concurrently for all unique URLs in the SVG.
+ * Skips anything that already starts with data: (already embedded).
  */
 async function embedExternalImages(svgText) {
   const matches = [...svgText.matchAll(/href="(https?:\/\/[^"]+)"/g)];
@@ -194,7 +188,7 @@ async function embedExternalImages(svgText) {
     uniqueUrls.map(async url => {
       try {
         const res = await fetch(url, {
-          headers: { 'User-Agent': 'SpicyDevs-Rasterizer/4.0' },
+          headers: { 'User-Agent': 'SpicyDevs-Rasterizer/5.0' },
           signal:  AbortSignal.timeout(8_000),
         });
         if (!res.ok) return { url, dataUri: null };

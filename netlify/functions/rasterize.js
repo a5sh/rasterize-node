@@ -1,23 +1,24 @@
 // netlify/functions/rasterize.js
 //
-// FIXED v5 — Switched to @resvg/resvg-wasm to eliminate native-binary
-// compatibility issues with Netlify's Lambda environment.
-//
-// WASM is initialised once at module load (Lambda cold start) via a
-// Promise; subsequent warm invocations skip re-init.
+// v6 — Icon placeholder expansion + bandwidth optimisations
+// ─────────────────────────────────────────────────────────────────────────────
+// Matches the same changes as vercel/api/rasterize.js v6:
+//   • expandIconPlaceholder() from lib/iconCache.js replaces <!--ICONS:…-->
+//   • warmIconCache() called at module load
+//   • X-Node: 'netlify' attribution header
 
-import { initWasm, Resvg } from '@resvg/resvg-js';
-import { readFileSync }     from 'node:fs';
-import { dirname, join }    from 'node:path';
-import { fileURLToPath }    from 'node:url';
-import { applyFauxBold }    from '../lib/fauxBold.js';
-import { buildResvgOpts }   from '../lib/sharedRender.js';
+import { initWasm, Resvg }                     from '@resvg/resvg-js';
+import { readFileSync }                         from 'node:fs';
+import { dirname, join }                        from 'node:path';
+import { fileURLToPath }                        from 'node:url';
+import { applyFauxBold }                        from '../lib/fauxBold.js';
+import { buildResvgOpts }                       from '../lib/sharedRender.js';
+import { expandIconPlaceholder, warmIconCache, iconCacheStatus } from '../lib/iconCache.js';
 
 const __dir      = dirname(fileURLToPath(import.meta.url));
 const RESVG_OPTS = buildResvgOpts();
 
-// ── WASM init (once per Lambda container) ─────────────────────────────────────
-// The .wasm file is included via netlify.toml → included_files.
+// ── WASM init ─────────────────────────────────────────────────────────────────
 let wasmReady   = false;
 let wasmPromise = null;
 
@@ -25,7 +26,6 @@ function ensureWasm() {
   if (wasmReady)   return Promise.resolve();
   if (wasmPromise) return wasmPromise;
   wasmPromise = (async () => {
-    // Path: functions/ → ../ → node_modules/
     const wasmPath = join(__dir, '..', 'node_modules', '@resvg', 'resvg-wasm', 'index_bg.wasm');
     const wasmData = readFileSync(wasmPath);
     await initWasm(wasmData);
@@ -33,6 +33,9 @@ function ensureWasm() {
   })().catch(e => { wasmPromise = null; throw e; });
   return wasmPromise;
 }
+
+// Warm icon cache at module load (cold start)
+warmIconCache();
 
 // ── Render helpers ────────────────────────────────────────────────────────────
 
@@ -43,8 +46,8 @@ async function embedExternalImages(svgText) {
   const reps   = await Promise.all(unique.map(async url => {
     try {
       const res = await fetch(url, {
-        signal:  AbortSignal.timeout(6000),
-        headers: { 'User-Agent': 'SpicyDevs-Rasterizer/5.0' },
+        signal:  AbortSignal.timeout(8_000),
+        headers: { 'User-Agent': 'SpicyDevs-Rasterizer/6.0' },
       });
       if (!res.ok) return { url, dataUri: null };
       const buf = Buffer.from(await res.arrayBuffer());
@@ -59,10 +62,15 @@ async function embedExternalImages(svgText) {
 
 async function renderToBuffer(svgText, format) {
   await ensureWasm();
-  const embedded  = await embedExternalImages(svgText);
-  const processed = applyFauxBold(embedded);
-  const resvg     = new Resvg(processed, RESVG_OPTS);
-  const rendered  = resvg.render();
+  // 1. Expand icon placeholder
+  const withIcons  = await expandIconPlaceholder(svgText);
+  // 2. Embed external poster URLs
+  const embedded   = await embedExternalImages(withIcons);
+  // 3. Faux-bold
+  const processed  = applyFauxBold(embedded);
+  // 4. Render
+  const resvg      = new Resvg(processed, RESVG_OPTS);
+  const rendered   = resvg.render();
   if ((format === 'jpg' || format === 'jpeg') && typeof rendered.asJpeg === 'function')
     return { buffer: rendered.asJpeg(85), mimeType: 'image/jpeg' };
   if (format === 'webp' && typeof rendered.asWebp === 'function')
@@ -78,8 +86,12 @@ const CORS = {
   'Access-Control-Allow-Headers': 'Content-Type, X-Format',
 };
 
-const jsonResp  = (code, body)    => ({ statusCode: code, headers: { 'Content-Type': 'application/json', ...CORS }, body: JSON.stringify(body) });
-const imageResp = (buf, mime)     => ({
+const jsonResp  = (code, body)   => ({
+  statusCode: code,
+  headers:    { 'Content-Type': 'application/json', ...CORS },
+  body:       JSON.stringify(body),
+});
+const imageResp = (buf, mime)    => ({
   statusCode:      200,
   headers:         { 'Content-Type': mime, 'Cache-Control': 'public, max-age=86400', 'X-Node': 'netlify', ...CORS },
   body:            Buffer.from(buf).toString('base64'),
@@ -103,9 +115,10 @@ export const handler = async (event) => {
   if (pathname === '/health') {
     return jsonResp(200, {
       status:    'ok',
-      version:   '5.0',
+      version:   '6.0',
       node:      'netlify',
       wasmReady,
+      iconCache: iconCacheStatus(),
     });
   }
 
@@ -143,7 +156,11 @@ export const handler = async (event) => {
           return { id: job.id, status: 'error', error: e.message };
         }
       }));
-      return { statusCode: 200, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...CORS }, body: JSON.stringify({ results }) };
+      return {
+        statusCode: 200,
+        headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...CORS },
+        body: JSON.stringify({ results }),
+      };
     }
 
     return jsonResp(400, { error: 'Expected { svgText } or { jobs: [] }' });
@@ -155,8 +172,8 @@ export const handler = async (event) => {
     if (!targetUrl) return jsonResp(400, { error: 'Missing ?url= parameter' });
     try {
       const r = await fetch(targetUrl, {
-        signal:  AbortSignal.timeout(8000),
-        headers: { 'User-Agent': 'SpicyDevs-Rasterizer/5.0' },
+        signal:  AbortSignal.timeout(8_000),
+        headers: { 'User-Agent': 'SpicyDevs-Rasterizer/6.0' },
       });
       if (!r.ok) return jsonResp(502, { error: `SVG fetch failed: ${r.status}` });
       const svgText = await r.text();
