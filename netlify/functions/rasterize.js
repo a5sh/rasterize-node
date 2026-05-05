@@ -7,7 +7,7 @@
 //   • warmIconCache() called at module load
 //   • X-Node: 'netlify' attribution header
 
-import { initWasm, Resvg }                     from '@resvg/resvg-js';
+import { Resvg }                     from '@resvg/resvg-js';
 import { readFileSync }                         from 'node:fs';
 import { dirname, join }                        from 'node:path';
 import { fileURLToPath }                        from 'node:url';
@@ -17,22 +17,6 @@ import { expandIconPlaceholder, warmIconCache, iconCacheStatus } from '../lib/ic
 
 const __dir      = dirname(fileURLToPath(import.meta.url));
 const RESVG_OPTS = buildResvgOpts();
-
-// ── WASM init ─────────────────────────────────────────────────────────────────
-let wasmReady   = false;
-let wasmPromise = null;
-
-function ensureWasm() {
-  if (wasmReady)   return Promise.resolve();
-  if (wasmPromise) return wasmPromise;
-  wasmPromise = (async () => {
-    const wasmPath = join(__dir, '..', 'node_modules', '@resvg', 'resvg-wasm', 'index_bg.wasm');
-    const wasmData = readFileSync(wasmPath);
-    await initWasm(wasmData);
-    wasmReady = true;
-  })().catch(e => { wasmPromise = null; throw e; });
-  return wasmPromise;
-}
 
 // Warm icon cache at module load (cold start)
 warmIconCache();
@@ -61,7 +45,6 @@ async function embedExternalImages(svgText) {
 }
 
 async function renderToBuffer(svgText, format) {
-  await ensureWasm();
   // 1. Expand icon placeholder
   const withIcons  = await expandIconPlaceholder(svgText);
   // 2. Embed external poster URLs
@@ -117,7 +100,6 @@ export const handler = async (event) => {
       status:    'ok',
       version:   '6.0',
       node:      'netlify',
-      wasmReady,
       iconCache: iconCacheStatus(),
     });
   }
