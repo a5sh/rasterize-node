@@ -14,34 +14,36 @@
 // This file is copied to {platform}/lib/ by scripts/build.mjs at deploy time.
 // NotoSans-Subset.ttf is copied alongside it so the path.join(_moduleDir, …)
 // reference resolves correctly in both local dev and production bundles.
-//
-// NOTE: We intentionally avoid declaring __dirname here because Lambda/NFT
-// environments inject it as a global in CJS bundles, causing a redeclaration
-// SyntaxError at runtime.
 
 import fs   from 'node:fs';
 import os   from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-// Use a non-conflicting name so this module is safe in both ESM and
-// NFT-bundled CJS Lambda contexts where __dirname is already a global.
-// Resolve the module directory safely across three environments:
-//   1. Native ESM (local dev, Cloudflare) — import.meta.url is a string
-//   2. NFT-bundled CJS (Netlify, Vercel)  — __dirname is injected as a global;
-//      import.meta.url is undefined so fileURLToPath throws ERR_INVALID_ARG_TYPE
-//   3. Fallback                           — use process.cwd()
+// ── Module directory resolution ───────────────────────────────────────────────
 //
-// Never declare `const __dirname` here — NFT bundles inject it as a global and
-// a local re-declaration would cause a SyntaxError at parse time.
+// Three environments to handle:
+//
+//   1. Native ESM (local dev, Cloudflare Workers)
+//      import.meta.url is a valid string → use fileURLToPath
+//
+//   2. NFT-bundled CJS lambda (Netlify, Vercel)
+//      The bundler transforms import.meta.url to undefined.
+//      __dirname IS injected as a global by the CJS wrapper — use it.
+//      We CANNOT declare `const __dirname` here (re-declaration SyntaxError).
+//
+//   3. Unknown fallback
+//      process.cwd() — font may not be found but the server won't crash.
+//
+// eslint-disable-next-line no-undef
 const _moduleDir = (() => {
-  // eslint-disable-next-line no-undef
-  if (typeof __dirname !== 'undefined') return __dirname;
+  if (typeof __dirname !== 'undefined') return __dirname;           // NFT CJS
   if (typeof import.meta?.url === 'string') {
     try { return path.dirname(fileURLToPath(import.meta.url)); } catch { /* fall */ }
   }
-  return process.cwd();
+  return process.cwd();                                             // last resort
 })();
+
 // Resolved once at module load; null if the font file is missing.
 const FONT_SRC = (() => {
   const p = path.join(_moduleDir, 'NotoSans-Subset.ttf');

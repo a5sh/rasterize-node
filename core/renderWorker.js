@@ -2,8 +2,9 @@
 
 import { createRequire }          from 'node:module';
 import { workerData, parentPort } from 'node:worker_threads';
+import { createHash }             from 'node:crypto';   // explicit import — globalThis.crypto in Node 18+ worker threads is the Web Crypto API, which has no createHash()
 import { applyFauxBold }          from './fauxBold.js';
-import { getCachedPoster, setCachedPoster } from './cache.js';  // ← moved here
+import { getCachedPoster, setCachedPoster } from './cache.js';
 
 const _require  = createRequire(workerData.serverDir + '/_.js');
 const { Resvg } = _require('@resvg/resvg-js');
@@ -33,9 +34,14 @@ try {
 //
 // Called ONLY when the SVG contains URL references (no_embed or URL-based path).
 // When the poster is already base64, this is a no-op (no matches).
+//
+// NOTE: The server (render/server.js, vps/server.js) pre-embeds images before
+// dispatching to the pool, so this function is a safety net for any URLs that
+// slip through (e.g. direct GET ?url= requests). It will typically be a no-op.
 
 const EXTERNAL_IMG_RE = /href="(https?:\/\/[^"]+)"/g;
 const FETCH_TIMEOUT_MS = 6_000;
+
 async function embedExternalImages(svgText) {
   const matches = [...svgText.matchAll(EXTERNAL_IMG_RE)];
   if (matches.length === 0) return svgText;
@@ -78,15 +84,15 @@ async function embedExternalImages(svgText) {
 }
 
 // ── Message handler ───────────────────────────────────────────────────────────
-// In renderWorker.js message handler:
 
 const _renderCache = new Map();        // svgHash:format → { png: Buffer, mime: string, expiry: number }
 const RENDER_CACHE_TTL  = 3 * 60_000; // 3 minutes
-const MAX_RENDER_CACHE  = 50;          // 50 cached renders
+const MAX_RENDER_CACHE  = 50;
 
 parentPort.on('message', async ({ jobId, svgText, format }) => {
   try {
-    const svgHash  = crypto.createHash('sha1').update(svgText + format).digest('hex').slice(0, 16);
+    // Use the explicitly imported createHash — NOT the global crypto object
+    const svgHash  = createHash('sha1').update(svgText + format).digest('hex').slice(0, 16);
     const cached   = _renderCache.get(svgHash);
 
     if (cached && Date.now() < cached.expiry) {
