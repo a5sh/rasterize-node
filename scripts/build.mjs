@@ -31,6 +31,7 @@ const CORE_FILES = [
   'sharedRender.js',
   'renderPool.js',
   'renderWorker.js',
+  'iconCache.js',   // ← add this
   'NotoSans-Subset.ttf',
   'b2p.js',
   'cache.js',
