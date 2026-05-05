@@ -10,10 +10,15 @@
 import http                     from 'node:http';
 import path, { dirname, join }  from 'node:path';
 import { fileURLToPath }        from 'node:url';
-import { RenderPool }           from './lib/renderPool.js';
-import { buildResvgOpts }       from './lib/sharedRender.js';
-import { generatePosterFromBackdrop } from './lib/b2p.js';
-import { expandIconPlaceholder, warmIconCache } from './lib/iconCache.js';
+import {
+  RenderPool,
+  buildResvgOpts,
+  generatePosterFromBackdrop,
+  generateSquareCropFromBackdrop,
+  expandIconPlaceholder,
+  warmIconCache,
+  RESOLVED_LIB_DIR,
+} from './lib.js';
 import {
   stats, logError, notifyOnline, notifyOffline,
   recordRequest, recordJobDuration, recordResvgFail, recordWsrvFallback,
@@ -23,8 +28,7 @@ const PORT           = parseInt(process.env.PORT           || '3000', 10);
 const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT || '4',    10);
 
 const __dir       = dirname(fileURLToPath(import.meta.url));
-const WORKER_PATH = join(__dir, 'lib', 'renderWorker.js');
-
+const WORKER_PATH = join(RESOLVED_LIB_DIR, 'renderWorker.js');
 // Warm icon cache at startup (fire-and-forget)
 warmIconCache();
 
@@ -177,14 +181,22 @@ const server = http.createServer(async (req, res) => {
         return res.end(JSON.stringify({ error: 'Missing url parameter or body content' }));
       }
 
-      const t0 = Date.now();
-      const { buffer, mimeType } = await generatePosterFromBackdrop(imageUrl, format);
+      const cropMode = params.get('crop') || '';
+    const t0 = Date.now();
 
-      recordJobDuration(Date.now() - t0);
-      syncStats();
+    const { buffer, mimeType } = cropMode === 'square'
+      ? await generateSquareCropFromBackdrop(imageUrl, format)
+      : await generatePosterFromBackdrop(imageUrl, format);
 
-      res.writeHead(200, { 'Content-Type': mimeType, 'Cache-Control': 'public, max-age=86400' });
-      return res.end(buffer);
+    recordJobDuration(Date.now() - t0);
+    syncStats();
+
+    res.writeHead(200, {
+      'Content-Type':    mimeType,
+      'Cache-Control':   'public, max-age=86400',
+      'X-Crop-Mode':     cropMode || 'poster',
+    });
+    return res.end(buffer);
     }
 
     // ── JSON path ───────────────────────────────────────────────────────────

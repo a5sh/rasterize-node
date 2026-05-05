@@ -54,3 +54,45 @@ export async function generatePosterFromBackdrop(imageUrl, format = 'jpeg') {
 
   return result;
 }
+
+/**
+ * Crops an image to 512×512 square using smart attention/entropy strategy.
+ * Portrait images (posters): attention-based — keeps faces/subjects, preserves full width.
+ * Landscape images (backdrops): entropy-based — finds most visually interesting region.
+ */
+export async function generateSquareCropFromBackdrop(imageUrl, format = 'jpeg') {
+  const cacheKey = `sq:${imageUrl}:${format}`;
+  const cached = _b2pCache.get(cacheKey);
+  if (cached && Date.now() < cached.expiry) {
+    return { buffer: cached.buffer, mimeType: cached.mimeType };
+  }
+
+  const imgRes = await fetch(imageUrl, {
+    signal: AbortSignal.timeout(5000),
+    headers: { 'User-Agent': 'SpicyDevs-Rasterizer/4.0' }
+  });
+  if (!imgRes.ok) throw new Error(`Square crop fetch failed: ${imgRes.status}`);
+
+  const imgBuffer = Buffer.from(await imgRes.arrayBuffer());
+  const outputFormat = format === 'png' ? 'png' : format === 'webp' ? 'webp' : 'jpeg';
+
+  const meta = await sharp(imgBuffer).metadata();
+  const isPortrait = (meta.height ?? 750) > (meta.width ?? 500);
+
+  const buffer = await sharp(imgBuffer)
+    .resize({
+      width: 512,
+      height: 512,
+      fit: sharp.fit.cover,
+      // Portrait: attention keeps faces/subject (full width preserved, height cropped)
+      // Landscape: entropy finds the richest horizontal band
+      position: isPortrait ? sharp.strategy.attention : sharp.strategy.entropy,
+    })
+    .toFormat(outputFormat, { quality: 85 })
+    .toBuffer();
+
+  const result = { buffer, mimeType: `image/${outputFormat}` };
+  if (_b2pCache.size >= MAX_CACHE) _b2pCache.delete(_b2pCache.keys().next().value);
+  _b2pCache.set(cacheKey, { ...result, expiry: Date.now() + CACHE_TTL });
+  return result;
+}
