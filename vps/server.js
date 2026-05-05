@@ -13,6 +13,7 @@ import { fileURLToPath }        from 'node:url';
 import { RenderPool }           from './lib/renderPool.js';
 import { buildResvgOpts }       from './lib/sharedRender.js';
 import { generatePosterFromBackdrop } from './lib/b2p.js';
+import { expandIconPlaceholder, warmIconCache } from './lib/iconCache.js';
 import {
   stats, logError, notifyOnline, notifyOffline,
   recordRequest, recordJobDuration, recordResvgFail, recordWsrvFallback,
@@ -23,6 +24,62 @@ const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT || '4',    10);
 
 const __dir       = dirname(fileURLToPath(import.meta.url));
 const WORKER_PATH = join(__dir, 'lib', 'renderWorker.js');
+
+// Warm icon cache at startup (fire-and-forget)
+warmIconCache();
+
+// ── Server-level image embedding ──────────────────────────────────────────────
+// Worker threads can't reliably reach external URLs (proxied poster hrefs) on
+// VPS / container networks. Embed poster image hrefs as base64 data URIs here,
+// in the main process, before the SVG is handed to the render pool.
+// This mirrors how Netlify/Vercel handle it — they embed in the lambda itself.
+
+const EMBED_IMG_RE = /href="(https?:\/\/[^"]+)"/g;
+
+async function serverEmbedImages(svgText) {
+  const matches = [...svgText.matchAll(EMBED_IMG_RE)];
+  if (matches.length === 0) return svgText;
+
+  const uniqueUrls = [...new Set(matches.map(m => m[1]))];
+
+  const replacements = await Promise.all(
+    uniqueUrls.map(async url => {
+      const ac = new AbortController();
+      const t  = setTimeout(() => ac.abort(), 8_000);
+      try {
+        const res = await fetch(url, {
+          signal:  ac.signal,
+          headers: { 'User-Agent': 'SpicyDevs-Rasterizer/3.0' },
+        });
+        clearTimeout(t);
+        if (!res.ok) return { url, dataUri: null };
+        const buf = Buffer.from(await res.arrayBuffer());
+        const ct  = res.headers.get('content-type') || 'image/jpeg';
+        return { url, dataUri: `data:${ct};base64,${buf.toString('base64')}` };
+      } catch {
+        clearTimeout(t);
+        return { url, dataUri: null };
+      }
+    }),
+  );
+
+  for (const { url, dataUri } of replacements) {
+    if (dataUri) svgText = svgText.split(`href="${url}"`).join(`href="${dataUri}"`);
+  }
+  return svgText;
+}
+
+// ── Render wrapper ─────────────────────────────────────────────────────────────
+// Expands the icon placeholder and embeds external images before dispatching
+// to the worker pool. Worker threads have no network access of their own.
+
+async function renderSvg(svgText, format) {
+  const withIcons  = await expandIconPlaceholder(svgText);
+  const withImages = await serverEmbedImages(withIcons);
+  return pool.render(withImages, format);
+}
+
+// ── wsrv fallback ─────────────────────────────────────────────────────────────
 
 async function fetchFromWsrv(svgUrl, format) {
   const u = new URL('https://wsrv.nl/');
@@ -40,6 +97,8 @@ async function fetchFromWsrv(svgUrl, format) {
   }
 }
 
+// ── Body reader ────────────────────────────────────────────────────────────────
+
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -52,12 +111,16 @@ function readBody(req) {
   });
 }
 
+// ── Pool + stats ───────────────────────────────────────────────────────────────
+
 let pool = null;
 function syncStats() {
   if (!pool) return;
   stats.activeJobs = pool.activeJobs;
   stats.queuedJobs = pool.queuedJobs;
 }
+
+// ── HTTP server ───────────────────────────────────────────────────────────────
 
 const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -76,7 +139,7 @@ const server = http.createServer(async (req, res) => {
     const fontCfg = pool?._resvgOpts?.font ?? null;
     res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*' });
     return res.end(JSON.stringify({
-      status: 'ok', version: '3.0', node: 'vps', ts: Date.now(),
+      status: 'ok', version: '3.1', node: 'vps', ts: Date.now(),
       activeJobs: stats.activeJobs, queuedJobs: stats.queuedJobs,
       workerCount: pool?.workerCount ?? 0, pendingRespawns: pool?.pendingRespawns ?? 0,
       maxConcurrent: MAX_CONCURRENT, uptime: Math.floor(process.uptime()),
@@ -126,16 +189,24 @@ const server = http.createServer(async (req, res) => {
 
     // ── JSON path ───────────────────────────────────────────────────────────
     if (req.headers['content-type'] === 'application/json') {
-      if (!bodyBuf?.length) { res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ error: 'Empty body' })); }
+      if (!bodyBuf?.length) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: 'Empty body' }));
+      }
+
       let payload;
       try { payload = JSON.parse(bodyBuf); }
-      catch { res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ error: 'Invalid JSON' })); }
+      catch {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: 'Invalid JSON' }));
+      }
 
+      // Single job
       if (payload.svgText) {
         const fmt = payload.format || format;
         const t0  = Date.now();
         try {
-          const { buffer, mimeType } = await pool.render(payload.svgText, fmt);
+          const { buffer, mimeType } = await renderSvg(payload.svgText, fmt);
           recordJobDuration(Date.now() - t0); syncStats();
           res.writeHead(200, { 'Content-Type': mimeType, 'Cache-Control': 'public, max-age=86400' });
           return res.end(buffer);
@@ -163,6 +234,7 @@ const server = http.createServer(async (req, res) => {
         }
       }
 
+      // Bulk jobs
       if (!Array.isArray(payload.jobs)) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ error: "Expected { svgText } or { jobs: [] }" }));
@@ -171,7 +243,7 @@ const server = http.createServer(async (req, res) => {
       const results = await Promise.all(payload.jobs.map(async job => {
         const t0 = Date.now(), fmt = job.format || 'png';
         try {
-          const { buffer, mimeType } = await pool.render(job.svgText, fmt);
+          const { buffer, mimeType } = await renderSvg(job.svgText, fmt);
           recordJobDuration(Date.now() - t0); syncStats();
           return { id: job.id, status: 'success', mimeType, data: buffer.toString('base64') };
         } catch (resvgErr) {
@@ -195,24 +267,34 @@ const server = http.createServer(async (req, res) => {
       return res.end(JSON.stringify({ results }));
     }
 
-    // ── Legacy path ─────────────────────────────────────────────────────────
+    // ── Legacy path (raw SVG body or GET ?url=) ─────────────────────────────
     let svgText;
     if (req.method === 'POST') {
-      if (!bodyBuf?.length) { res.writeHead(400, { 'Content-Type': 'text/plain' }); return res.end('Empty SVG body'); }
+      if (!bodyBuf?.length) {
+        res.writeHead(400, { 'Content-Type': 'text/plain' });
+        return res.end('Empty SVG body');
+      }
       svgText = bodyBuf.toString('utf8');
     } else if (req.method === 'GET') {
       const targetUrl = params.get('url');
-      if (!targetUrl) { res.writeHead(400, { 'Content-Type': 'text/plain' }); return res.end('Missing ?url= parameter'); }
+      if (!targetUrl) {
+        res.writeHead(400, { 'Content-Type': 'text/plain' });
+        return res.end('Missing ?url= parameter');
+      }
       const r = await fetch(targetUrl, { headers: { 'User-Agent': 'SpicyDevs-Rasterizer/3.0' }, signal: AbortSignal.timeout(8_000) });
-      if (!r.ok) { res.writeHead(502, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ error: `SVG fetch failed: ${r.status}` })); }
+      if (!r.ok) {
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: `SVG fetch failed: ${r.status}` }));
+      }
       svgText = await r.text();
     } else {
-      res.writeHead(405, { 'Content-Type': 'text/plain' }); return res.end('Method not allowed');
+      res.writeHead(405, { 'Content-Type': 'text/plain' });
+      return res.end('Method not allowed');
     }
 
     const t0 = Date.now();
     try {
-      const { buffer, mimeType } = await pool.render(svgText, format);
+      const { buffer, mimeType } = await renderSvg(svgText, format);
       recordJobDuration(Date.now() - t0); syncStats();
       res.writeHead(200, { 'Content-Type': mimeType, 'Cache-Control': 'public, max-age=86400' });
       res.end(buffer);
@@ -251,6 +333,8 @@ server.keepAliveTimeout = 65_000;
 server.headersTimeout   = 66_000;
 server.requestTimeout   = 30_000;
 server.on('connection', s => s.setNoDelay(true));
+
+// ── Boot ──────────────────────────────────────────────────────────────────────
 
 (async () => {
   const resvgOpts = buildResvgOpts();

@@ -26,8 +26,22 @@ import { fileURLToPath } from 'node:url';
 
 // Use a non-conflicting name so this module is safe in both ESM and
 // NFT-bundled CJS Lambda contexts where __dirname is already a global.
-const _moduleDir = path.dirname(fileURLToPath(import.meta.url));
-
+// Resolve the module directory safely across three environments:
+//   1. Native ESM (local dev, Cloudflare) — import.meta.url is a string
+//   2. NFT-bundled CJS (Netlify, Vercel)  — __dirname is injected as a global;
+//      import.meta.url is undefined so fileURLToPath throws ERR_INVALID_ARG_TYPE
+//   3. Fallback                           — use process.cwd()
+//
+// Never declare `const __dirname` here — NFT bundles inject it as a global and
+// a local re-declaration would cause a SyntaxError at parse time.
+const _moduleDir = (() => {
+  // eslint-disable-next-line no-undef
+  if (typeof __dirname !== 'undefined') return __dirname;
+  if (typeof import.meta?.url === 'string') {
+    try { return path.dirname(fileURLToPath(import.meta.url)); } catch { /* fall */ }
+  }
+  return process.cwd();
+})();
 // Resolved once at module load; null if the font file is missing.
 const FONT_SRC = (() => {
   const p = path.join(_moduleDir, 'NotoSans-Subset.ttf');

@@ -74,8 +74,9 @@ function syncStats() {
 // Worker threads have no network access, so expansion must happen here.
 
 async function renderSvg(svgText, format) {
-  const expanded = await expandIconPlaceholder(svgText);
-  return pool.render(expanded, format);
+  const withIcons   = await expandIconPlaceholder(svgText);
+  const withImages  = await serverEmbedImages(withIcons);   // ← new
+  return pool.render(withImages, format);
 }
 
 // ── HTTP server ───────────────────────────────────────────────────────────────
@@ -290,4 +291,44 @@ async function shutdown(signal) {
   await notifyOffline(signal);
   if (pool) await pool.destroy();
   process.exit(0);
+}
+
+// ── Server-level image embedding ──────────────────────────────────────────────
+// Worker threads can't reliably reach external URLs on Render's network.
+// Embed poster image hrefs as base64 data URIs here, in the main process,
+// before the SVG is handed to the render pool.
+
+const EMBED_IMG_RE = /href="(https?:\/\/[^"]+)"/g;
+
+async function serverEmbedImages(svgText) {
+  const matches = [...svgText.matchAll(EMBED_IMG_RE)];
+  if (matches.length === 0) return svgText;
+
+  const uniqueUrls = [...new Set(matches.map(m => m[1]))];
+
+  const replacements = await Promise.all(
+    uniqueUrls.map(async url => {
+      const ac  = new AbortController();
+      const t   = setTimeout(() => ac.abort(), 8_000);
+      try {
+        const res = await fetch(url, {
+          signal:  ac.signal,
+          headers: { 'User-Agent': 'SpicyDevs-Rasterizer/4.0' },
+        });
+        clearTimeout(t);
+        if (!res.ok) return { url, dataUri: null };
+        const buf = Buffer.from(await res.arrayBuffer());
+        const ct  = res.headers.get('content-type') || 'image/jpeg';
+        return { url, dataUri: `data:${ct};base64,${buf.toString('base64')}` };
+      } catch {
+        clearTimeout(t);
+        return { url, dataUri: null };
+      }
+    }),
+  );
+
+  for (const { url, dataUri } of replacements) {
+    if (dataUri) svgText = svgText.split(`href="${url}"`).join(`href="${dataUri}"`);
+  }
+  return svgText;
 }
