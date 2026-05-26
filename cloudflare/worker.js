@@ -1,20 +1,26 @@
 // cloudflare/worker.js
 //
-// CHANGES v5
+// CHANGES v6
 // ─────────────────────────────────────────────────────────────────────────────
-// • Expands <!--ICONS:key1,key2--> placeholder using bundled ICONS before render.
-//   This keeps the SVG payload sent by the main Worker lean (~40 bytes vs ~20 KB)
-//   while the rasterizer still receives full icon <symbol> elements.
-// • expandIconPlaceholderSync() uses the bundled assets/icons.js — no fetch.
-// • All prior v4 behaviour preserved (service binding + HTTP, X-Format, etc.)
+// • Removes ../assets/icons.js dependency (was causing build failure).
+//   Now uses expandIconPlaceholder() (async, fetches from api.spicydevs.xyz/data/icons
+//   and caches in-isolate for 24 h) instead of the sync bundled-ICONS variant.
+// • warmIconCache() called at module load so icons are ready before first request.
+// • Adds /proxy endpoint — HTTPS→HTTP bridge so the browser benchmark tool
+//   can reach HTTP-only rasterizer nodes without disabling Cloudflare Always-HTTPS.
+//   Targets are whitelisted to prevent open-relay abuse.
+// • All prior v5 behaviour preserved (service binding + HTTP, X-Format, /ss, etc.)
 
-import { initWasm, Resvg }              from '@resvg/resvg-wasm';
-import resvgWasm                        from '@resvg/resvg-wasm/index_bg.wasm';
-import fontBuffer                       from '../core/NotoSans-Subset.ttf';
-import { applyFauxBold }                from '../core/fauxBold.js';
-import { expandIconPlaceholderSync }    from '../core/iconCache.js';
-import { ICONS }                        from '../assets/icons.js';
-import puppeteer                        from '@cloudflare/puppeteer';
+import { initWasm, Resvg }                        from '@resvg/resvg-wasm';
+import resvgWasm                                   from '@resvg/resvg-wasm/index_bg.wasm';
+import fontBuffer                                  from '../core/NotoSans-Subset.ttf';
+import { applyFauxBold }                           from '../core/fauxBold.js';
+import { expandIconPlaceholder, warmIconCache }    from '../core/iconCache.js';
+import puppeteer                                   from '@cloudflare/puppeteer';
+
+// Warm the icon cache at module load (fire-and-forget — any error is swallowed
+// internally and retried on first real request)
+warmIconCache();
 
 // ── WASM init ─────────────────────────────────────────────────────────────────
 
@@ -45,19 +51,42 @@ const RESVG_OPTS = {
   imageRendering: 1,
 };
 
+// ── Proxy allowlist ───────────────────────────────────────────────────────────
+// Only requests whose target URL starts with one of these prefixes are
+// forwarded. This prevents the /proxy endpoint being used as an open relay.
+
+const PROXY_ALLOWLIST = [
+  'http://fr1.spaceify.eu:25980',
+  'http://de20.spaceify.eu:26100',
+  'http://node-3.midas.host:25108',
+];
+
 // ── Main handler ──────────────────────────────────────────────────────────────
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
+    // ── Dedicated routes ───────────────────────────────────────────────────
+
     if (url.pathname === '/health') {
-      return jsonOk({ status: 'ok', version: '5.0', node: 'cloudflare', queueDepth: 0 });
+      return jsonOk({
+        status:    'ok',
+        version:   '6.0',
+        node:      'cloudflare',
+        queueDepth: 0,
+      });
     }
 
     if (url.pathname === '/ss') {
       return handleScreenshot(request, env);
     }
+
+    if (url.pathname === '/proxy') {
+      return handleProxy(request);
+    }
+
+    // ── CORS preflight ─────────────────────────────────────────────────────
 
     if (request.method === 'OPTIONS') {
       return new Response(null, {
@@ -65,12 +94,12 @@ export default {
         headers: {
           'Access-Control-Allow-Origin':  '*',
           'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-          'Access-Control-Allow-Headers': 'Content-Type, X-Format',
+          'Access-Control-Allow-Headers': 'Content-Type, X-Format, X-SVG-Encoding',
         },
       });
     }
 
-    // ── Rasterisation routes ───────────────────────────────────────────────
+    // ── Rasterisation ──────────────────────────────────────────────────────
 
     try {
       await ensureWasm();
@@ -80,9 +109,12 @@ export default {
 
     const formatHeader = request.headers.get('X-Format') || '';
     const formatParam  = url.searchParams.get('format')  || '';
-    const format       = (['png','jpg','jpeg','webp'].find(f => f === (formatHeader || formatParam).toLowerCase())) || 'png';
+    const format       = (['png', 'jpg', 'jpeg', 'webp'].find(
+      f => f === (formatHeader || formatParam).toLowerCase()
+    )) || 'png';
 
     // ── Resolve SVG text ───────────────────────────────────────────────────
+
     let svgText;
 
     if (request.method === 'POST') {
@@ -101,7 +133,9 @@ export default {
       const targetUrl = url.searchParams.get('url');
       if (!targetUrl) return jsonError(400, 'Missing ?url= parameter');
       try {
-        const r = await fetch(targetUrl, { headers: { 'User-Agent': 'SpicyDevs-Rasterizer/5.0' } });
+        const r = await fetch(targetUrl, {
+          headers: { 'User-Agent': 'SpicyDevs-Rasterizer/6.0' },
+        });
         if (!r.ok) return jsonError(502, `SVG fetch failed: ${r.status}`);
         svgText = await r.text();
       } catch (e) {
@@ -111,15 +145,16 @@ export default {
       return jsonError(405, 'Method not allowed');
     }
 
-    // ── Render ─────────────────────────────────────────────────────────────
+    // ── Render pipeline ────────────────────────────────────────────────────
+
     try {
-      // 1. Expand icon placeholder using bundled ICONS (sync, no fetch needed)
-      const withIcons  = expandIconPlaceholderSync(svgText, ICONS);
-      // 2. Embed external poster image URLs as base64
+      // 1. Expand <!--ICONS:key1,key2--> placeholder (fetched + cached in-isolate)
+      const withIcons  = await expandIconPlaceholder(svgText);
+      // 2. Embed external poster image URLs as base64 data URIs
       const embedded   = await embedExternalImages(withIcons);
-      // 3. Faux-bold synthesis
+      // 3. Faux-bold synthesis (stroke on bold text so Regular-only font looks bold)
       const processed  = applyFauxBold(embedded);
-      // 4. Render
+      // 4. Rasterise
       const resvg      = new Resvg(processed, RESVG_OPTS);
       const rendered   = resvg.render();
 
@@ -158,7 +193,7 @@ export default {
   },
 };
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── JSON helpers ──────────────────────────────────────────────────────────────
 
 function jsonOk(body) {
   return new Response(JSON.stringify(body), {
@@ -174,9 +209,12 @@ function jsonError(status, message) {
   });
 }
 
+// ── External image embedding ──────────────────────────────────────────────────
+
 /**
- * Embed external http(s) image hrefs as inline base64 data URIs.
- * Skips anything that already starts with data: (already embedded).
+ * Replace every href="https://..." in the SVG with an inline base64 data URI
+ * so resvg can render the poster image without a network call during rendering.
+ * Skips anything already starting with data: (already embedded).
  */
 async function embedExternalImages(svgText) {
   const matches = [...svgText.matchAll(/href="(https?:\/\/[^"]+)"/g)];
@@ -188,7 +226,7 @@ async function embedExternalImages(svgText) {
     uniqueUrls.map(async url => {
       try {
         const res = await fetch(url, {
-          headers: { 'User-Agent': 'SpicyDevs-Rasterizer/5.0' },
+          headers: { 'User-Agent': 'SpicyDevs-Rasterizer/6.0' },
           signal:  AbortSignal.timeout(8_000),
         });
         if (!res.ok) return { url, dataUri: null };
@@ -214,7 +252,58 @@ async function embedExternalImages(svgText) {
   return svgText;
 }
 
-// ── /ss — headless screenshot ─────────────────────────────────────────────────
+// ── /proxy — HTTPS→HTTP bridge ────────────────────────────────────────────────
+//
+// The browser benchmark tool runs on an HTTPS origin; mixed-content policy
+// blocks direct fetch() to HTTP servers. This endpoint lets the browser send
+// HTTPS requests to the Worker, which forwards them server-side (no such
+// restriction) to the HTTP rasterizer node and streams the response back.
+//
+// Security: only URLs that start with a known HTTP node prefix are forwarded.
+
+async function handleProxy(request) {
+  const url       = new URL(request.url);
+  const targetUrl = url.searchParams.get('url');
+
+  if (!targetUrl) return jsonError(400, 'Missing ?url= parameter');
+
+  const allowed = PROXY_ALLOWLIST.some(prefix => targetUrl.startsWith(prefix));
+  if (!allowed) return jsonError(403, `Proxy target not in allowlist: ${targetUrl}`);
+
+  // Forward only the headers the rasterizer nodes actually use
+  const proxyHeaders = new Headers();
+  for (const key of ['content-type', 'x-format', 'x-svg-encoding']) {
+    const val = request.headers.get(key);
+    if (val) proxyHeaders.set(key, val);
+  }
+  proxyHeaders.set('User-Agent', 'SpicyDevs-Proxy/1.0');
+
+  const init = { method: request.method, headers: proxyHeaders };
+  if (request.method === 'POST') {
+    // Consume body as ArrayBuffer so binary SVG payloads are forwarded correctly
+    init.body = await request.arrayBuffer();
+  }
+
+  let upstream;
+  try {
+    upstream = await fetch(targetUrl, init);
+  } catch (e) {
+    return jsonError(502, `Proxy fetch failed: ${e.message}`);
+  }
+
+  // Copy upstream headers and add CORS so the browser accepts the response
+  const respHeaders = new Headers(upstream.headers);
+  respHeaders.set('Access-Control-Allow-Origin', '*');
+  respHeaders.set('X-Proxied-Via',  'cf-worker');
+  respHeaders.set('X-Proxy-Target', targetUrl);
+
+  return new Response(upstream.body, {
+    status:  upstream.status,
+    headers: respHeaders,
+  });
+}
+
+// ── /ss — headless screenshot via Puppeteer ───────────────────────────────────
 
 async function handleScreenshot(request, env) {
   const { searchParams } = new URL(request.url);
@@ -244,8 +333,14 @@ async function handleScreenshot(request, env) {
 
     await page.setRequestInterception(true);
     page.on('request', req => {
-      const blocked = ['doubleclick.net', 'googlesyndication.com', 'adservice.google.com', 'google-analytics.com'];
-      if (blocked.some(h => req.url().includes(h)) || ['media', 'websocket', 'manifest'].includes(req.resourceType())) {
+      const blocked = [
+        'doubleclick.net', 'googlesyndication.com',
+        'adservice.google.com', 'google-analytics.com',
+      ];
+      if (
+        blocked.some(h => req.url().includes(h)) ||
+        ['media', 'websocket', 'manifest'].includes(req.resourceType())
+      ) {
         req.abort();
       } else {
         req.continue();
@@ -258,7 +353,9 @@ async function handleScreenshot(request, env) {
     const opts = {
       type: format,
       ...(format === 'jpeg' ? { quality } : {}),
-      ...(fullPage ? { fullPage: true } : { clip: { x: 0, y: 0, width, height } }),
+      ...(fullPage
+        ? { fullPage: true }
+        : { clip: { x: 0, y: 0, width, height } }),
     };
     const imageBuffer = await page.screenshot(opts);
 
@@ -276,4 +373,4 @@ async function handleScreenshot(request, env) {
   } finally {
     if (browser) await browser.close();
   }
-}
+    }
