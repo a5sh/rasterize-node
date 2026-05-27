@@ -1,141 +1,119 @@
-// render-node/discord.js
+// render/discord.js
+//
+// REWRITTEN — Discord integration removed from this node.
+// Metrics are collected locally (same logic as before) and forwarded to the
+// Cloudflare Edge Hub at /report, which owns all Discord interactions and
+// displays a unified fleet embed covering every node.
+//
+// Exported API is IDENTICAL to the old discord.js — server.js needs no changes.
+//
+// ENV VARS
+//   CF_REPORT_URL        Override hub URL (default: https://r-cf.spicydevs.xyz/report)
+//   RENDER_SERVICE_NAME  Node display name injected by Render.com
 
-import fs   from 'node:fs';
-import os   from 'node:os';
-import path from 'node:path';
+import os from 'node:os';
 
-const WEBHOOK_URL   = process.env.DISCORD_WEBHOOK_URL || 'https://discord.com/api/webhooks/1484521396326502511/hOSVLWiK3MKCXzzwujgYtIa6zOiTkHnjO4GmGYvTeGTLmBjEO0kTvs5x4ySWFC4htpg5';
-const MSG_ID_FILE   = path.join(process.cwd(), '.dashboard_msg_id');
-const NODE_NAME     = process.env.RENDER_SERVICE_NAME || os.hostname();
+const CF_REPORT_URL      = process.env.CF_REPORT_URL || 'https://r-cf.spicydevs.xyz/report';
+const NODE_NAME          = process.env.RENDER_SERVICE_NAME || os.hostname();
+const REPORT_INTERVAL_MS = 5 * 60_000;   // flush + report every 5 minutes
+const MAX_JITTER_MS      = 60_000;        // random start delay so nodes don't all report at once
 
-// How often to edit the dashboard embed. Each node picks a random offset
-// on startup so all 4 nodes don't PATCH the webhook at the same millisecond.
-const DASHBOARD_INTERVAL_MS = 5 * 60_000;  // 5 minutes base
-const MAX_JITTER_MS         = 60_000;       // up to 1 minute of random offset
+// ── Metrics window ────────────────────────────────────────────────────────────
+// Identical to the old discord.js — samples are collected between flushes.
 
-// Error messages: at most one Discord post per this window to avoid spam.
-const ERROR_COOLDOWN_MS = 30_000;
-
-// ── Internal metrics window ───────────────────────────────────────────────────
-// Collects raw samples between dashboard flushes.
-// On each flush the window is summarised (min/max/percentiles) then cleared.
-
-const WINDOW_SIZE = 2000; // max samples kept in memory before flush
+const WINDOW_SIZE = 2000;
 
 const _window = {
-  jobDurationsMs: [],   // time each job spent in renderToBuffer() or wsrv fallback
-  cpuSamples:     [],   // _cpuPercent snapshot taken every 5s
-  memSamples:     [],   // memory used % taken every 5s
-  queueDepths:    [],   // jobQueue.length sampled every 5s
+  jobDurationsMs: [],
+  cpuSamples:     [],
+  memSamples:     [],
+  queueDepths:    [],
   wsrvFallbacks:  0,
   resvgFails:     0,
   requests:       0,
   errors:         0,
 };
 
-// Snapshot of last flush — shown in the embed until the next flush
-let _lastSnapshot = null;
-
 // ── Public stats object (mutated by server.js) ────────────────────────────────
+
 export const stats = {
-  startedAt:    Date.now(),
-  activeJobs:   0,
-  queuedJobs:   0,
-  status:       'starting',
-  lastError:    null,
+  startedAt:  Date.now(),
+  activeJobs: 0,
+  queuedJobs: 0,
+  status:     'starting',
+  lastError:  null,
 };
 
-// Counters incremented by server.js
-export function recordRequest()      { _window.requests++;                        }
-export function recordResvgFail()    { _window.resvgFails++;   stats.lastError = { message: 'resvg fail', ts: Date.now() }; }
-export function recordWsrvFallback() { _window.wsrvFallbacks++;                   }
-export function recordError(msg)     { _window.errors++;       stats.lastError = { message: msg, ts: Date.now() }; }
+// ── Counters ──────────────────────────────────────────────────────────────────
 
-/**
- * Record how long a single job took (ms).
- * Call this in server.js after each renderToBuffer() call.
- */
+export function recordRequest()      { _window.requests++;                                               }
+export function recordResvgFail()    { _window.resvgFails++;   stats.lastError = { message: 'resvg fail', ts: Date.now() }; }
+export function recordWsrvFallback() { _window.wsrvFallbacks++;                                          }
+export function recordError(msg)     { _window.errors++;       stats.lastError = { message: msg,          ts: Date.now() }; }
+
 export function recordJobDuration(ms) {
-  if (_window.jobDurationsMs.length < WINDOW_SIZE) {
-    _window.jobDurationsMs.push(ms);
-  }
+  if (_window.jobDurationsMs.length < WINDOW_SIZE) _window.jobDurationsMs.push(ms);
 }
 
 // ── CPU / memory sampler ──────────────────────────────────────────────────────
-const SAMPLE_INTERVAL_MS = 5_000;
-let _cpuPercent  = 0;
+
 let _prevCpuSample = _takeCpuSample();
 
 function _takeCpuSample() {
-  return os.cpus().map((c) => ({ ...c.times }));
+  return os.cpus().map(c => ({ ...c.times }));
 }
 
-function _refreshSystem() {
-  // CPU delta
+setInterval(() => {
   const next = _takeCpuSample();
   let totalIdle = 0, totalBusy = 0;
   next.forEach((cpu, i) => {
     const prev = _prevCpuSample[i];
     const idle = cpu.idle - prev.idle;
-    const busy = (cpu.user - prev.user) + (cpu.sys - prev.sys)
-               + (cpu.nice - prev.nice) + (cpu.irq - prev.irq);
+    const busy = (cpu.user - prev.user) + (cpu.sys  - prev.sys)
+               + (cpu.nice - prev.nice) + (cpu.irq  - prev.irq);
     totalIdle += idle;
     totalBusy += busy;
   });
-  const total = totalIdle + totalBusy;
-  _cpuPercent = total > 0 ? Math.round((totalBusy / total) * 100) : 0;
+  const total  = totalIdle + totalBusy;
+  const cpuPct = total > 0 ? Math.round((totalBusy / total) * 100) : 0;
   _prevCpuSample = next;
 
-  // Memory
   const memPct = Math.round(((os.totalmem() - os.freemem()) / os.totalmem()) * 100);
 
-  // Push samples (cap size)
-  if (_window.cpuSamples.length  < WINDOW_SIZE) _window.cpuSamples.push(_cpuPercent);
+  if (_window.cpuSamples.length  < WINDOW_SIZE) _window.cpuSamples.push(cpuPct);
   if (_window.memSamples.length  < WINDOW_SIZE) _window.memSamples.push(memPct);
   if (_window.queueDepths.length < WINDOW_SIZE) _window.queueDepths.push(stats.queuedJobs);
-}
-
-setInterval(_refreshSystem, SAMPLE_INTERVAL_MS);
+}, 5_000);
 
 // ── Percentile helpers ────────────────────────────────────────────────────────
 
 function pct(sorted, p) {
   if (sorted.length === 0) return 0;
-  const idx = Math.ceil((p / 100) * sorted.length) - 1;
-  return sorted[Math.max(0, idx)];
+  return sorted[Math.max(0, Math.ceil((p / 100) * sorted.length) - 1)];
 }
 
 function summarise(arr) {
   if (arr.length === 0) return { min: 0, max: 0, p50: 0, p95: 0, p99: 0, avg: 0, n: 0 };
-  const s = [...arr].sort((a, b) => a - b);
+  const s   = [...arr].sort((a, b) => a - b);
   const avg = Math.round(s.reduce((a, b) => a + b, 0) / s.length);
-  return {
-    min: s[0],
-    max: s[s.length - 1],
-    p50: pct(s, 50),
-    p95: pct(s, 95),
-    p99: pct(s, 99),
-    avg,
-    n:   s.length,
-  };
+  return { min: s[0], max: s[s.length - 1], p50: pct(s, 50), p95: pct(s, 95), p99: pct(s, 99), avg, n: s.length };
 }
 
 function flushWindow() {
   const snap = {
-    ts:           Date.now(),
-    requests:     _window.requests,
-    errors:       _window.errors,
-    resvgFails:   _window.resvgFails,
-    wsrvFallbacks:_window.wsrvFallbacks,
-    jobDuration:  summarise(_window.jobDurationsMs),
-    cpu:          summarise(_window.cpuSamples),
-    mem:          summarise(_window.memSamples),
-    queueDepth:   summarise(_window.queueDepths),
-    cores:        os.cpus().length,
-    totalMemMB:   Math.round(os.totalmem() / 1024 / 1024),
+    ts:            Date.now(),
+    requests:      _window.requests,
+    errors:        _window.errors,
+    resvgFails:    _window.resvgFails,
+    wsrvFallbacks: _window.wsrvFallbacks,
+    jobDuration:   summarise(_window.jobDurationsMs),
+    cpu:           summarise(_window.cpuSamples),
+    mem:           summarise(_window.memSamples),
+    queueDepth:    summarise(_window.queueDepths),
+    cores:         os.cpus().length,
+    totalMemMB:    Math.round(os.totalmem() / 1024 / 1024),
   };
 
-  // Reset window
   _window.jobDurationsMs = [];
   _window.cpuSamples     = [];
   _window.memSamples     = [];
@@ -148,283 +126,74 @@ function flushWindow() {
   return snap;
 }
 
-// ── Formatting helpers ────────────────────────────────────────────────────────
+// ── CF Hub reporting ──────────────────────────────────────────────────────────
 
-function uptimeStr() {
-  const s   = Math.floor((Date.now() - stats.startedAt) / 1000);
-  const h   = Math.floor(s / 3600);
-  const m   = Math.floor((s % 3600) / 60);
-  return `${h}h ${m}m`;
-}
-
-function statusColor() {
-  if (stats.status === 'online')   return 0x2ecc71;
-  if (stats.status === 'degraded') return 0xe67e22;
-  if (stats.status === 'offline')  return 0xe74c3c;
-  return 0x95a5a6;
-}
-
-function statusEmoji() {
-  if (stats.status === 'online')   return '🟢';
-  if (stats.status === 'degraded') return '🟠';
-  if (stats.status === 'offline')  return '🔴';
-  return '⚪';
-}
-
-function fmtDur(s) {
-  // s is a summarise() object
-  return `min \`${s.min}ms\` · p50 \`${s.p50}ms\` · p95 \`${s.p95}ms\` · p99 \`${s.p99}ms\` · max \`${s.max}ms\``;
-}
-
-function fmtPct(s) {
-  return `avg \`${s.avg}%\` · p95 \`${s.p95}%\` · max \`${s.max}%\``;
-}
-
-function fmtQueue(s) {
-  return `avg \`${s.avg}\` · p95 \`${s.p95}\` · max \`${s.max}\``;
-}
-
-function buildDashboardPayload(snap) {
-  const hasSnap = snap !== null;
-
-  const fields = [
-    // ── Header row ────────────────────────────────────────────────────────
-    { name: '📊 Status',   value: stats.status,                   inline: true },
-    { name: '⏱ Uptime',    value: uptimeStr(),                    inline: true },
-    { name: '⚡ Active',    value: String(stats.activeJobs),       inline: true },
-  ];
-
-  if (hasSnap) {
-    const intervalMin = Math.round(DASHBOARD_INTERVAL_MS / 60_000);
-
-    fields.push(
-      // ── This interval's counters ──────────────────────────────────────
-      { name: `📥 Requests (last ${intervalMin}m)`,  value: String(snap.requests),      inline: true },
-      { name: `❌ Errors (last ${intervalMin}m)`,    value: String(snap.errors),        inline: true },
-      { name: `🌐 wsrv Fallbacks`,                   value: String(snap.wsrvFallbacks), inline: true },
-
-      // ── Job duration percentiles ──────────────────────────────────────
-      {
-        name:   `⏱ Job Duration (n=${snap.jobDuration.n})`,
-        value:  snap.jobDuration.n > 0
-          ? fmtDur(snap.jobDuration)
-          : '_No jobs this interval_',
-        inline: false,
-      },
-
-      // ── CPU ───────────────────────────────────────────────────────────
-      {
-        name:   `🖥 CPU — ${snap.cores} core(s)`,
-        value:  snap.cpu.n > 0 ? fmtPct(snap.cpu) : '_No samples_',
-        inline: false,
-      },
-
-      // ── Memory ────────────────────────────────────────────────────────
-      {
-        name:   `💾 Memory — ${snap.totalMemMB} MB total`,
-        value:  snap.mem.n > 0 ? fmtPct(snap.mem) : '_No samples_',
-        inline: false,
-      },
-
-      // ── Queue depth ───────────────────────────────────────────────────
-      {
-        name:   '🕐 Queue Depth',
-        value:  snap.queueDepth.n > 0 ? fmtQueue(snap.queueDepth) : '_No samples_',
-        inline: false,
-      },
-
-      // ── Tuning hint ───────────────────────────────────────────────────
-      {
-        name:   '💡 MAX_CONCURRENT hint',
-        value:  snap.cpu.n > 0
-          ? concurrencyHint(snap)
-          : '_Not enough data yet_',
-        inline: false,
-      },
-    );
-  } else {
-    fields.push({
-      name:  '📊 Metrics',
-      value: `_First snapshot in ${Math.round(DASHBOARD_INTERVAL_MS / 60_000)} min_`,
-      inline: false,
-    });
-  }
-
-  // Last error always shown
-  fields.push({
-    name:   '🕵 Last Error',
-    value:  stats.lastError
-      ? `\`${stats.lastError.message.slice(0, 200)}\`\n<t:${Math.floor(stats.lastError.ts / 1000)}:R>`
-      : 'None',
-    inline: false,
-  });
-
-  return {
-    embeds: [{
-      title:     `${statusEmoji()} Rasterizer — ${NODE_NAME}`,
-      color:     statusColor(),
-      fields,
-      footer:    { text: `Updated every ${Math.round(DASHBOARD_INTERVAL_MS / 60_000)}m · intervals reset on flush` },
-      timestamp: new Date().toISOString(),
-    }],
+async function reportToCF(type, extra = {}) {
+  const payload = {
+    type,
+    node:  NODE_NAME,
+    ts:    Date.now(),
+    stats: {
+      startedAt:  stats.startedAt,
+      activeJobs: stats.activeJobs,
+      queuedJobs: stats.queuedJobs,
+      status:     stats.status,
+      lastError:  stats.lastError,
+    },
+    ...extra,
   };
-}
 
-function concurrencyHint(snap) {
-  const p95cpu   = snap.cpu.p95;
-  const p95queue = snap.queueDepth.p95;
-  const cores    = snap.cores;
-  const current  = parseInt(process.env.MAX_CONCURRENT || '4', 10);
-
-  if (p95cpu < 40 && p95queue === 0) {
-    return `✅ Underutilised (p95 CPU ${p95cpu}%, no queuing). Consider raising MAX_CONCURRENT to **${Math.min(current + 2, cores * 4)}**.`;
-  }
-  if (p95cpu > 80 || p95queue > 2) {
-    return `⚠️ Saturated (p95 CPU ${p95cpu}%, p95 queue ${p95queue}). Consider lowering MAX_CONCURRENT to **${Math.max(current - 1, 1)}**.`;
-  }
-  return `✅ Well-balanced (p95 CPU ${p95cpu}%, p95 queue ${p95queue}). Current MAX_CONCURRENT=${current} looks good.`;
-}
-
-// ── Webhook helpers ───────────────────────────────────────────────────────────
-
-async function webhookPost(payload) {
-  if (!WEBHOOK_URL) return null;
   try {
-    const res = await fetch(`${WEBHOOK_URL}?wait=true`, {
+    await fetch(CF_REPORT_URL, {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
       body:    JSON.stringify(payload),
+      signal:  AbortSignal.timeout(5_000),
     });
-    if (!res.ok) { console.error(`[discord] POST failed: ${res.status}`); return null; }
-    return res.json();
   } catch (e) {
-    console.error('[discord] POST error:', e.message);
-    return null;
+    // Non-fatal — node keeps running even if the hub is temporarily unreachable.
+    console.warn('[reporter] CF hub unreachable:', e.message);
   }
 }
-
-async function webhookPatch(messageId, payload) {
-  if (!WEBHOOK_URL || !messageId) return false;
-  try {
-    const res = await fetch(`${WEBHOOK_URL}/messages/${messageId}`, {
-      method:  'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify(payload),
-    });
-    return res.ok;
-  } catch {
-    return false;
-  }
-}
-
-// ── Dashboard message lifecycle ───────────────────────────────────────────────
-
-let _dashboardMsgId = null;
-
-async function loadOrCreateDashboard() {
-  try {
-    const stored = fs.readFileSync(MSG_ID_FILE, 'utf8').trim();
-    if (stored) {
-      const ok = await webhookPatch(stored, buildDashboardPayload(_lastSnapshot));
-      if (ok) {
-        _dashboardMsgId = stored;
-        console.log(`[discord] Resumed dashboard ${stored}`);
-        return;
-      }
-    }
-  } catch (_) {}
-
-  const msg = await webhookPost(buildDashboardPayload(_lastSnapshot));
-  if (msg?.id) {
-    _dashboardMsgId = msg.id;
-    try { fs.writeFileSync(MSG_ID_FILE, msg.id, 'utf8'); } catch (_) {}
-    console.log(`[discord] Created dashboard ${msg.id}`);
-  }
-}
-
-async function runDashboardCycle() {
-  // 1. Flush the current window into a snapshot
-  _lastSnapshot = flushWindow();
-
-  // 2. Update degraded status based on this interval's error rate
-  if (stats.status !== 'offline') {
-    stats.status = _lastSnapshot.errors > 5 ? 'degraded' : 'online';
-  }
-
-  // 3. Edit the dashboard message in-place
-  if (!_dashboardMsgId) {
-    await loadOrCreateDashboard();
-    return;
-  }
-  const ok = await webhookPatch(_dashboardMsgId, buildDashboardPayload(_lastSnapshot));
-  if (!ok) {
-    _dashboardMsgId = null;
-    try { fs.unlinkSync(MSG_ID_FILE); } catch (_) {}
-    await loadOrCreateDashboard();
-  }
-}
-
-// ── Error rate limiting ───────────────────────────────────────────────────────
-
-let _lastErrorPost = 0;
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /**
- * Post a standalone error embed.
- * Rate-limited to one post per ERROR_COOLDOWN_MS to prevent webhook spam
- * during cascading failures. Suppressed errors are still counted internally.
+ * Log an error to the CF hub (which surfaces it in the Discord embed).
+ * Drop-in replacement for the old logError — third `fields` arg is ignored
+ * (hub builds its own embed; raw data is more useful than pre-formatted fields).
  */
-export async function logError(title, description, fields = []) {
+export async function logError(title, description, _fields = []) {
   recordError(description);
-  if (!WEBHOOK_URL) return;
-
-  const now = Date.now();
-  if (now - _lastErrorPost < ERROR_COOLDOWN_MS) {
-    // Suppressed — still counted in _window.errors, will appear in next snapshot
-    return;
-  }
-  _lastErrorPost = now;
-
-  await webhookPost({
-    embeds: [{
-      title:       `❌ ${title}`,
-      description: `\`\`\`${description.slice(0, 1000)}\`\`\``,
-      color:       0xe74c3c,
-      fields: [
-        { name: 'Node', value: NODE_NAME,                inline: true },
-        { name: 'Time', value: new Date().toISOString(), inline: true },
-        ...fields,
-      ],
-      timestamp: new Date().toISOString(),
-    }],
-  }).catch(() => {});
+  await reportToCF('error', { title, description });
 }
 
+/**
+ * Call once after the server starts listening.
+ * Sends an 'online' report after a random jitter delay (to stagger fleet startup),
+ * then schedules periodic metric flushes.
+ */
 export async function notifyOnline() {
-  if (!WEBHOOK_URL) return;
   stats.status = 'online';
 
-  // Stagger: random delay up to MAX_JITTER_MS so all nodes don't
-  // hit the webhook at the same time on a coordinated deployment.
   const jitter = Math.floor(Math.random() * MAX_JITTER_MS);
-  console.log(`[discord] Starting with ${Math.round(jitter / 1000)}s jitter`);
+  console.log(`[reporter] Starting — will report to CF hub after ${Math.round(jitter / 1000)}s`);
+  await new Promise(r => setTimeout(r, jitter));
 
-  await new Promise((r) => setTimeout(r, jitter));
-  await loadOrCreateDashboard();
+  await reportToCF('online');
 
-  // Schedule periodic flush + dashboard edit, offset by the same jitter
-  // so subsequent cycles also stay staggered between nodes.
   setInterval(async () => {
-    try { await runDashboardCycle(); } catch (e) {
-      console.error('[discord] Dashboard cycle error:', e.message);
-    }
-  }, DASHBOARD_INTERVAL_MS);
+    const snapshot = flushWindow();
+    stats.status   = snapshot.errors > 5 ? 'degraded' : 'online';
+    await reportToCF('metrics', { snapshot });
+  }, REPORT_INTERVAL_MS);
 }
 
+/**
+ * Call in SIGTERM / SIGINT handler before process.exit().
+ * Flushes current window and sends a final 'offline' report.
+ */
 export async function notifyOffline(reason = 'SIGTERM') {
-  if (!WEBHOOK_URL || !_dashboardMsgId) return;
   stats.status = 'offline';
-  _lastSnapshot = flushWindow(); // final flush
-  await webhookPatch(_dashboardMsgId, buildDashboardPayload(_lastSnapshot)).catch(() => {});
+  await reportToCF('offline', { reason, snapshot: flushWindow() });
 }
