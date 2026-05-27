@@ -2,12 +2,19 @@
 
 import { createRequire }          from 'node:module';
 import { workerData, parentPort } from 'node:worker_threads';
-import { createHash }             from 'node:crypto';   // explicit import — globalThis.crypto in Node 18+ worker threads is the Web Crypto API, which has no createHash()
+// NOTE: do NOT import createHash from 'node:crypto' here.
+// On Render.com (and NFT-bundled envs) the ESM named import resolves to the
+// Web Crypto API (globalThis.crypto) which has no createHash().
+// We use _require('node:crypto') instead, after _require is set up below.
 import { applyFauxBold }          from './fauxBold.js';
 import { getCachedPoster, setCachedPoster } from './cache.js';
 
 const _require  = createRequire(workerData.serverDir + '/_.js');
 const { Resvg } = _require('@resvg/resvg-js');
+
+// Use require-based crypto — guaranteed to be the Node.js built-in regardless
+// of how the worker file is bundled or which Node version is running.
+const { createHash } = _require('node:crypto');
 
 const OPTS = workerData.resvgOpts;
 
@@ -29,15 +36,6 @@ try {
 }
 
 // ── External image embedding ──────────────────────────────────────────────────
-// Replaces href="https://..." with inline base64 data URIs so resvg can render
-// the poster image without filesystem or network access.
-//
-// Called ONLY when the SVG contains URL references (no_embed or URL-based path).
-// When the poster is already base64, this is a no-op (no matches).
-//
-// NOTE: The server (render/server.js, vps/server.js) pre-embeds images before
-// dispatching to the pool, so this function is a safety net for any URLs that
-// slip through (e.g. direct GET ?url= requests). It will typically be a no-op.
 
 const EXTERNAL_IMG_RE = /href="(https?:\/\/[^"]+)"/g;
 const FETCH_TIMEOUT_MS = 6_000;
@@ -50,7 +48,6 @@ async function embedExternalImages(svgText) {
 
   const replacements = await Promise.all(
     uniqueUrls.map(async url => {
-      // Check poster cache first
       const cached = getCachedPoster(url);
       if (cached) {
         return { url, dataUri: `data:${cached.ct};base64,${cached.data.toString('base64')}` };
@@ -66,7 +63,6 @@ async function embedExternalImages(svgText) {
         const buf  = Buffer.from(await res.arrayBuffer());
         const ct   = res.headers.get('content-type') || 'image/jpeg';
 
-        // Cache the poster
         setCachedPoster(url, buf, ct);
 
         return { url, dataUri: `data:${ct};base64,${buf.toString('base64')}` };
@@ -85,13 +81,12 @@ async function embedExternalImages(svgText) {
 
 // ── Message handler ───────────────────────────────────────────────────────────
 
-const _renderCache = new Map();        // svgHash:format → { png: Buffer, mime: string, expiry: number }
-const RENDER_CACHE_TTL  = 3 * 60_000; // 3 minutes
+const _renderCache = new Map();
+const RENDER_CACHE_TTL  = 3 * 60_000;
 const MAX_RENDER_CACHE  = 50;
 
 parentPort.on('message', async ({ jobId, svgText, format }) => {
   try {
-    // Use the explicitly imported createHash — NOT the global crypto object
     const svgHash  = createHash('sha1').update(svgText + format).digest('hex').slice(0, 16);
     const cached   = _renderCache.get(svgHash);
 
@@ -115,7 +110,6 @@ parentPort.on('message', async ({ jobId, svgText, format }) => {
       buf = rendered.asPng(); mime = 'image/png';
     }
 
-    // Store in render cache
     if (_renderCache.size >= MAX_RENDER_CACHE) {
       _renderCache.delete(_renderCache.keys().next().value);
     }
