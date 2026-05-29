@@ -1,20 +1,34 @@
-// core/renderWorker.js — corrected import order
+// core/renderWorker.js
 
 import { createRequire }          from 'node:module';
 import { workerData, parentPort } from 'node:worker_threads';
-// NOTE: do NOT import createHash from 'node:crypto' here.
-// On Render.com (and NFT-bundled envs) the ESM named import resolves to the
-// Web Crypto API (globalThis.crypto) which has no createHash().
-// We use _require('node:crypto') instead, after _require is set up below.
 import { applyFauxBold }          from './fauxBold.js';
 import { getCachedPoster, setCachedPoster } from './cache.js';
 
 const _require  = createRequire(workerData.serverDir + '/_.js');
 const { Resvg } = _require('@resvg/resvg-js');
 
-// Use require-based crypto — guaranteed to be the Node.js built-in regardless
-// of how the worker file is bundled or which Node version is running.
-const { createHash } = _require('node:crypto');
+// ── CRYPTO-FREE cache key ─────────────────────────────────────────────────────
+// Do NOT import createHash from node:crypto here.  On Render.com (and NFT-
+// bundled envs) it can resolve to the Web Crypto API which has no createHash().
+// A simple inline FNV-1a hash is entirely sufficient for a render-cache key.
+function simpleHash(str) {
+  let h = 0x811c9dc5;
+  // Only hash the first 4 KB — SVGs are large but the meaningful variance is
+  // in the first few hundred bytes (dimensions, viewBox, first elements).
+  const len = Math.min(str.length, 4096);
+  for (let i = 0; i < len; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  // Also mix the tail (last 64 chars) to distinguish SVGs with shared prefixes
+  const tail = str.length > 4096 ? str.slice(-64) : '';
+  for (let i = 0; i < tail.length; i++) {
+    h ^= tail.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(36);
+}
 
 const OPTS = workerData.resvgOpts;
 
@@ -29,8 +43,7 @@ const WARMUP_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="500" height="
 </svg>`;
 
 try {
-  const warmSvg = applyFauxBold(WARMUP_SVG);
-  new Resvg(warmSvg, OPTS).render().asPng();
+  new Resvg(applyFauxBold(WARMUP_SVG), OPTS).render().asPng();
 } catch (e) {
   console.warn('[worker] Pre-warm failed (non-fatal):', e.message);
 }
@@ -52,19 +65,15 @@ async function embedExternalImages(svgText) {
       if (cached) {
         return { url, dataUri: `data:${cached.ct};base64,${cached.data.toString('base64')}` };
       }
-
       const ac = new AbortController();
       const t  = setTimeout(() => ac.abort(), FETCH_TIMEOUT_MS);
       try {
         const res = await fetch(url, { signal: ac.signal, headers: { 'User-Agent': 'SpicyDevs-Rasterizer/4.0' } });
         clearTimeout(t);
         if (!res.ok) return { url, dataUri: null };
-
-        const buf  = Buffer.from(await res.arrayBuffer());
-        const ct   = res.headers.get('content-type') || 'image/jpeg';
-
+        const buf = Buffer.from(await res.arrayBuffer());
+        const ct  = res.headers.get('content-type') || 'image/jpeg';
         setCachedPoster(url, buf, ct);
-
         return { url, dataUri: `data:${ct};base64,${buf.toString('base64')}` };
       } catch {
         clearTimeout(t);
@@ -82,13 +91,13 @@ async function embedExternalImages(svgText) {
 // ── Message handler ───────────────────────────────────────────────────────────
 
 const _renderCache = new Map();
-const RENDER_CACHE_TTL  = 3 * 60_000;
-const MAX_RENDER_CACHE  = 50;
+const RENDER_CACHE_TTL = 3 * 60_000;
+const MAX_RENDER_CACHE = 50;
 
 parentPort.on('message', async ({ jobId, svgText, format }) => {
   try {
-    const svgHash  = createHash('sha1').update(svgText + format).digest('hex').slice(0, 16);
-    const cached   = _renderCache.get(svgHash);
+    const cacheKey = simpleHash(svgText) + ':' + format;
+    const cached   = _renderCache.get(cacheKey);
 
     if (cached && Date.now() < cached.expiry) {
       const ab = cached.png.buffer.slice(cached.png.byteOffset, cached.png.byteOffset + cached.png.byteLength);
@@ -113,7 +122,7 @@ parentPort.on('message', async ({ jobId, svgText, format }) => {
     if (_renderCache.size >= MAX_RENDER_CACHE) {
       _renderCache.delete(_renderCache.keys().next().value);
     }
-    _renderCache.set(svgHash, { png: buf, mime, expiry: Date.now() + RENDER_CACHE_TTL });
+    _renderCache.set(cacheKey, { png: buf, mime, expiry: Date.now() + RENDER_CACHE_TTL });
 
     const ab = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
     parentPort.postMessage({ jobId, buffer: ab, mimeType: mime }, [ab]);

@@ -1,27 +1,27 @@
-// render/discord.js
-//
-// REWRITTEN — Discord integration removed from this node.
-// Metrics are collected locally (same logic as before) and forwarded to the
-// Cloudflare Edge Hub at /report, which owns all Discord interactions and
-// displays a unified fleet embed covering every node.
-//
-// Exported API is IDENTICAL to the old discord.js — server.js needs no changes.
+// render/discord.js — CF hub reporter
 //
 // ENV VARS
+//   CF_NODE_ID           REQUIRED — must match the id in CF worker's getNodes().
+//                        Set to 'render' in Render dashboard env vars.
+//                        Without this, the Discord embed won't show metrics for
+//                        this node (names won't match).
 //   CF_REPORT_URL        Override hub URL (default: https://r-cf.spicydevs.xyz/report)
-//   RENDER_SERVICE_NAME  Node display name injected by Render.com
+//   RENDER_SERVICE_NAME  Auto-injected by Render.com (used as fallback display name only)
 
 import os from 'node:os';
 
-const CF_REPORT_URL      = process.env.CF_REPORT_URL || 'https://r-cf.spicydevs.xyz/report';
-const NODE_NAME          = process.env.RENDER_SERVICE_NAME || os.hostname();
-const REPORT_INTERVAL_MS = 5 * 60_000;   // flush + report every 5 minutes
-const MAX_JITTER_MS      = 60_000;        // random start delay so nodes don't all report at once
+const CF_REPORT_URL = process.env.CF_REPORT_URL || 'https://r-cf.spicydevs.xyz/report';
 
-// ── Metrics window ────────────────────────────────────────────────────────────
-// Identical to the old discord.js — samples are collected between flushes.
+// CF_NODE_ID MUST match the id key in the CF worker's getNodes() registry.
+// e.g. if CF worker has: add('render', 'Render', env.RENDER_NODE_URL)
+// then set CF_NODE_ID=render in Render's environment variables.
+const NODE_NAME = process.env.CF_NODE_ID
+               || process.env.RENDER_SERVICE_NAME
+               || os.hostname();
 
-const WINDOW_SIZE = 2000;
+const REPORT_INTERVAL_MS = 5 * 60_000;
+const MAX_JITTER_MS      = 60_000;
+const WINDOW_SIZE        = 2000;
 
 const _window = {
   jobDurationsMs: [],
@@ -34,8 +34,6 @@ const _window = {
   errors:         0,
 };
 
-// ── Public stats object (mutated by server.js) ────────────────────────────────
-
 export const stats = {
   startedAt:  Date.now(),
   activeJobs: 0,
@@ -44,12 +42,10 @@ export const stats = {
   lastError:  null,
 };
 
-// ── Counters ──────────────────────────────────────────────────────────────────
-
-export function recordRequest()      { _window.requests++;                                               }
+export function recordRequest()      { _window.requests++;                                                         }
 export function recordResvgFail()    { _window.resvgFails++;   stats.lastError = { message: 'resvg fail', ts: Date.now() }; }
-export function recordWsrvFallback() { _window.wsrvFallbacks++;                                          }
-export function recordError(msg)     { _window.errors++;       stats.lastError = { message: msg,          ts: Date.now() }; }
+export function recordWsrvFallback() { _window.wsrvFallbacks++;                                                    }
+export function recordError(msg)     { _window.errors++;       stats.lastError = { message: msg, ts: Date.now() }; }
 
 export function recordJobDuration(ms) {
   if (_window.jobDurationsMs.length < WINDOW_SIZE) _window.jobDurationsMs.push(ms);
@@ -69,8 +65,8 @@ setInterval(() => {
   next.forEach((cpu, i) => {
     const prev = _prevCpuSample[i];
     const idle = cpu.idle - prev.idle;
-    const busy = (cpu.user - prev.user) + (cpu.sys  - prev.sys)
-               + (cpu.nice - prev.nice) + (cpu.irq  - prev.irq);
+    const busy = (cpu.user - prev.user) + (cpu.sys - prev.sys)
+               + (cpu.nice - prev.nice) + (cpu.irq - prev.irq);
     totalIdle += idle;
     totalBusy += busy;
   });
@@ -113,7 +109,6 @@ function flushWindow() {
     cores:         os.cpus().length,
     totalMemMB:    Math.round(os.totalmem() / 1024 / 1024),
   };
-
   _window.jobDurationsMs = [];
   _window.cpuSamples     = [];
   _window.memSamples     = [];
@@ -122,64 +117,49 @@ function flushWindow() {
   _window.errors         = 0;
   _window.resvgFails     = 0;
   _window.wsrvFallbacks  = 0;
-
   return snap;
 }
 
 // ── CF Hub reporting ──────────────────────────────────────────────────────────
 
 async function reportToCF(type, extra = {}) {
-  const payload = {
-    type,
-    node:  NODE_NAME,
-    ts:    Date.now(),
-    stats: {
-      startedAt:  stats.startedAt,
-      activeJobs: stats.activeJobs,
-      queuedJobs: stats.queuedJobs,
-      status:     stats.status,
-      lastError:  stats.lastError,
-    },
-    ...extra,
-  };
-
   try {
     await fetch(CF_REPORT_URL, {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify(payload),
-      signal:  AbortSignal.timeout(5_000),
+      body:    JSON.stringify({
+        type,
+        node:  NODE_NAME,
+        ts:    Date.now(),
+        stats: {
+          startedAt:  stats.startedAt,
+          activeJobs: stats.activeJobs,
+          queuedJobs: stats.queuedJobs,
+          status:     stats.status,
+          lastError:  stats.lastError,
+        },
+        ...extra,
+      }),
+      signal: AbortSignal.timeout(5_000),
     });
   } catch (e) {
-    // Non-fatal — node keeps running even if the hub is temporarily unreachable.
     console.warn('[reporter] CF hub unreachable:', e.message);
   }
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/**
- * Log an error to the CF hub (which surfaces it in the Discord embed).
- * Drop-in replacement for the old logError — third `fields` arg is ignored
- * (hub builds its own embed; raw data is more useful than pre-formatted fields).
- */
 export async function logError(title, description, _fields = []) {
   recordError(description);
   await reportToCF('error', { title, description });
 }
 
-/**
- * Call once after the server starts listening.
- * Sends an 'online' report after a random jitter delay (to stagger fleet startup),
- * then schedules periodic metric flushes.
- */
 export async function notifyOnline() {
   stats.status = 'online';
+  console.log(`[reporter] Node name: "${NODE_NAME}" — must match CF worker registry id`);
 
   const jitter = Math.floor(Math.random() * MAX_JITTER_MS);
-  console.log(`[reporter] Starting — will report to CF hub after ${Math.round(jitter / 1000)}s`);
   await new Promise(r => setTimeout(r, jitter));
-
   await reportToCF('online');
 
   setInterval(async () => {
@@ -189,10 +169,6 @@ export async function notifyOnline() {
   }, REPORT_INTERVAL_MS);
 }
 
-/**
- * Call in SIGTERM / SIGINT handler before process.exit().
- * Flushes current window and sends a final 'offline' report.
- */
 export async function notifyOffline(reason = 'SIGTERM') {
   stats.status = 'offline';
   await reportToCF('offline', { reason, snapshot: flushWindow() });

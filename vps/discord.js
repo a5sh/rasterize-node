@@ -1,26 +1,27 @@
-// vps/discord.js
-//
-// REWRITTEN — Discord integration removed from this node.
-// Metrics are collected locally and forwarded to the Cloudflare Edge Hub at
-// /report, which owns all Discord interactions and displays a unified fleet embed.
-//
-// Exported API is IDENTICAL to the old discord.js — server.js needs no changes.
+// vps/discord.js — CF hub reporter
 //
 // ENV VARS
-//   CF_REPORT_URL   Override hub URL (default: https://r-cf.spicydevs.xyz/report)
-//   NODE_NAME       Display name for this node in the fleet embed
-//   SERVER_NAME     Fallback display name
+//   CF_NODE_ID    REQUIRED — must match the id in CF worker's getNodes().
+//                 Set to 'vps-1', 'vps-2', etc. in your process env / Docker env.
+//   CF_REPORT_URL Override hub URL (default: https://r-cf.spicydevs.xyz/report)
+//   NODE_NAME     Fallback display name if CF_NODE_ID not set
+//   SERVER_NAME   Secondary fallback
 
 import os from 'node:os';
 
-const CF_REPORT_URL      = process.env.CF_REPORT_URL || 'https://r-cf.spicydevs.xyz/report';
-const NODE_NAME          = process.env.NODE_NAME || process.env.SERVER_NAME || os.hostname();
+const CF_REPORT_URL = process.env.CF_REPORT_URL || 'https://r-cf.spicydevs.xyz/report';
+
+// CF_NODE_ID MUST match the id key in the CF worker's getNodes() registry.
+// e.g. if CF worker has: add('vps-1', 'VPS 1', env.VPS1_NODE_URL)
+// then set CF_NODE_ID=vps-1 in the VPS process environment.
+const NODE_NAME = process.env.CF_NODE_ID
+               || process.env.NODE_NAME
+               || process.env.SERVER_NAME
+               || os.hostname();
+
 const REPORT_INTERVAL_MS = 5 * 60_000;
 const MAX_JITTER_MS      = 60_000;
-
-// ── Metrics window ────────────────────────────────────────────────────────────
-
-const WINDOW_SIZE = 2000;
+const WINDOW_SIZE        = 2000;
 
 const _window = {
   jobDurationsMs: [],
@@ -33,8 +34,6 @@ const _window = {
   errors:         0,
 };
 
-// ── Public stats object (mutated by server.js) ────────────────────────────────
-
 export const stats = {
   startedAt:  Date.now(),
   activeJobs: 0,
@@ -43,18 +42,14 @@ export const stats = {
   lastError:  null,
 };
 
-// ── Counters ──────────────────────────────────────────────────────────────────
-
-export function recordRequest()      { _window.requests++;                                               }
+export function recordRequest()      { _window.requests++;                                                         }
 export function recordResvgFail()    { _window.resvgFails++;   stats.lastError = { message: 'resvg fail', ts: Date.now() }; }
-export function recordWsrvFallback() { _window.wsrvFallbacks++;                                          }
-export function recordError(msg)     { _window.errors++;       stats.lastError = { message: msg,          ts: Date.now() }; }
+export function recordWsrvFallback() { _window.wsrvFallbacks++;                                                    }
+export function recordError(msg)     { _window.errors++;       stats.lastError = { message: msg, ts: Date.now() }; }
 
 export function recordJobDuration(ms) {
   if (_window.jobDurationsMs.length < WINDOW_SIZE) _window.jobDurationsMs.push(ms);
 }
-
-// ── CPU / memory sampler ──────────────────────────────────────────────────────
 
 let _prevCpuSample = _takeCpuSample();
 
@@ -68,8 +63,8 @@ setInterval(() => {
   next.forEach((cpu, i) => {
     const prev = _prevCpuSample[i];
     const idle = cpu.idle - prev.idle;
-    const busy = (cpu.user - prev.user) + (cpu.sys  - prev.sys)
-               + (cpu.nice - prev.nice) + (cpu.irq  - prev.irq);
+    const busy = (cpu.user - prev.user) + (cpu.sys - prev.sys)
+               + (cpu.nice - prev.nice) + (cpu.irq - prev.irq);
     totalIdle += idle;
     totalBusy += busy;
   });
@@ -83,8 +78,6 @@ setInterval(() => {
   if (_window.memSamples.length  < WINDOW_SIZE) _window.memSamples.push(memPct);
   if (_window.queueDepths.length < WINDOW_SIZE) _window.queueDepths.push(stats.queuedJobs);
 }, 5_000);
-
-// ── Percentile helpers ────────────────────────────────────────────────────────
 
 function pct(sorted, p) {
   if (sorted.length === 0) return 0;
@@ -112,7 +105,6 @@ function flushWindow() {
     cores:         os.cpus().length,
     totalMemMB:    Math.round(os.totalmem() / 1024 / 1024),
   };
-
   _window.jobDurationsMs = [];
   _window.cpuSamples     = [];
   _window.memSamples     = [];
@@ -121,40 +113,33 @@ function flushWindow() {
   _window.errors         = 0;
   _window.resvgFails     = 0;
   _window.wsrvFallbacks  = 0;
-
   return snap;
 }
 
-// ── CF Hub reporting ──────────────────────────────────────────────────────────
-
 async function reportToCF(type, extra = {}) {
-  const payload = {
-    type,
-    node:  NODE_NAME,
-    ts:    Date.now(),
-    stats: {
-      startedAt:  stats.startedAt,
-      activeJobs: stats.activeJobs,
-      queuedJobs: stats.queuedJobs,
-      status:     stats.status,
-      lastError:  stats.lastError,
-    },
-    ...extra,
-  };
-
   try {
     await fetch(CF_REPORT_URL, {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify(payload),
-      signal:  AbortSignal.timeout(5_000),
+      body:    JSON.stringify({
+        type,
+        node:  NODE_NAME,
+        ts:    Date.now(),
+        stats: {
+          startedAt:  stats.startedAt,
+          activeJobs: stats.activeJobs,
+          queuedJobs: stats.queuedJobs,
+          status:     stats.status,
+          lastError:  stats.lastError,
+        },
+        ...extra,
+      }),
+      signal: AbortSignal.timeout(5_000),
     });
   } catch (e) {
     console.warn('[reporter] CF hub unreachable:', e.message);
   }
 }
-
-// ── Public API ────────────────────────────────────────────────────────────────
 
 export async function logError(title, description, _fields = []) {
   recordError(description);
@@ -163,11 +148,10 @@ export async function logError(title, description, _fields = []) {
 
 export async function notifyOnline() {
   stats.status = 'online';
+  console.log(`[reporter] Node name: "${NODE_NAME}" — must match CF worker registry id`);
 
   const jitter = Math.floor(Math.random() * MAX_JITTER_MS);
-  console.log(`[reporter] Starting — will report to CF hub after ${Math.round(jitter / 1000)}s`);
   await new Promise(r => setTimeout(r, jitter));
-
   await reportToCF('online');
 
   setInterval(async () => {
