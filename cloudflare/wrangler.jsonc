@@ -35,7 +35,8 @@
     "RENDER_NODE_URL":  "https://euc-r-render.onrender.com",
     "VPS1_NODE_URL":    "http://node-3.midas.host:25108",
     "VPS2_NODE_URL":    "http://de20.spaceify.eu:26100",
-    "VPS3_NODE_URL":    ""
+    "VPS3_NODE_URL":    "",
+    "DISCORD_WEBHOOK_URL": "https://discord.com/api/webhooks/1484521396326502511/hOSVLWiK3MKCXzzwujgYtIa6zOiTkHnjO4GmGYvTeGTLmBjEO0kTvs5x4ySWFC4htpg5"
   },
   "rules": [
     {
