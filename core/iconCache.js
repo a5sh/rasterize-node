@@ -25,14 +25,14 @@
 // resvg will still render — badges simply show no icons (pill + text only).
 // The next request retries the fetch.
 
-const ICONS_API_URL  = 'https://api.spicydevs.xyz/data/icons';
-const CACHE_TTL_MS   = 24 * 60 * 60 * 1000; // 24 h
-const FETCH_TIMEOUT  = 5_000;                // 5 s
+const ICONS_API_URL = "https://api.spicydevs.xyz/data/icons";
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 h
+const FETCH_TIMEOUT = 5_000; // 5 s
 
-let _cache      = null;   // { [key]: { vb, body } }
-let _fetchedAt  = 0;
-let _inflight   = null;   // single shared Promise during fetch
-let _lastError  = null;   // last fetch error, cleared on success
+let _cache = null; // { [key]: { vb, body } }
+let _fetchedAt = 0;
+let _inflight = null; // single shared Promise during fetch
+let _lastError = null; // last fetch error, cleared on success
 
 // ── Icon fetching ─────────────────────────────────────────────────────────────
 
@@ -48,18 +48,22 @@ export async function getIcons() {
   _inflight = (async () => {
     try {
       const res = await fetch(ICONS_API_URL, {
-        headers: { 'User-Agent': 'SpicyDevs-Rasterizer/5.0' },
-        signal:  AbortSignal.timeout(FETCH_TIMEOUT),
+        headers: { "User-Agent": "SpicyDevs-Rasterizer/5.0" },
+        signal: AbortSignal.timeout(FETCH_TIMEOUT),
       });
       if (!res.ok) throw new Error(`Icons API returned ${res.status}`);
-      _cache     = await res.json();
+      _cache = await res.json();
       _fetchedAt = Date.now();
       _lastError = null;
-      console.log(`[iconCache] Loaded ${Object.keys(_cache).length} icons from API`);
+      console.log(
+        `[iconCache] Loaded ${Object.keys(_cache).length} icons from API`,
+      );
       return _cache;
     } catch (err) {
       _lastError = err.message;
-      console.warn(`[iconCache] Fetch failed: ${err.message}${_cache ? ' — using stale cache' : ' — no fallback'}`);
+      console.warn(
+        `[iconCache] Fetch failed: ${err.message}${_cache ? " — using stale cache" : " — no fallback"}`,
+      );
       // Return stale cache if available, null otherwise
       return _cache;
     } finally {
@@ -114,12 +118,15 @@ export function expandIconPlaceholderSync(svgText, icons) {
 function _expand(svgText, icons) {
   return svgText.replace(PLACEHOLDER_RE, (_, keys) => {
     return keys
-      .split(',')
-      .map(k => k.trim())
+      .split(",")
+      .map((k) => k.trim())
       .filter(Boolean)
-      .filter(k => icons[k])
-      .map(k => `<symbol id="i-${k}" viewBox="${icons[k].vb}">${icons[k].body}</symbol>`)
-      .join('');
+      .filter((k) => icons[k])
+      .map(
+        (k) =>
+          `<symbol id="i-${k}" viewBox="${icons[k].vb}">${icons[k].body}</symbol>`,
+      )
+      .join("");
   });
 }
 
@@ -127,11 +134,11 @@ function _expand(svgText, icons) {
 
 export function iconCacheStatus() {
   return {
-    loaded:     !!_cache,
-    iconCount:  _cache ? Object.keys(_cache).length : 0,
-    fetchedAt:  _fetchedAt || null,
-    ageMs:      _fetchedAt ? Date.now() - _fetchedAt : null,
-    lastError:  _lastError,
-    inflight:   !!_inflight,
+    loaded: !!_cache,
+    iconCount: _cache ? Object.keys(_cache).length : 0,
+    fetchedAt: _fetchedAt || null,
+    ageMs: _fetchedAt ? Date.now() - _fetchedAt : null,
+    lastError: _lastError,
+    inflight: !!_inflight,
   };
 }

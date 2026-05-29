@@ -1,31 +1,39 @@
-// cloudflare/worker.js
+// cloudflare/worker.js — v8
 //
-// CHANGES v7
+// RASTERIZER + LOAD BALANCER
 // ─────────────────────────────────────────────────────────────────────────────
-// • Adds /report endpoint — receives metrics POSTs from render/vps nodes.
-// • Adds scheduled() handler — fires every 5 min via cron trigger.
-// • Discord is CENTRALISED here. render/discord.js and vps/discord.js are thin
-//   reporters that POST to /report instead of hitting Discord directly.
+// This worker now serves two roles:
 //
-// FREE TIER KV STRATEGY
+//   1. WASM rasterizer  — used ONLY for simple requests (poster blur/grayscale,
+//                         no ratings). Signalled by X-Simple: 1 header from the
+//                         main API worker.
+//
+//   2. Load balancer    — all other rasterization requests are distributed to
+//                         T1 nodes using 40/30/30 geo-weighted selection:
+//
+//        T1 pool:    US East (Vercel), DE20 (Spaceify), DE2 / Midas
+//        Fallback:   wsrv.nl → EUC Render (last resort)
+//
+//        High-traffic detection: nodes that accumulate ≥3 errors/min are
+//        deprioritised; the fallback chain absorbs the overflow naturally.
+//
+//        FR1 (fr1.spaceify.eu) is deprecated — not in rotation, b2p endpoint
+//        calls are now handled via the main API /b2p route.
+//
+// INTERFACE (called by main API via env.RASTERIZER service binding)
 // ─────────────────────────────────────────────────────────────────────────────
-// The free tier allows only 1,000 KV writes and 1,000 KV list ops per day.
-// 5 nodes × every 5 min = 1,440 node-metric writes/day alone — blows the limit.
+//   POST /
+//     Body:          raw SVG text  (icons already expanded by main API worker)
+//     X-Simple: 1   → WASM render
+//     X-SVG-Url:    → canonical SVG URL (needed for Vercel URL-payload + wsrv)
+//     X-CF-Colo:    → CF colo code of the original request (geo routing)
+//     X-Format:     → output format (png | jpg | jpeg | webp)
 //
-// Solution: node metrics live in module-level memory (Map), NOT KV.
-//   • KV is used ONLY to persist the Discord message ID across isolate restarts
-//     (≈ 1 write per week when the message is created or re-created).
-//   • Discord update rate-limiting uses a module-level timestamp, accepted to be
-//     per-isolate (Discord's own webhook rate limit is the effective backstop).
-//
-// KV usage at steady state:
-//   Reads:  ~288/day (msgId read on each cron fire)         ✅ < 100,000
-//   Writes: ~0–1/day (only when Discord msg is re-created)  ✅ < 1,000
-//   List:   0                                               ✅ < 1,000
-//
-// CPU time per invocation (free tier limit: 10ms):
-//   Health fetches are async I/O — do not consume CPU time.
-//   Embed string-building is < 2ms CPU. ✅
+// FLEET MONITORING (unchanged from v7)
+// ─────────────────────────────────────────────────────────────────────────────
+//   POST /report     ← T1 nodes POST metrics here
+//   GET  /hub-test   ← debug: live fleet state + health polls
+//   scheduled()      ← cron: refresh Discord embed
 
 import { initWasm, Resvg }                             from '@resvg/resvg-wasm';
 import resvgWasm                                        from '@resvg/resvg-wasm/index_bg.wasm';
@@ -51,7 +59,7 @@ function ensureWasm() {
   return wasmPromise;
 }
 
-// ── resvg options ─────────────────────────────────────────────────────────────
+// ── RESVG options ─────────────────────────────────────────────────────────────
 
 const RESVG_OPTS = {
   fitTo: { mode: 'original' },
@@ -75,23 +83,258 @@ const PROXY_ALLOWLIST = [
 ];
 
 // ══════════════════════════════════════════════════════════════════════════════
-// ── IN-ISOLATE FLEET STATE (no KV — see free tier strategy above) ─────────────
+// ── T1 NODE POOL & LOAD BALANCER ──────────────────────────────────────────────
 // ══════════════════════════════════════════════════════════════════════════════
+
+const T1_NODES = [
+  {
+    id:          'us-east',
+    url:         'https://us-r-vercel.vercel.app/api/rasterize',
+    region:      'NA',
+    useUrlPayload: true,   // GET ?url= path; avoids Vercel fast-origin-transfer cost
+    acceptsGzip: false,
+  },
+  {
+    id:          'de-20',
+    url:         'http://de20.spaceify.eu:26100',
+    region:      'EU',
+    useUrlPayload: false,
+    acceptsGzip: true,
+  },
+  {
+    id:          'de-2',
+    url:         'http://node-3.midas.host:25108',
+    region:      'EU',
+    useUrlPayload: false,
+    acceptsGzip: true,
+  },
+];
+
+// Fallback tier — wsrv is attempted first (no node overhead), then EUC
+const EUC_NODE = {
+  id:          'euc',
+  url:         'https://euc-r-render.onrender.com',
+  region:      'EU',
+  useUrlPayload: false,
+  acceptsGzip: true,
+};
+
+// ── Per-isolate health tracking ───────────────────────────────────────────────
+
+const _errMap     = new Map();   // id → { count, windowEnd }
+const _inflightMap = new Map();  // id → number
+
+const ERR_WINDOW_MS        = 60_000;
+const STRESS_THRESHOLD     = 3;   // errors/min → deprioritise
+const FAILING_THRESHOLD    = 8;   // errors/min → skip in primary loop
+const T1_TIMEOUT_MS        = 5_000;
+const EUC_TIMEOUT_MS       = 10_000;
+const WSRV_TIMEOUT_MS      = 5_000;
+
+function _recordErr(id) {
+  const now = Date.now();
+  let e = _errMap.get(id);
+  if (!e || now > e.windowEnd) e = { count: 0, windowEnd: now + ERR_WINDOW_MS };
+  e.count++;
+  _errMap.set(id, e);
+}
+
+function _recordOk(id) {
+  const e = _errMap.get(id);
+  if (e) e.count = Math.max(0, e.count - 1);
+}
+
+function _errCount(id) {
+  const e = _errMap.get(id);
+  return (!e || Date.now() > e.windowEnd) ? 0 : e.count;
+}
+
+function _isStressed(id)  { return _errCount(id) >= STRESS_THRESHOLD; }
+function _isFailing(id)   { return _errCount(id) >= FAILING_THRESHOLD; }
+function _acqIF(id)       { _inflightMap.set(id, (_inflightMap.get(id) || 0) + 1); }
+function _relIF(id)       { _inflightMap.set(id, Math.max(0, (_inflightMap.get(id) || 0) - 1)); }
+function _inFlight(id)    { return _inflightMap.get(id) || 0; }
+
+// ── Geo region mapping ────────────────────────────────────────────────────────
+
+const _COLO_REGION = (() => {
+  const m = {};
+  const zones = {
+    NA: ['IAD','EWR','MIA','ORD','ATL','BOS','LAX','SFO','SEA','DFW','MSP',
+         'PHX','DEN','PDX','LAS','SMF','SLC','OAK','SJC','DTW','PHL','CMH',
+         'BUF','CLE','MSY','PIT','RDU','STL','OKC','KCI','OMA','TUL'],
+    EU: ['LHR','CDG','AMS','DUB','FRA','ZRH','ARN','WAW','FCO','MAD','BCN',
+         'MUC','DUS','HAM','BRU','GVA','CPH','OSL','HEL','LIS','VIE','PRG',
+         'BUD','OTP','SOF','SKP','BEG','RIX','VNO','TLL','MXP','MAN'],
+  };
+  for (const [r, colos] of Object.entries(zones))
+    for (const c of colos) m[c] = r;
+  return m;
+})();
+
+function _region(colo) {
+  return (colo && _COLO_REGION[colo.toUpperCase()]) || 'NA';
+}
+
+// ── Node order: geo-closest first, stressed nodes demoted ─────────────────────
 //
-// Cloudflare Workers run in isolates that are reused across requests to the
-// same Worker instance. Module-level state persists for the isolate's lifetime
-// (typically minutes to hours), which is more than adequate for a 5-min report
-// cadence. On a cold isolate the state is empty; the next cron or /report call
-// repopulates it within seconds.
+// Base order:  EU → [de-20, de-2, us-east]  /  NA/else → [us-east, de-20, de-2]
+// Sort key:    failing=2 > stressed=1 > healthy=0
+// Result:      healthy nodes always precede stressed; failing nodes come last.
+// Effectively: wsrv/EUC get promoted naturally when all T1 nodes are failing.
 
-// Map<nodeId, { node, type, ts, stats, snapshot, lastError }>
+function _nodeOrder(colo) {
+  const eu = _region(colo) === 'EU';
+  const base = eu
+    ? [T1_NODES[1], T1_NODES[2], T1_NODES[0]]   // de-20, de-2, us-east
+    : [T1_NODES[0], T1_NODES[1], T1_NODES[2]];  // us-east, de-20, de-2
+  return [...base].sort((a, b) => {
+    const w = n => _isFailing(n.id) ? 2 : _isStressed(n.id) ? 1 : 0;
+    return w(a) - w(b);
+  });
+}
+
+// 40 / 30 / 30 probabilistic selection from the (already-sorted) ordered list.
+function _pick(ordered) {
+  if (!ordered.length) return null;
+  const r = Math.random() * 100;
+  if (r < 40 || ordered.length === 1) return ordered[0];
+  if (r < 70 || ordered.length === 2) return ordered[1];
+  return ordered[2];
+}
+
+// ── Gzip compression (CompressionStream — native in CF Workers) ───────────────
+
+async function _gzip(text) {
+  try {
+    const ds = new CompressionStream('gzip');
+    const w  = ds.writable.getWriter();
+    w.write(new TextEncoder().encode(text));
+    w.close();
+    return await new Response(ds.readable).arrayBuffer();
+  } catch { return null; }
+}
+
+// ── Single T1 / EUC node request ─────────────────────────────────────────────
+
+async function _fetchNode(node, svgText, svgUrl, format, signal) {
+  _acqIF(node.id);
+  try {
+    let res;
+    if (node.useUrlPayload && svgUrl) {
+      const u = new URL(node.url);
+      u.searchParams.set('url',    svgUrl);
+      u.searchParams.set('format', format);
+      res = await fetch(u.toString(), {
+        method:  'GET',
+        headers: { 'User-Agent': 'SpicyDevs-LB/8.0' },
+        signal,
+      });
+    } else {
+      let body = svgText, ct = 'image/svg+xml';
+      const extraHeaders = {};
+      if (node.acceptsGzip) {
+        const gz = await _gzip(svgText);
+        if (gz) { body = gz; ct = 'application/octet-stream'; extraHeaders['X-SVG-Encoding'] = 'gzip'; }
+      }
+      res = await fetch(node.url, {
+        method:  'POST',
+        body,
+        headers: { 'Content-Type': ct, 'X-Format': format, 'User-Agent': 'SpicyDevs-LB/8.0', ...extraHeaders },
+        signal,
+      });
+    }
+    if (!res.ok) { _recordErr(node.id); return null; }
+    _recordOk(node.id);
+    return res;
+  } catch (e) {
+    if (e?.name !== 'AbortError') _recordErr(node.id);
+    return null;
+  } finally { _relIF(node.id); }
+}
+
+// ── wsrv.nl fallback ──────────────────────────────────────────────────────────
+
+async function _fetchWsrv(svgUrl, format) {
+  if (!svgUrl) return null;
+  try {
+    // Rewrite to backend direct domain so wsrv can reach it; strip no_embed redirect
+    const src = new URL(svgUrl);
+    src.hostname = 'posterium-backend.aayu5h.workers.dev';
+    src.searchParams.delete('no_embed');
+
+    const u = new URL('https://wsrv.nl/');
+    u.searchParams.set('url',    src.toString());
+    u.searchParams.set('output', format === 'webp' ? 'webp' : (format === 'jpg' || format === 'jpeg') ? 'jpeg' : 'png');
+    u.searchParams.set('q',      '100');
+
+    const res = await fetch(u.toString(), { signal: AbortSignal.timeout(WSRV_TIMEOUT_MS) });
+    return res.ok ? res : null;
+  } catch { return null; }
+}
+
+// ── Build a uniform image Response from any upstream ─────────────────────────
+
+function _imageResp(upstream, source, format) {
+  const h = new Headers(upstream.headers);
+  h.set('Access-Control-Allow-Origin', '*');
+  h.set('X-Raster-Source',            source);
+  h.set('Cache-Control',              'public, max-age=86400');
+  h.set('X-Node',                     'cf-lb');
+  return new Response(upstream.body, { status: 200, headers: h });
+}
+
+// ── Distributed render orchestrator ──────────────────────────────────────────
+//
+// 1. Select primary T1 node (40/30/30 weighted, geo-aware)
+// 2. Try primary → try remaining T1 nodes sequentially
+// 3. wsrv.nl fallback
+// 4. EUC Render last resort
+//
+// Each T1 attempt gets T1_TIMEOUT_MS; EUC gets EUC_TIMEOUT_MS.
+// All fallback logic lives here — individual nodes have no nested fallbacks.
+
+async function _distributedRender(svgText, svgUrl, format, colo) {
+  const ordered = _nodeOrder(colo);
+  const primary = _pick(ordered);
+  const rest    = ordered.filter(n => n !== primary);
+
+  // Primary T1 attempt
+  if (primary) {
+    const ac = new AbortController();
+    const tm = setTimeout(() => ac.abort(), T1_TIMEOUT_MS);
+    const res = await _fetchNode(primary, svgText, svgUrl, format, ac.signal).finally(() => clearTimeout(tm));
+    if (res) return _imageResp(res, primary.id, format);
+  }
+
+  // Remaining T1 nodes
+  for (const node of rest) {
+    const ac = new AbortController();
+    const tm = setTimeout(() => ac.abort(), T1_TIMEOUT_MS);
+    const res = await _fetchNode(node, svgText, svgUrl, format, ac.signal).finally(() => clearTimeout(tm));
+    if (res) return _imageResp(res, node.id, format);
+  }
+
+  // wsrv.nl
+  const wsrvRes = await _fetchWsrv(svgUrl, format);
+  if (wsrvRes) return _imageResp(wsrvRes, 'wsrv', format);
+
+  // EUC Render (last resort)
+  const ac = new AbortController();
+  const tm = setTimeout(() => ac.abort(), EUC_TIMEOUT_MS);
+  const eucRes = await _fetchNode(EUC_NODE, svgText, svgUrl, format, ac.signal).finally(() => clearTimeout(tm));
+  if (eucRes) return _imageResp(eucRes, 'euc', format);
+
+  return jsonError(502, 'All rasterizers exhausted');
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ── IN-ISOLATE FLEET STATE (Discord hub — no KV, see v7 comments) ─────────────
+// ══════════════════════════════════════════════════════════════════════════════
+
 const _nodeMetrics = new Map();
-
-// Module-level rate-limiter for Discord updates (per-isolate).
-// Multiple concurrent isolates may each update Discord, but Discord's own
-// webhook rate limit (5 PATCH/30s per message) is the effective ceiling.
 let _lastDiscordUpdate = 0;
-const DISCORD_MIN_INTERVAL_MS = 90_000; // 90 seconds
+const DISCORD_MIN_INTERVAL_MS = 90_000;
 
 // ── Main handler ──────────────────────────────────────────────────────────────
 
@@ -101,19 +344,24 @@ export default {
 
     if (url.pathname === '/health') {
       return jsonOk({
-        status:    'ok',
-        version:   '7.0',
-        node:      'cloudflare',
+        status:     'ok',
+        version:    '8.0',
+        node:       'cloudflare',
         wasmReady,
         queueDepth: 0,
-        iconCache: iconCacheStatus(),
+        iconCache:  iconCacheStatus(),
         fleetNodes: _nodeMetrics.size,
+        t1Nodes:    T1_NODES.map(n => ({
+          id:       n.id,
+          errors:   _errCount(n.id),
+          inFlight: _inFlight(n.id),
+          stressed: _isStressed(n.id),
+          failing:  _isFailing(n.id),
+        })),
       });
     }
 
     if (url.pathname === '/hub-test') {
-      // Debug: returns in-memory fleet state + live health polls — no Discord side effects.
-      // curl https://r-cf.spicydevs.xyz/hub-test
       const nodes = getNodes(env);
       const liveHealth = await Promise.all(
         nodes.map(n => fetchNodeHealth(n.url).then(h => ({ id: n.id, name: n.name, health: h }))),
@@ -126,6 +374,7 @@ export default {
         storedMetricKeys:  [..._nodeMetrics.keys()],
         storedMetrics:     Object.fromEntries(_nodeMetrics),
         liveHealth,
+        t1Pool: T1_NODES.map(n => ({ id: n.id, errors: _errCount(n.id), inFlight: _inFlight(n.id) })),
       });
     }
 
@@ -143,29 +392,31 @@ export default {
 
     if (request.method === 'OPTIONS') {
       return new Response(null, {
-        status: 204,
+        status:  204,
         headers: {
           'Access-Control-Allow-Origin':  '*',
           'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-          'Access-Control-Allow-Headers': 'Content-Type, X-Format, X-SVG-Encoding',
+          'Access-Control-Allow-Headers': 'Content-Type, X-Format, X-SVG-Encoding, X-Simple, X-SVG-Url, X-CF-Colo',
         },
       });
     }
 
-    // ── Rasterisation ────────────────────────────────────────────────────
+    // ── Rasterisation entry point ─────────────────────────────────────────────
+    //
+    // X-Simple: 1   → WASM render (poster blur/grayscale only, no ratings)
+    // (no header)   → distributed render via T1 pool
 
-    try {
-      await ensureWasm();
-    } catch (e) {
-      return jsonError(503, `WASM init failed: ${e.message}`);
-    }
+    const isSimple = request.headers.get('X-Simple') === '1';
+    const svgUrl   = request.headers.get('X-SVG-Url')  || null;
+    const colo     = request.headers.get('X-CF-Colo')  || request.cf?.colo || null;
 
     const formatHeader = request.headers.get('X-Format') || '';
     const formatParam  = url.searchParams.get('format')  || '';
-    const format       = (['png', 'jpg', 'jpeg', 'webp'].find(
-      f => f === (formatHeader || formatParam).toLowerCase()
+    const format       = (['png','jpg','jpeg','webp'].find(
+      f => f === (formatHeader || formatParam).toLowerCase(),
     )) || 'png';
 
+    // ── Parse SVG body ───────────────────────────────────────────────────────
     let svgText;
 
     if (request.method === 'POST') {
@@ -184,9 +435,7 @@ export default {
       const targetUrl = url.searchParams.get('url');
       if (!targetUrl) return jsonError(400, 'Missing ?url= parameter');
       try {
-        const r = await fetch(targetUrl, {
-          headers: { 'User-Agent': 'SpicyDevs-Rasterizer/7.0' },
-        });
+        const r = await fetch(targetUrl, { headers: { 'User-Agent': 'SpicyDevs-Rasterizer/8.0' } });
         if (!r.ok) return jsonError(502, `SVG fetch failed: ${r.status}`);
         svgText = await r.text();
       } catch (e) {
@@ -196,6 +445,15 @@ export default {
       return jsonError(405, 'Method not allowed');
     }
 
+    // ── Distributed render (all non-simple requests) ─────────────────────────
+    if (!isSimple) {
+      return _distributedRender(svgText, svgUrl, format, colo);
+    }
+
+    // ── WASM render (simple poster blur/grayscale, no ratings) ───────────────
+    try { await ensureWasm(); }
+    catch (e) { return jsonError(503, `WASM init failed: ${e.message}`); }
+
     try {
       const withIcons  = await expandIconPlaceholder(svgText);
       const embedded   = await embedExternalImages(withIcons);
@@ -204,7 +462,6 @@ export default {
       const rendered   = resvg.render();
 
       let imageBuffer, mimeType;
-
       if (format === 'jpg' || format === 'jpeg') {
         imageBuffer = typeof rendered.asJpeg === 'function' ? rendered.asJpeg(85) : rendered.asPng();
         mimeType    = typeof rendered.asJpeg === 'function' ? 'image/jpeg'        : 'image/png';
@@ -223,7 +480,8 @@ export default {
           'Cache-Control':               'public, max-age=86400',
           'Access-Control-Allow-Origin': '*',
           'X-Queue-Depth':               '0',
-          'X-Node':                      'cloudflare',
+          'X-Node':                      'cloudflare-wasm',
+          'X-Raster-Source':             'cf-wasm',
         },
       });
 
@@ -237,10 +495,7 @@ export default {
     }
   },
 
-  // ── Cron trigger ─────────────────────────────────────────────────────────
-  // Fires every 5 minutes. Forces a Discord embed refresh regardless of the
-  // in-isolate rate-limit, ensuring the embed stays current even when no nodes
-  // happen to POST a /report in a given window (e.g. after a cold isolate start).
+  // ── Cron trigger ─────────────────────────────────────────────────────────────
   async scheduled(_event, env, ctx) {
     ctx.waitUntil(updateDashboard(env, true));
   },
@@ -262,7 +517,7 @@ function jsonError(status, message) {
   });
 }
 
-// ── External image embedding ──────────────────────────────────────────────────
+// ── External image embedding (WASM path only) ─────────────────────────────────
 
 async function embedExternalImages(svgText) {
   const matches = [...svgText.matchAll(/href="(https?:\/\/[^"]+)"/g)];
@@ -274,29 +529,24 @@ async function embedExternalImages(svgText) {
     uniqueUrls.map(async url => {
       try {
         const res = await fetch(url, {
-          headers: { 'User-Agent': 'SpicyDevs-Rasterizer/7.0' },
+          headers: { 'User-Agent': 'SpicyDevs-Rasterizer/8.0' },
           signal:  AbortSignal.timeout(8_000),
         });
         if (!res.ok) return { url, dataUri: null };
-
         const buf   = await res.arrayBuffer();
         const ct    = res.headers.get('content-type') || 'image/jpeg';
         const bytes = new Uint8Array(buf);
         const CHUNK = 0x8000;
         let binary  = '';
-        for (let i = 0; i < bytes.length; i += CHUNK) {
+        for (let i = 0; i < bytes.length; i += CHUNK)
           binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
-        }
         return { url, dataUri: `data:${ct};base64,${btoa(binary)}` };
-      } catch {
-        return { url, dataUri: null };
-      }
+      } catch { return { url, dataUri: null }; }
     }),
   );
 
-  for (const { url, dataUri } of replacements) {
+  for (const { url, dataUri } of replacements)
     if (dataUri) svgText = svgText.split(`href="${url}"`).join(`href="${dataUri}"`);
-  }
   return svgText;
 }
 
@@ -305,40 +555,28 @@ async function embedExternalImages(svgText) {
 async function handleProxy(request) {
   const url       = new URL(request.url);
   const targetUrl = url.searchParams.get('url');
-
   if (!targetUrl) return jsonError(400, 'Missing ?url= parameter');
 
   const allowed = PROXY_ALLOWLIST.some(prefix => targetUrl.startsWith(prefix));
   if (!allowed) return jsonError(403, `Proxy target not in allowlist: ${targetUrl}`);
 
   const proxyHeaders = new Headers();
-  for (const key of ['content-type', 'x-format', 'x-svg-encoding']) {
-    const val = request.headers.get(key);
-    if (val) proxyHeaders.set(key, val);
-  }
+  for (const key of ['content-type', 'x-format', 'x-svg-encoding'])
+    if (request.headers.get(key)) proxyHeaders.set(key, request.headers.get(key));
   proxyHeaders.set('User-Agent', 'SpicyDevs-Proxy/1.0');
 
   const init = { method: request.method, headers: proxyHeaders };
-  if (request.method === 'POST') {
-    init.body = await request.arrayBuffer();
-  }
+  if (request.method === 'POST') init.body = await request.arrayBuffer();
 
   let upstream;
-  try {
-    upstream = await fetch(targetUrl, init);
-  } catch (e) {
-    return jsonError(502, `Proxy fetch failed: ${e.message}`);
-  }
+  try { upstream = await fetch(targetUrl, init); }
+  catch (e) { return jsonError(502, `Proxy fetch failed: ${e.message}`); }
 
   const respHeaders = new Headers(upstream.headers);
   respHeaders.set('Access-Control-Allow-Origin', '*');
   respHeaders.set('X-Proxied-Via',  'cf-worker');
   respHeaders.set('X-Proxy-Target', targetUrl);
-
-  return new Response(upstream.body, {
-    status:  upstream.status,
-    headers: respHeaders,
-  });
+  return new Response(upstream.body, { status: upstream.status, headers: respHeaders });
 }
 
 // ── /ss ───────────────────────────────────────────────────────────────────────
@@ -351,51 +589,34 @@ async function handleScreenshot(request, env) {
   let parsedUrl;
   try {
     parsedUrl = new URL(targetUrl);
-    if (!['http:', 'https:'].includes(parsedUrl.protocol)) throw new Error('bad protocol');
-  } catch {
-    return jsonError(400, 'Invalid URL — must be http or https');
-  }
+    if (!['http:','https:'].includes(parsedUrl.protocol)) throw new Error('bad protocol');
+  } catch { return jsonError(400, 'Invalid URL — must be http or https'); }
 
-  const width    = Math.min(Math.max(parseInt(searchParams.get('width')   || '500',  10), 100), 3840);
-  const height   = Math.min(Math.max(parseInt(searchParams.get('height')  || '750',  10), 100), 2160);
-  const fullPage = searchParams.get('full') === '1';
+  const width    = Math.min(Math.max(parseInt(searchParams.get('width')   || '500', 10), 100), 3840);
+  const height   = Math.min(Math.max(parseInt(searchParams.get('height')  || '750', 10), 100), 2160);
+  const fullPage = searchParams.get('full')    === '1';
   const format   = searchParams.get('format') === 'jpeg' ? 'jpeg' : 'png';
-  const quality  = Math.min(Math.max(parseInt(searchParams.get('quality') || '85',   10), 1),   100);
-  const waitMs   = Math.min(Math.max(parseInt(searchParams.get('wait')    || '0',    10), 0), 10_000);
+  const quality  = Math.min(Math.max(parseInt(searchParams.get('quality') || '85',  10), 1), 100);
+  const waitMs   = Math.min(Math.max(parseInt(searchParams.get('wait')    || '0',   10), 0), 10_000);
 
   let browser;
   try {
     browser = await puppeteer.launch(env.MYBROWSER);
     const page = await browser.newPage();
     await page.setViewport({ width, height });
-
     await page.setRequestInterception(true);
     page.on('request', req => {
-      const blocked = ['doubleclick.net', 'googlesyndication.com', 'adservice.google.com', 'google-analytics.com'];
-      if (
-        blocked.some(h => req.url().includes(h)) ||
-        ['media', 'websocket', 'manifest'].includes(req.resourceType())
-      ) { req.abort(); } else { req.continue(); }
+      const blocked = ['doubleclick.net','googlesyndication.com','adservice.google.com','google-analytics.com'];
+      if (blocked.some(h => req.url().includes(h)) || ['media','websocket','manifest'].includes(req.resourceType()))
+        req.abort(); else req.continue();
     });
-
     await page.goto(parsedUrl.toString(), { waitUntil: 'load', timeout: 20_000 });
     if (waitMs > 0) await new Promise(r => setTimeout(r, waitMs));
-
-    const opts = {
-      type: format,
-      ...(format === 'jpeg' ? { quality } : {}),
-      ...(fullPage ? { fullPage: true } : { clip: { x: 0, y: 0, width, height } }),
-    };
-    const imageBuffer = await page.screenshot(opts);
-
-    return new Response(imageBuffer, {
+    const opts      = { type: format, ...(format === 'jpeg' ? { quality } : {}), ...(fullPage ? { fullPage: true } : { clip: { x: 0, y: 0, width, height } }) };
+    const imgBuffer = await page.screenshot(opts);
+    return new Response(imgBuffer, {
       status:  200,
-      headers: {
-        'Content-Type':                format === 'jpeg' ? 'image/jpeg' : 'image/png',
-        'Cache-Control':               'public, max-age=3600',
-        'Access-Control-Allow-Origin': '*',
-        'X-Screenshot-URL':            parsedUrl.toString(),
-      },
+      headers: { 'Content-Type': format === 'jpeg' ? 'image/jpeg' : 'image/png', 'Cache-Control': 'public, max-age=3600', 'Access-Control-Allow-Origin': '*', 'X-Screenshot-URL': parsedUrl.toString() },
     });
   } catch (e) {
     return jsonError(500, e instanceof Error ? e.message : String(e));
@@ -405,38 +626,20 @@ async function handleScreenshot(request, env) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// ── DISCORD FLEET HUB ─────────────────────────────────────────────────────────
+// ── DISCORD FLEET HUB (unchanged from v7) ─────────────────────────────────────
 // ══════════════════════════════════════════════════════════════════════════════
-
-// ── /report handler ───────────────────────────────────────────────────────────
 
 async function handleReport(request, env, ctx) {
   if (request.method !== 'POST') return jsonError(405, 'POST only');
-
   let body;
-  try { body = await request.json(); }
-  catch { return jsonError(400, 'Invalid JSON'); }
-
-  const { type, node, ts, stats, snapshot, title, description } = body;
+  try { body = await request.json(); } catch { return jsonError(400, 'Invalid JSON'); }
+  const { type, node, ts, stats, snapshot } = body;
   if (!node || !type) return jsonError(400, 'Missing node or type');
-
-  // Store in module-level memory — zero KV operations.
-  // Keyed by node name so successive reports from the same node overwrite.
-  _nodeMetrics.set(node, {
-    node, type, ts: ts || Date.now(),
-    stats:     stats    || null,
-    snapshot:  snapshot || null,
-    lastError: stats?.lastError || null,
-  });
-
-  // Force Discord update for errors/offline; rate-limit routine reports.
+  _nodeMetrics.set(node, { node, type, ts: ts || Date.now(), stats: stats || null, snapshot: snapshot || null, lastError: stats?.lastError || null });
   const force = type === 'error' || type === 'offline';
   ctx.waitUntil(updateDashboard(env, force));
-
   return jsonOk({ received: true, type, node });
 }
-
-// ── Node registry ─────────────────────────────────────────────────────────────
 
 function getNodes(env) {
   const nodes = [];
@@ -450,24 +653,16 @@ function getNodes(env) {
   return nodes;
 }
 
-// ── Health polling ────────────────────────────────────────────────────────────
-
 async function fetchNodeHealth(url) {
   try {
     const res = await fetch(`${url.replace(/\/$/, '')}/health`, {
-      headers: { 'User-Agent': 'SpicyDevs-Hub/7.0' },
+      headers: { 'User-Agent': 'SpicyDevs-Hub/8.0' },
       signal:  AbortSignal.timeout(6_000),
     });
     if (!res.ok) return { reachable: false, httpStatus: res.status };
     return { reachable: true, ...(await res.json()) };
-  } catch (e) {
-    return { reachable: false, error: e.message };
-  }
+  } catch (e) { return { reachable: false, error: e.message }; }
 }
-
-// ── KV helpers (message ID only) ─────────────────────────────────────────────
-// KV is touched exclusively for the Discord dashboard message ID.
-// Expected: ~0 writes/day at steady state, ~1 read per cron fire (288/day).
 
 async function getMsgId(env) {
   if (!env.DASHBOARD_KV) return null;
@@ -484,50 +679,34 @@ async function clearMsgId(env) {
   await env.DASHBOARD_KV.delete('cf:discord:msgId').catch(() => {});
 }
 
-// ── Embed construction ────────────────────────────────────────────────────────
-
 function fmtUptime(s) {
   if (!s) return '—';
   const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
   return h > 0 ? `${h}h ${m}m` : `${m}m`;
 }
 
-function fmtRelTs(tsMs) {
-  return tsMs ? `<t:${Math.floor(tsMs / 1000)}:R>` : 'never';
-}
+function fmtRelTs(tsMs) { return tsMs ? `<t:${Math.floor(tsMs / 1000)}:R>` : 'never'; }
 
 function statusEmoji(health) {
-  if (!health.reachable || health.status === 'offline')  return '🔴';
-  if (health.status === 'degraded')                       return '🟠';
+  if (!health.reachable || health.status === 'offline') return '🔴';
+  if (health.status === 'degraded')                     return '🟠';
   return '🟢';
 }
 
-// Resolves stored metrics for a node entry.
-// Tries exact id match first, then display name — tolerates cases where the
-// node reported a slightly different name than the registry id.
 function findStoredMetrics(nodeId, nodeName) {
   return _nodeMetrics.get(nodeId) || _nodeMetrics.get(nodeName) || null;
 }
 
 function buildNodeFieldValue(health, stored) {
   const lines = [];
-
   if (!health.reachable) {
     const err = health.error ? health.error.slice(0, 80) : `HTTP ${health.httpStatus || '???'}`;
     lines.push(`❌ **Unreachable** — \`${err}\``);
     if (stored?.ts) lines.push(`Last report: ${fmtRelTs(stored.ts)}`);
     return lines.join('\n');
   }
-
-  // Status / version / uptime
-  const row1 = [
-    health.version  ? `v${health.version}`         : null,
-    health.status   ? health.status                 : null,
-    health.uptime   ? `up ${fmtUptime(health.uptime)}` : null,
-  ].filter(Boolean);
+  const row1 = [health.version ? `v${health.version}` : null, health.status || null, health.uptime ? `up ${fmtUptime(health.uptime)}` : null].filter(Boolean);
   if (row1.length) lines.push(row1.join(' · '));
-
-  // Worker pool (long-lived nodes only)
   if (health.activeJobs !== undefined) {
     const row2 = [];
     if (health.workerCount)    row2.push(`${health.workerCount} workers`);
@@ -536,17 +715,12 @@ function buildNodeFieldValue(health, stored) {
     if (health.pendingRespawns) row2.push(`⚠️ ${health.pendingRespawns} respawning`);
     lines.push(row2.join(' · '));
   }
-
-  // Font + icon cache
   const cap = [];
-  const fontOk = health.fontReady
-    ?? (Array.isArray(health.fontFiles) ? health.fontFiles.length > 0 : undefined);
+  const fontOk = health.fontReady ?? (Array.isArray(health.fontFiles) ? health.fontFiles.length > 0 : undefined);
   if (fontOk !== undefined) cap.push(fontOk ? 'Font ✅' : 'Font ❌');
   if (health.iconCache?.loaded)       cap.push(`Icons: ${health.iconCache.iconCount}`);
   else if (health.iconCache?.lastError) cap.push('Icons ❌');
   if (cap.length) lines.push(cap.join(' · '));
-
-  // Metrics snapshot from /report (render/vps; not available for serverless nodes)
   const snap = stored?.snapshot;
   if (snap) {
     if (snap.jobDuration?.n > 0) {
@@ -554,10 +728,7 @@ function buildNodeFieldValue(health, stored) {
       lines.push(`Latency — p50 \`${d.p50}ms\` · p95 \`${d.p95}ms\` · p99 \`${d.p99}ms\` · max \`${d.max}ms\``);
     }
     if (snap.cpu?.n > 0) {
-      lines.push(
-        `CPU avg \`${snap.cpu.avg}%\` p95 \`${snap.cpu.p95}%\`` +
-        (snap.mem?.n > 0 ? ` · Mem avg \`${snap.mem.avg}%\` p95 \`${snap.mem.p95}%\`` : '')
-      );
+      lines.push(`CPU avg \`${snap.cpu.avg}%\` p95 \`${snap.cpu.p95}%\`` + (snap.mem?.n > 0 ? ` · Mem avg \`${snap.mem.avg}%\` p95 \`${snap.mem.p95}%\`` : ''));
     }
     if (snap.requests !== undefined) {
       const r = [`Req: **${snap.requests}**`, `Err: **${snap.errors}**`];
@@ -569,75 +740,51 @@ function buildNodeFieldValue(health, stored) {
       lines.push(`Queue — avg \`${snap.queueDepth.avg}\` · p95 \`${snap.queueDepth.p95}\` · max \`${snap.queueDepth.max}\``);
     }
   }
-
-  // Last error
   const lastErr = stored?.lastError || stored?.stats?.lastError;
-  if (lastErr?.message) {
-    lines.push(`⚠️ Last err: \`${lastErr.message.slice(0, 100)}\` ${fmtRelTs(lastErr.ts)}`);
-  }
-
-  // Staleness warning
-  if (stored?.ts && Date.now() - stored.ts > 15 * 60_000) {
-    lines.push(`_⏳ Metrics stale — last report ${fmtRelTs(stored.ts)}_`);
-  }
-
+  if (lastErr?.message) lines.push(`⚠️ Last err: \`${lastErr.message.slice(0, 100)}\` ${fmtRelTs(lastErr.ts)}`);
+  if (stored?.ts && Date.now() - stored.ts > 15 * 60_000) lines.push(`_⏳ Metrics stale — last report ${fmtRelTs(stored.ts)}_`);
   return lines.join('\n') || '_(no data)_';
 }
 
 async function buildFleetEmbed(env, nodes) {
-  // Poll all external nodes in parallel — pure I/O, doesn't burn CPU budget
   const healthResults = await Promise.all(
     nodes.map(n => fetchNodeHealth(n.url).then(h => ({ ...n, health: h }))),
   );
-
-  // CF self entry — internal state, no HTTP call
   const cfEntry = {
     id: 'cloudflare', name: 'Cloudflare Edge',
-    health: {
-      reachable: true, status: 'online', version: '7.0',
-      node: 'cloudflare', wasmReady,
-      iconCache: iconCacheStatus(),
-    },
+    health: { reachable: true, status: 'online', version: '8.0', node: 'cloudflare', wasmReady, iconCache: iconCacheStatus() },
   };
-
   const allEntries = [cfEntry, ...healthResults];
-
   const online   = allEntries.filter(e => e.health.reachable && !['degraded','offline'].includes(e.health.status)).length;
   const degraded = allEntries.filter(e => e.health.reachable && e.health.status === 'degraded').length;
   const offline  = allEntries.filter(e => !e.health.reachable || e.health.status === 'offline').length;
-
-  const color = offline > 0 ? 0xe74c3c : degraded > 0 ? 0xe67e22 : 0x2ecc71;
-
-  const fields = [
+  const color    = offline > 0 ? 0xe74c3c : degraded > 0 ? 0xe67e22 : 0x2ecc71;
+  const fields   = [
     { name: '🟢 Online',   value: `\`${online}\``,   inline: true },
     { name: '🟠 Degraded', value: `\`${degraded}\``, inline: true },
     { name: '🔴 Offline',  value: `\`${offline}\``,  inline: true },
     ...allEntries.map(e => ({
       name:   `${statusEmoji(e.health)} ${e.name}`,
-      // Look up stored metrics by node id OR by the name the node reported itself as
       value:  buildNodeFieldValue(e.health, findStoredMetrics(e.id, e.name)),
       inline: false,
     })),
   ];
-
   return {
     embeds: [{
       title:     '🎯 Posterium Rasterizer Fleet',
       color,
       fields,
-      footer:    { text: `${allEntries.length} nodes · Hub: Cloudflare Edge · KV: msgId only` },
+      footer:    { text: `${allEntries.length} nodes · Hub: Cloudflare Edge v8 · LB: T1×3 + wsrv + EUC` },
       timestamp: new Date().toISOString(),
     }],
   };
 }
 
-// ── Discord webhook ───────────────────────────────────────────────────────────
-
 async function discordPost(url, payload) {
   try {
     const res = await fetch(`${url}?wait=true`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
+      body:   JSON.stringify(payload),
     });
     if (!res.ok) { console.error('[hub] Discord POST failed:', res.status); return null; }
     return res.json();
@@ -648,48 +795,28 @@ async function discordPatch(url, msgId, payload) {
   try {
     const res = await fetch(`${url}/messages/${msgId}`, {
       method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
+      body:   JSON.stringify(payload),
     });
     return res.ok;
   } catch { return false; }
 }
 
-// ── Dashboard update orchestrator ─────────────────────────────────────────────
-
 async function updateDashboard(env, force = false) {
   const webhookUrl = env.DISCORD_WEBHOOK_URL;
   if (!webhookUrl) return;
-
-  // Per-isolate rate-limit (force=true bypasses — used for cron + errors)
   if (!force && Date.now() - _lastDiscordUpdate < DISCORD_MIN_INTERVAL_MS) return;
   _lastDiscordUpdate = Date.now();
-
   const nodes = getNodes(env);
   let payload;
-  try {
-    payload = await buildFleetEmbed(env, nodes);
-  } catch (e) {
-    console.error('[hub] buildFleetEmbed error:', e.message);
-    return;
-  }
-
-  // Single KV read to get the message ID — the only KV operation at steady state
+  try { payload = await buildFleetEmbed(env, nodes); }
+  catch (e) { console.error('[hub] buildFleetEmbed error:', e.message); return; }
   let msgId = await getMsgId(env);
-
   if (msgId) {
     const ok = await discordPatch(webhookUrl, msgId, payload);
-    if (!ok) {
-      console.warn('[hub] PATCH failed — message deleted? Creating new one.');
-      await clearMsgId(env);
-      msgId = null;
-    }
+    if (!ok) { await clearMsgId(env); msgId = null; }
   }
-
   if (!msgId) {
     const msg = await discordPost(webhookUrl, payload);
-    if (msg?.id) {
-      await setMsgId(env, msg.id); // only KV write in steady state
-      console.log('[hub] Created dashboard message:', msg.id);
-    }
+    if (msg?.id) { await setMsgId(env, msg.id); console.log('[hub] Created dashboard message:', msg.id); }
   }
 }
