@@ -19,7 +19,7 @@
   // Create with: wrangler kv:namespace create DASHBOARD_KV
   // Then replace the id below with the output ID.
   "kv_namespaces": [
-    { "binding": "DASHBOARD_KV", "id": "dashboard-rasterise" }
+    { "binding": "DASHBOARD_KV", "id": "c0547489012a48368146b53c1227f1f2" }
   ],
   // Cron: refresh fleet Discord embed every 5 minutes regardless of node reports.
   "triggers": {
