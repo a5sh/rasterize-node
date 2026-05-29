@@ -11,7 +11,7 @@
 //   <!--ICONS:imdb,rt_fresh,age-->
 //
 // This module:
-//   1. On first call, fetches https://api.spicydevs.xyz/data/icons (JSON)
+//   1. On first call, fetches https://api.posterium.xyz/data/icons (JSON)
 //      and caches the result in-process for 24 h.
 //   2. expandIconPlaceholder(svgText) replaces the placeholder with the real
 //      <symbol> elements before the SVG is handed to resvg.
@@ -25,7 +25,7 @@
 // resvg will still render — badges simply show no icons (pill + text only).
 // The next request retries the fetch.
 
-const ICONS_API_URL = "https://api.spicydevs.xyz/data/icons";
+const ICONS_API_URL = "https://api.posterium.xyz/data/icons";
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 h
 const FETCH_TIMEOUT = 5_000; // 5 s
 
