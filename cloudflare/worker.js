@@ -1,49 +1,39 @@
-// cloudflare/worker.js — v8
+// cloudflare/worker.js — v9
 //
 // RASTERIZER + LOAD BALANCER
 // ─────────────────────────────────────────────────────────────────────────────
-// This worker now serves two roles:
+// Roles:
+//   1. WASM rasterizer  — X-Simple: 1 requests (poster blur/grayscale, no ratings)
+//   2. Load balancer    — all other rasterization; staggered-concurrent T1 race:
 //
-//   1. WASM rasterizer  — used ONLY for simple requests (poster blur/grayscale,
-//                         no ratings). Signalled by X-Simple: 1 header from the
-//                         main API worker.
+//        T1 pool derived from assets/nodes.config.js (features.inLbWorker)
+//        Fallback: wsrv.nl → EUC (features.isLbFallback)
 //
-//   2. Load balancer    — all other rasterization requests are distributed to
-//                         T1 nodes using 40/30/30 geo-weighted selection:
+//        Staggered race: primary starts at t=0, second at t=1.5s, third at t=2.5s.
+//        First successful response wins and cancels the others.
+//        This cuts worst-case latency vs sequential retry while still
+//        conserving T1 node capacity when the primary responds quickly.
 //
-//        T1 pool:    US East (Vercel), DE20 (Spaceify), DE2 / Midas
-//        Fallback:   wsrv.nl → EUC Render (last resort)
+// ICON EXPANSION
+// ─────────────────────────────────────────────────────────────────────────────
+// The main API worker expands <!--ICONS:--> placeholders before sending SVG
+// here via the service binding. This worker never needs to expand icons.
 //
-//        High-traffic detection: nodes that accumulate ≥3 errors/min are
-//        deprioritised; the fallback chain absorbs the overflow naturally.
-//
-//        FR1 (fr1.spaceify.eu) is deprecated — not in rotation, b2p endpoint
-//        calls are now handled via the main API /b2p route.
-//
-// INTERFACE (called by main API via env.RASTERIZER service binding)
+// INTERFACE
 // ─────────────────────────────────────────────────────────────────────────────
 //   POST /
-//     Body:          raw SVG text  (icons already expanded by main API worker)
-//     X-Simple: 1   → WASM render
-//     X-SVG-Url:    → canonical SVG URL (needed for Vercel URL-payload + wsrv)
-//     X-CF-Colo:    → CF colo code of the original request (geo routing)
-//     X-Format:     → output format (png | jpg | jpeg | webp)
-//
-// FLEET MONITORING (unchanged from v7)
-// ─────────────────────────────────────────────────────────────────────────────
-//   POST /report     ← T1 nodes POST metrics here
-//   GET  /hub-test   ← debug: live fleet state + health polls
-//   scheduled()      ← cron: refresh Discord embed
+//     Body:         raw SVG text (icons already expanded by main API worker)
+//     X-Simple: 1  → WASM render
+//     X-SVG-Url:   → canonical SVG URL (for URL-payload nodes + wsrv)
+//     X-CF-Colo:   → CF colo of the original request (geo routing)
+//     X-Format:    → output format
 
-import { initWasm, Resvg }                             from '@resvg/resvg-wasm';
-import resvgWasm                                        from '@resvg/resvg-wasm/index_bg.wasm';
-import fontBuffer                                       from '../core/NotoSans-Subset.ttf';
-import { applyFauxBold }                               from '../core/fauxBold.js';
-import { expandIconPlaceholder, warmIconCache,
-         iconCacheStatus }                             from '../core/iconCache.js';
-import puppeteer                                        from '@cloudflare/puppeteer';
-
-warmIconCache();
+import { initWasm, Resvg } from '@resvg/resvg-wasm';
+import resvgWasm           from '@resvg/resvg-wasm/index_bg.wasm';
+import fontBuffer          from '../core/NotoSans-Subset.ttf';
+import { applyFauxBold }   from '../core/fauxBold.js';
+import NODE_CONFIG         from '../assets/nodes.config.js';
+import puppeteer           from '@cloudflare/puppeteer';
 
 // ── WASM init ─────────────────────────────────────────────────────────────────
 
@@ -51,15 +41,13 @@ let wasmReady   = false;
 let wasmPromise = null;
 
 function ensureWasm() {
-  if (wasmReady) return Promise.resolve();
+  if (wasmReady)   return Promise.resolve();
   if (wasmPromise) return wasmPromise;
   wasmPromise = initWasm(resvgWasm)
     .then(() => { wasmReady = true; })
     .catch(e  => { wasmPromise = null; throw e; });
   return wasmPromise;
 }
-
-// ── RESVG options ─────────────────────────────────────────────────────────────
 
 const RESVG_OPTS = {
   fitTo: { mode: 'original' },
@@ -83,53 +71,49 @@ const PROXY_ALLOWLIST = [
 ];
 
 // ══════════════════════════════════════════════════════════════════════════════
-// ── T1 NODE POOL & LOAD BALANCER ──────────────────────────────────────────────
+// ── T1 NODE POOL — derived from centralized config ────────────────────────────
 // ══════════════════════════════════════════════════════════════════════════════
 
-const T1_NODES = [
-  {
-    id:          'us-east',
-    url:         'https://us-r-vercel.vercel.app/api/rasterize',
-    region:      'NA',
-    useUrlPayload: true,   // GET ?url= path; avoids Vercel fast-origin-transfer cost
-    acceptsGzip: false,
-  },
-  {
-    id:          'de-20',
-    url:         'http://de20.spaceify.eu:26100',
-    region:      'EU',
-    useUrlPayload: false,
-    acceptsGzip: true,
-  },
-  {
-    id:          'de-2',
-    url:         'http://node-3.midas.host:25108',
-    region:      'EU',
-    useUrlPayload: false,
-    acceptsGzip: true,
-  },
-];
+/**
+ * Build the T1 pool and EUC fallback node from the shared nodes config.
+ * Nodes are ordered by tier (lower = higher priority).
+ */
+const T1_NODES = NODE_CONFIG.nodes
+  .filter(n => n.features.inLbWorker)
+  .sort((a, b) => (a.specs.tier ?? 99) - (b.specs.tier ?? 99))
+  .map(n => ({
+    id:            n.id,
+    // For URL-payload nodes include the API path; POST nodes use root.
+    url:           `${n.url}${n.features.apiPath ?? ''}`,
+    region:        n.lbRegion,
+    useUrlPayload: n.features.useUrlPayload  ?? false,
+    acceptsGzip:   n.features.acceptsCompression ?? false,
+  }));
 
-// Fallback tier — wsrv is attempted first (no node overhead), then EUC
-const EUC_NODE = {
-  id:          'euc',
-  url:         'https://euc-r-render.onrender.com',
-  region:      'EU',
-  useUrlPayload: false,
-  acceptsGzip: true,
-};
+const EUC_NODE = (() => {
+  const n = NODE_CONFIG.nodes.find(nd => nd.features.isLbFallback);
+  if (!n) return null;
+  return {
+    id:          n.id,
+    url:         `${n.url}${n.features.apiPath ?? ''}`,
+    region:      n.lbRegion ?? 'EU',
+    useUrlPayload: false,
+    acceptsGzip: n.features.acceptsCompression ?? false,
+  };
+})();
+
+const { t1TimeoutMs: T1_TIMEOUT_MS = 5_000, eucTimeoutMs: EUC_TIMEOUT_MS = 10_000,
+        wsrvTimeoutMs: WSRV_TIMEOUT_MS = 5_000,
+        staggerMs: STAGGER_MS = [0, 1_500, 2_500] } = NODE_CONFIG.settings;
 
 // ── Per-isolate health tracking ───────────────────────────────────────────────
 
-const _errMap     = new Map();   // id → { count, windowEnd }
-const _inflightMap = new Map();  // id → number
+const _errMap      = new Map(); // id → { count, windowEnd }
+const _inflightMap = new Map(); // id → number
 
-const ERR_WINDOW_MS        = 60_000;
-const STRESS_THRESHOLD     = 3;   // errors/min → deprioritise
-const FAILING_THRESHOLD    = 8;   // errors/min → skip in primary loop
-const T1_TIMEOUT_MS        = 5_000;
-const EUC_TIMEOUT_MS       = 10_000;
-const WSRV_TIMEOUT_MS      = 5_000;
+const ERR_WINDOW_MS     = 60_000;
+const STRESS_THRESHOLD  = 3;
+const FAILING_THRESHOLD = 8;
 
 function _recordErr(id) {
   const now = Date.now();
@@ -149,11 +133,11 @@ function _errCount(id) {
   return (!e || Date.now() > e.windowEnd) ? 0 : e.count;
 }
 
-function _isStressed(id)  { return _errCount(id) >= STRESS_THRESHOLD; }
-function _isFailing(id)   { return _errCount(id) >= FAILING_THRESHOLD; }
-function _acqIF(id)       { _inflightMap.set(id, (_inflightMap.get(id) || 0) + 1); }
-function _relIF(id)       { _inflightMap.set(id, Math.max(0, (_inflightMap.get(id) || 0) - 1)); }
-function _inFlight(id)    { return _inflightMap.get(id) || 0; }
+function _isStressed(id) { return _errCount(id) >= STRESS_THRESHOLD;  }
+function _isFailing(id)  { return _errCount(id) >= FAILING_THRESHOLD; }
+function _acqIF(id)      { _inflightMap.set(id, (_inflightMap.get(id) || 0) + 1); }
+function _relIF(id)      { _inflightMap.set(id, Math.max(0, (_inflightMap.get(id) || 0) - 1)); }
+function _inFlight(id)   { return _inflightMap.get(id) || 0; }
 
 // ── Geo region mapping ────────────────────────────────────────────────────────
 
@@ -176,34 +160,21 @@ function _region(colo) {
   return (colo && _COLO_REGION[colo.toUpperCase()]) || 'NA';
 }
 
-// ── Node order: geo-closest first, stressed nodes demoted ─────────────────────
-//
-// Base order:  EU → [de-20, de-2, us-east]  /  NA/else → [us-east, de-20, de-2]
-// Sort key:    failing=2 > stressed=1 > healthy=0
-// Result:      healthy nodes always precede stressed; failing nodes come last.
-// Effectively: wsrv/EUC get promoted naturally when all T1 nodes are failing.
-
+/**
+ * Return T1_NODES ordered geo-closest first, stressed nodes demoted,
+ * failing nodes last.
+ */
 function _nodeOrder(colo) {
-  const eu = _region(colo) === 'EU';
-  const base = eu
-    ? [T1_NODES[1], T1_NODES[2], T1_NODES[0]]   // de-20, de-2, us-east
-    : [T1_NODES[0], T1_NODES[1], T1_NODES[2]];  // us-east, de-20, de-2
-  return [...base].sort((a, b) => {
+  const req   = _region(colo);
+  const same  = T1_NODES.filter(n => n.region === req);
+  const other = T1_NODES.filter(n => n.region !== req);
+  return [...same, ...other].sort((a, b) => {
     const w = n => _isFailing(n.id) ? 2 : _isStressed(n.id) ? 1 : 0;
     return w(a) - w(b);
   });
 }
 
-// 40 / 30 / 30 probabilistic selection from the (already-sorted) ordered list.
-function _pick(ordered) {
-  if (!ordered.length) return null;
-  const r = Math.random() * 100;
-  if (r < 40 || ordered.length === 1) return ordered[0];
-  if (r < 70 || ordered.length === 2) return ordered[1];
-  return ordered[2];
-}
-
-// ── Gzip compression (CompressionStream — native in CF Workers) ───────────────
+// ── Gzip compression ──────────────────────────────────────────────────────────
 
 async function _gzip(text) {
   try {
@@ -215,7 +186,7 @@ async function _gzip(text) {
   } catch { return null; }
 }
 
-// ── Single T1 / EUC node request ─────────────────────────────────────────────
+// ── Single node request ───────────────────────────────────────────────────────
 
 async function _fetchNode(node, svgText, svgUrl, format, signal) {
   _acqIF(node.id);
@@ -227,7 +198,7 @@ async function _fetchNode(node, svgText, svgUrl, format, signal) {
       u.searchParams.set('format', format);
       res = await fetch(u.toString(), {
         method:  'GET',
-        headers: { 'User-Agent': 'SpicyDevs-LB/8.0' },
+        headers: { 'User-Agent': 'SpicyDevs-LB/9.0' },
         signal,
       });
     } else {
@@ -235,12 +206,16 @@ async function _fetchNode(node, svgText, svgUrl, format, signal) {
       const extraHeaders = {};
       if (node.acceptsGzip) {
         const gz = await _gzip(svgText);
-        if (gz) { body = gz; ct = 'application/octet-stream'; extraHeaders['X-SVG-Encoding'] = 'gzip'; }
+        if (gz) {
+          body = gz;
+          ct   = 'application/octet-stream';
+          extraHeaders['X-SVG-Encoding'] = 'gzip';
+        }
       }
       res = await fetch(node.url, {
         method:  'POST',
         body,
-        headers: { 'Content-Type': ct, 'X-Format': format, 'User-Agent': 'SpicyDevs-LB/8.0', ...extraHeaders },
+        headers: { 'Content-Type': ct, 'X-Format': format, 'User-Agent': 'SpicyDevs-LB/9.0', ...extraHeaders },
         signal,
       });
     }
@@ -258,22 +233,20 @@ async function _fetchNode(node, svgText, svgUrl, format, signal) {
 async function _fetchWsrv(svgUrl, format) {
   if (!svgUrl) return null;
   try {
-    // Rewrite to backend direct domain so wsrv can reach it; strip no_embed redirect
     const src = new URL(svgUrl);
     src.hostname = 'posterium-backend.aayu5h.workers.dev';
     src.searchParams.delete('no_embed');
 
     const u = new URL('https://wsrv.nl/');
     u.searchParams.set('url',    src.toString());
-    u.searchParams.set('output', format === 'webp' ? 'webp' : (format === 'jpg' || format === 'jpeg') ? 'jpeg' : 'png');
-    u.searchParams.set('q',      '100');
-
+    u.searchParams.set('output',
+      format === 'webp' ? 'webp' : (format === 'jpg' || format === 'jpeg') ? 'jpeg' : 'png',
+    );
+    u.searchParams.set('q', '100');
     const res = await fetch(u.toString(), { signal: AbortSignal.timeout(WSRV_TIMEOUT_MS) });
     return res.ok ? res : null;
   } catch { return null; }
 }
-
-// ── Build a uniform image Response from any upstream ─────────────────────────
 
 function _imageResp(upstream, source, format) {
   const h = new Headers(upstream.headers);
@@ -284,52 +257,76 @@ function _imageResp(upstream, source, format) {
   return new Response(upstream.body, { status: 200, headers: h });
 }
 
-// ── Distributed render orchestrator ──────────────────────────────────────────
+const _sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// ── Staggered-concurrent T1 race ──────────────────────────────────────────────
 //
-// 1. Select primary T1 node (40/30/30 weighted, geo-aware)
-// 2. Try primary → try remaining T1 nodes sequentially
-// 3. wsrv.nl fallback
-// 4. EUC Render last resort
+// All T1 nodes start within a window rather than sequentially:
+//   Node 0: starts immediately
+//   Node 1: starts after STAGGER_MS[1] (default 1.5s) if no winner yet
+//   Node 2: starts after STAGGER_MS[2] (default 2.5s) if no winner yet
 //
-// Each T1 attempt gets T1_TIMEOUT_MS; EUC gets EUC_TIMEOUT_MS.
-// All fallback logic lives here — individual nodes have no nested fallbacks.
+// The first successful response cancels all pending sibling requests via
+// the shared raceAc AbortController.  Promise.any() resolves with the
+// winner; rejects only when ALL nodes fail.
+//
+// Worst-case latency (vs sequential): 2.5s + T1_TIMEOUT_MS instead of
+// 3 × T1_TIMEOUT_MS.  Best case: same as sending to the fastest node only.
 
 async function _distributedRender(svgText, svgUrl, format, colo) {
   const ordered = _nodeOrder(colo);
-  const primary = _pick(ordered);
-  const rest    = ordered.filter(n => n !== primary);
-
-  // Primary T1 attempt
-  if (primary) {
-    const ac = new AbortController();
-    const tm = setTimeout(() => ac.abort(), T1_TIMEOUT_MS);
-    const res = await _fetchNode(primary, svgText, svgUrl, format, ac.signal).finally(() => clearTimeout(tm));
-    if (res) return _imageResp(res, primary.id, format);
+  if (!ordered.length) {
+    const wsrvRes = await _fetchWsrv(svgUrl, format);
+    if (wsrvRes) return _imageResp(wsrvRes, 'wsrv', format);
+    return jsonError(502, 'No T1 nodes configured');
   }
 
-  // Remaining T1 nodes
-  for (const node of rest) {
-    const ac = new AbortController();
-    const tm = setTimeout(() => ac.abort(), T1_TIMEOUT_MS);
-    const res = await _fetchNode(node, svgText, svgUrl, format, ac.signal).finally(() => clearTimeout(tm));
-    if (res) return _imageResp(res, node.id, format);
-  }
+  const raceAc = new AbortController();
+
+  const t1Promises = ordered.map((node, idx) => (async () => {
+    if (idx > 0) {
+      await _sleep(STAGGER_MS[idx] ?? STAGGER_MS[STAGGER_MS.length - 1]);
+      if (raceAc.signal.aborted) throw new Error('race cancelled');
+    }
+
+    const nodeAc = new AbortController();
+    raceAc.signal.addEventListener('abort', () => nodeAc.abort(), { once: true });
+    const tm = setTimeout(() => nodeAc.abort(), T1_TIMEOUT_MS);
+
+    try {
+      const res = await _fetchNode(node, svgText, svgUrl, format, nodeAc.signal);
+      clearTimeout(tm);
+      if (!res) throw new Error('node returned null');
+      raceAc.abort(); // cancel remaining staggered starts + in-flight siblings
+      return _imageResp(res, node.id, format);
+    } catch (e) {
+      clearTimeout(tm);
+      throw e;
+    }
+  })());
+
+  try {
+    return await Promise.any(t1Promises);
+  } catch { /* all T1 failed */ }
 
   // wsrv.nl
   const wsrvRes = await _fetchWsrv(svgUrl, format);
   if (wsrvRes) return _imageResp(wsrvRes, 'wsrv', format);
 
-  // EUC Render (last resort)
-  const ac = new AbortController();
-  const tm = setTimeout(() => ac.abort(), EUC_TIMEOUT_MS);
-  const eucRes = await _fetchNode(EUC_NODE, svgText, svgUrl, format, ac.signal).finally(() => clearTimeout(tm));
-  if (eucRes) return _imageResp(eucRes, 'euc', format);
+  // EUC last resort
+  if (EUC_NODE) {
+    const eucAc = new AbortController();
+    const eucTm = setTimeout(() => eucAc.abort(), EUC_TIMEOUT_MS);
+    const eucRes = await _fetchNode(EUC_NODE, svgText, svgUrl, format, eucAc.signal)
+      .finally(() => clearTimeout(eucTm));
+    if (eucRes) return _imageResp(eucRes, EUC_NODE.id, format);
+  }
 
   return jsonError(502, 'All rasterizers exhausted');
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// ── IN-ISOLATE FLEET STATE (Discord hub — no KV, see v7 comments) ─────────────
+// ── FLEET MONITORING STATE ────────────────────────────────────────────────────
 // ══════════════════════════════════════════════════════════════════════════════
 
 const _nodeMetrics = new Map();
@@ -345,24 +342,24 @@ export default {
     if (url.pathname === '/health') {
       return jsonOk({
         status:     'ok',
-        version:    '8.0',
+        version:    '9.0',
         node:       'cloudflare',
         wasmReady,
         queueDepth: 0,
-        iconCache:  iconCacheStatus(),
-        fleetNodes: _nodeMetrics.size,
-        t1Nodes:    T1_NODES.map(n => ({
+        t1Pool: T1_NODES.map(n => ({
           id:       n.id,
           errors:   _errCount(n.id),
           inFlight: _inFlight(n.id),
           stressed: _isStressed(n.id),
           failing:  _isFailing(n.id),
         })),
+        eucNode:    EUC_NODE?.id ?? null,
+        fleetNodes: _nodeMetrics.size,
       });
     }
 
     if (url.pathname === '/hub-test') {
-      const nodes = getNodes(env);
+      const nodes      = getNodes(env);
       const liveHealth = await Promise.all(
         nodes.map(n => fetchNodeHealth(n.url).then(h => ({ id: n.id, name: n.name, health: h }))),
       );
@@ -378,17 +375,9 @@ export default {
       });
     }
 
-    if (url.pathname === '/report') {
-      return handleReport(request, env, ctx);
-    }
-
-    if (url.pathname === '/ss') {
-      return handleScreenshot(request, env);
-    }
-
-    if (url.pathname === '/proxy') {
-      return handleProxy(request);
-    }
+    if (url.pathname === '/report') return handleReport(request, env, ctx);
+    if (url.pathname === '/ss')     return handleScreenshot(request, env);
+    if (url.pathname === '/proxy')  return handleProxy(request);
 
     if (request.method === 'OPTIONS') {
       return new Response(null, {
@@ -401,24 +390,18 @@ export default {
       });
     }
 
-    // ── Rasterisation entry point ─────────────────────────────────────────────
-    //
-    // X-Simple: 1   → WASM render (poster blur/grayscale only, no ratings)
-    // (no header)   → distributed render via T1 pool
-
-    const isSimple = request.headers.get('X-Simple') === '1';
-    const svgUrl   = request.headers.get('X-SVG-Url')  || null;
-    const colo     = request.headers.get('X-CF-Colo')  || request.cf?.colo || null;
-
-    const formatHeader = request.headers.get('X-Format') || '';
-    const formatParam  = url.searchParams.get('format')  || '';
+    // ── Rasterization entry point ─────────────────────────────────────────────
+    const isSimple     = request.headers.get('X-Simple')  === '1';
+    const svgUrl       = request.headers.get('X-SVG-Url') || null;
+    const colo         = request.headers.get('X-CF-Colo') || request.cf?.colo || null;
+    const formatHeader = request.headers.get('X-Format')  || '';
+    const formatParam  = url.searchParams.get('format')   || '';
     const format       = (['png','jpg','jpeg','webp'].find(
       f => f === (formatHeader || formatParam).toLowerCase(),
     )) || 'png';
 
-    // ── Parse SVG body ───────────────────────────────────────────────────────
+    // ── Parse SVG body ────────────────────────────────────────────────────────
     let svgText;
-
     if (request.method === 'POST') {
       const ct = request.headers.get('content-type') || '';
       if (ct.includes('application/json')) {
@@ -435,7 +418,7 @@ export default {
       const targetUrl = url.searchParams.get('url');
       if (!targetUrl) return jsonError(400, 'Missing ?url= parameter');
       try {
-        const r = await fetch(targetUrl, { headers: { 'User-Agent': 'SpicyDevs-Rasterizer/8.0' } });
+        const r = await fetch(targetUrl, { headers: { 'User-Agent': 'SpicyDevs-Rasterizer/9.0' } });
         if (!r.ok) return jsonError(502, `SVG fetch failed: ${r.status}`);
         svgText = await r.text();
       } catch (e) {
@@ -445,21 +428,21 @@ export default {
       return jsonError(405, 'Method not allowed');
     }
 
-    // ── Distributed render (all non-simple requests) ─────────────────────────
+    // ── Distributed render (all non-simple) ───────────────────────────────────
     if (!isSimple) {
       return _distributedRender(svgText, svgUrl, format, colo);
     }
 
-    // ── WASM render (simple poster blur/grayscale, no ratings) ───────────────
+    // ── WASM render (simple: poster blur/grayscale, no ratings) ───────────────
     try { await ensureWasm(); }
     catch (e) { return jsonError(503, `WASM init failed: ${e.message}`); }
 
     try {
-      const withIcons  = await expandIconPlaceholder(svgText);
-      const embedded   = await embedExternalImages(withIcons);
-      const processed  = applyFauxBold(embedded);
-      const resvg      = new Resvg(processed, RESVG_OPTS);
-      const rendered   = resvg.render();
+      // Icons are already expanded by the main API worker — no expansion needed here.
+      const embedded  = await embedExternalImages(svgText);
+      const processed = applyFauxBold(embedded);
+      const resvg     = new Resvg(processed, RESVG_OPTS);
+      const rendered  = resvg.render();
 
       let imageBuffer, mimeType;
       if (format === 'jpg' || format === 'jpeg') {
@@ -484,18 +467,13 @@ export default {
           'X-Raster-Source':             'cf-wasm',
         },
       });
-
-      if (request.method === 'GET') {
-        ctx.waitUntil(caches.default.put(request, response.clone()));
-      }
-
+      if (request.method === 'GET') ctx.waitUntil(caches.default.put(request, response.clone()));
       return response;
     } catch (e) {
       return jsonError(500, e instanceof Error ? e.message : String(e));
     }
   },
 
-  // ── Cron trigger ─────────────────────────────────────────────────────────────
   async scheduled(_event, env, ctx) {
     ctx.waitUntil(updateDashboard(env, true));
   },
@@ -522,14 +500,12 @@ function jsonError(status, message) {
 async function embedExternalImages(svgText) {
   const matches = [...svgText.matchAll(/href="(https?:\/\/[^"]+)"/g)];
   if (matches.length === 0) return svgText;
-
   const uniqueUrls = [...new Set(matches.map(m => m[1]))];
-
   const replacements = await Promise.all(
     uniqueUrls.map(async url => {
       try {
         const res = await fetch(url, {
-          headers: { 'User-Agent': 'SpicyDevs-Rasterizer/8.0' },
+          headers: { 'User-Agent': 'SpicyDevs-Rasterizer/9.0' },
           signal:  AbortSignal.timeout(8_000),
         });
         if (!res.ok) return { url, dataUri: null };
@@ -544,7 +520,6 @@ async function embedExternalImages(svgText) {
       } catch { return { url, dataUri: null }; }
     }),
   );
-
   for (const { url, dataUri } of replacements)
     if (dataUri) svgText = svgText.split(`href="${url}"`).join(`href="${dataUri}"`);
   return svgText;
@@ -554,11 +529,11 @@ async function embedExternalImages(svgText) {
 
 async function handleProxy(request) {
   const url       = new URL(request.url);
-  const targetUrl = url.searchParams.get('url');
+  const targetUrl = url.
+  searchParams.get('url');
   if (!targetUrl) return jsonError(400, 'Missing ?url= parameter');
-
-  const allowed = PROXY_ALLOWLIST.some(prefix => targetUrl.startsWith(prefix));
-  if (!allowed) return jsonError(403, `Proxy target not in allowlist: ${targetUrl}`);
+  if (!PROXY_ALLOWLIST.some(prefix => targetUrl.startsWith(prefix)))
+    return jsonError(403, `Proxy target not in allowlist: ${targetUrl}`);
 
   const proxyHeaders = new Headers();
   for (const key of ['content-type', 'x-format', 'x-svg-encoding'])
@@ -626,7 +601,7 @@ async function handleScreenshot(request, env) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// ── DISCORD FLEET HUB (unchanged from v7) ─────────────────────────────────────
+// ── DISCORD FLEET HUB (unchanged) ─────────────────────────────────────────────
 // ══════════════════════════════════════════════════════════════════════════════
 
 async function handleReport(request, env, ctx) {
@@ -636,8 +611,7 @@ async function handleReport(request, env, ctx) {
   const { type, node, ts, stats, snapshot } = body;
   if (!node || !type) return jsonError(400, 'Missing node or type');
   _nodeMetrics.set(node, { node, type, ts: ts || Date.now(), stats: stats || null, snapshot: snapshot || null, lastError: stats?.lastError || null });
-  const force = type === 'error' || type === 'offline';
-  ctx.waitUntil(updateDashboard(env, force));
+  ctx.waitUntil(updateDashboard(env, type === 'error' || type === 'offline'));
   return jsonOk({ received: true, type, node });
 }
 
@@ -656,7 +630,7 @@ function getNodes(env) {
 async function fetchNodeHealth(url) {
   try {
     const res = await fetch(`${url.replace(/\/$/, '')}/health`, {
-      headers: { 'User-Agent': 'SpicyDevs-Hub/8.0' },
+      headers: { 'User-Agent': 'SpicyDevs-Hub/9.0' },
       signal:  AbortSignal.timeout(6_000),
     });
     if (!res.ok) return { reachable: false, httpStatus: res.status };
@@ -668,12 +642,10 @@ async function getMsgId(env) {
   if (!env.DASHBOARD_KV) return null;
   try { return await env.DASHBOARD_KV.get('cf:discord:msgId'); } catch { return null; }
 }
-
 async function setMsgId(env, id) {
   if (!env.DASHBOARD_KV) return;
   await env.DASHBOARD_KV.put('cf:discord:msgId', id).catch(() => {});
 }
-
 async function clearMsgId(env) {
   if (!env.DASHBOARD_KV) return;
   await env.DASHBOARD_KV.delete('cf:discord:msgId').catch(() => {});
@@ -684,15 +656,12 @@ function fmtUptime(s) {
   const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
   return h > 0 ? `${h}h ${m}m` : `${m}m`;
 }
-
 function fmtRelTs(tsMs) { return tsMs ? `<t:${Math.floor(tsMs / 1000)}:R>` : 'never'; }
-
 function statusEmoji(health) {
   if (!health.reachable || health.status === 'offline') return '🔴';
   if (health.status === 'degraded')                     return '🟠';
   return '🟢';
 }
-
 function findStoredMetrics(nodeId, nodeName) {
   return _nodeMetrics.get(nodeId) || _nodeMetrics.get(nodeName) || null;
 }
@@ -709,17 +678,15 @@ function buildNodeFieldValue(health, stored) {
   if (row1.length) lines.push(row1.join(' · '));
   if (health.activeJobs !== undefined) {
     const row2 = [];
-    if (health.workerCount)    row2.push(`${health.workerCount} workers`);
+    if (health.workerCount)     row2.push(`${health.workerCount} workers`);
     row2.push(`${health.activeJobs} active`);
-    if (health.queuedJobs)     row2.push(`${health.queuedJobs} queued`);
+    if (health.queuedJobs)      row2.push(`${health.queuedJobs} queued`);
     if (health.pendingRespawns) row2.push(`⚠️ ${health.pendingRespawns} respawning`);
     lines.push(row2.join(' · '));
   }
   const cap = [];
   const fontOk = health.fontReady ?? (Array.isArray(health.fontFiles) ? health.fontFiles.length > 0 : undefined);
   if (fontOk !== undefined) cap.push(fontOk ? 'Font ✅' : 'Font ❌');
-  if (health.iconCache?.loaded)       cap.push(`Icons: ${health.iconCache.iconCount}`);
-  else if (health.iconCache?.lastError) cap.push('Icons ❌');
   if (cap.length) lines.push(cap.join(' · '));
   const snap = stored?.snapshot;
   if (snap) {
@@ -752,7 +719,7 @@ async function buildFleetEmbed(env, nodes) {
   );
   const cfEntry = {
     id: 'cloudflare', name: 'Cloudflare Edge',
-    health: { reachable: true, status: 'online', version: '8.0', node: 'cloudflare', wasmReady, iconCache: iconCacheStatus() },
+    health: { reachable: true, status: 'online', version: '9.0', node: 'cloudflare', wasmReady },
   };
   const allEntries = [cfEntry, ...healthResults];
   const online   = allEntries.filter(e => e.health.reachable && !['degraded','offline'].includes(e.health.status)).length;
@@ -774,7 +741,7 @@ async function buildFleetEmbed(env, nodes) {
       title:     '🎯 Posterium Rasterizer Fleet',
       color,
       fields,
-      footer:    { text: `${allEntries.length} nodes · Hub: Cloudflare Edge v8 · LB: T1×3 + wsrv + EUC` },
+      footer:    { text: `${allEntries.length} nodes · Hub: CF Edge v9 · T1: ${T1_NODES.length} nodes + wsrv + ${EUC_NODE?.id ?? 'no-euc'}` },
       timestamp: new Date().toISOString(),
     }],
   };

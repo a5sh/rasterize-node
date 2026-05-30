@@ -31,7 +31,8 @@ const CORE_FILES = [
   "renderPool.js",
   "renderWorker.js",
   "iconCache.js",
-  "serverlessReporter.js", // ← add this
+  "serverlessReporter.js",
+  "embedImages.js",
   "NotoSans-Subset.ttf",
   "b2p.js",
   "cache.js",

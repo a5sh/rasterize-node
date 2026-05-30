@@ -1,20 +1,14 @@
 // vercel/api/rasterize.js
 //
-// v7.1 — serverlessReporter added
-// ─────────────────────────────────────────────────────────────────────────────
-// Metrics (request count, job duration percentiles, error rate) are now
-// accumulated in module-level memory and flushed to the CF Discord hub via
-// maybeReport() after each render. No Discord dependency in this file.
+// v7.2 — gzip dead code removed (vercel uses GET ?url= only, never gzip POST)
+//       icon placeholder expansion removed (main API worker pre-expands icons)
+//       embedExternalImages moved to shared lib/embedImages.js
 
-import { gunzipSync } from "node:zlib";
 import { Resvg } from "@resvg/resvg-js";
 import { applyFauxBold } from "../lib/fauxBold.js";
 import { buildResvgOpts } from "../lib/sharedRender.js";
-import {
-  expandIconPlaceholder,
-  warmIconCache,
-  iconCacheStatus,
-} from "../lib/iconCache.js";
+import { iconCacheStatus } from "../lib/iconCache.js";
+import { embedExternalImages } from "../lib/embedImages.js";
 import {
   recordRequest,
   recordJobDuration,
@@ -23,13 +17,8 @@ import {
   maybeReport,
 } from "../lib/serverlessReporter.js";
 
-// NODE_NAME must match the id used in CF worker's getNodes() — set via
-// Vercel dashboard: Settings > Environment Variables > NODE_NAME = vercel-usw
 const NODE_NAME = process.env.NODE_NAME || "vercel-usw";
-
 const RESVG_OPTS = buildResvgOpts();
-
-warmIconCache();
 
 export const config = { maxDuration: 10 };
 
@@ -39,52 +28,14 @@ const CORS = {
   "Access-Control-Allow-Headers": "Content-Type, X-Format, X-SVG-Encoding",
 };
 
-// ── Decompression ─────────────────────────────────────────────────────────────
-
-function decompressBody(buf, encoding) {
-  if (encoding === "gzip") {
-    try {
-      return gunzipSync(buf).toString("utf8");
-    } catch {
-      /* fall through */
-    }
-  }
-  return buf.toString("utf8");
-}
-
-// ── External image embedding ──────────────────────────────────────────────────
-
-async function embedExternalImages(svgText) {
-  const matches = [...svgText.matchAll(/href="(https?:\/\/[^"]+)"/g)];
-  if (!matches.length) return svgText;
-  const unique = [...new Set(matches.map((m) => m[1]))];
-  const reps = await Promise.all(
-    unique.map(async (url) => {
-      try {
-        const res = await fetch(url, {
-          signal: AbortSignal.timeout(8_000),
-          headers: { "User-Agent": "SpicyDevs-Rasterizer/7.1" },
-        });
-        if (!res.ok) return { url, dataUri: null };
-        const buf = Buffer.from(await res.arrayBuffer());
-        const ct = res.headers.get("content-type") || "image/jpeg";
-        return { url, dataUri: `data:${ct};base64,${buf.toString("base64")}` };
-      } catch {
-        return { url, dataUri: null };
-      }
-    }),
-  );
-  for (const { url, dataUri } of reps)
-    if (dataUri)
-      svgText = svgText.split(`href="${url}"`).join(`href="${dataUri}"`);
-  return svgText;
-}
-
 // ── Render pipeline ───────────────────────────────────────────────────────────
 
 async function renderToBuffer(svgText, format) {
-  const withIcons = await expandIconPlaceholder(svgText);
-  const embedded = await embedExternalImages(withIcons);
+  // Icons are already expanded by the main API worker — no expansion needed.
+  const embedded = await embedExternalImages(
+    svgText,
+    "SpicyDevs-Rasterizer/7.2",
+  );
   const processed = applyFauxBold(embedded);
   const resvg = new Resvg(processed, RESVG_OPTS);
   const rendered = resvg.render();
@@ -99,10 +50,6 @@ async function renderToBuffer(svgText, format) {
   return { buffer: rendered.asPng(), mimeType: "image/png" };
 }
 
-/**
- * Wraps renderToBuffer with metric recording.
- * recordRequest() is called by the caller so bulk jobs aren't double-counted.
- */
 async function renderAndRecord(svgText, format) {
   const t0 = Date.now();
   try {
@@ -160,18 +107,18 @@ export default async function handler(req, res) {
     "png"
   ).toLowerCase();
 
-  // ── Health check ──────────────────────────────────────────────────────────
+  // ── Health ────────────────────────────────────────────────────────────────
   if (url.pathname === "/health") {
     return sendJson(res, 200, {
       status: "ok",
-      version: "7.1",
+      version: "7.2",
       node: NODE_NAME,
       fontReady: !!RESVG_OPTS.font?.fontFiles?.length,
       iconCache: iconCacheStatus(),
     });
   }
 
-  // ── GET ?url= ─────────────────────────────────────────────────────────────
+  // ── GET ?url= (primary path — vercel only uses URL-payload) ───────────────
   if (req.method === "GET") {
     const targetUrl = url.searchParams.get("url");
     if (!targetUrl)
@@ -181,7 +128,7 @@ export default async function handler(req, res) {
     try {
       const r = await fetch(targetUrl, {
         signal: AbortSignal.timeout(8_000),
-        headers: { "User-Agent": "SpicyDevs-Rasterizer/7.1" },
+        headers: { "User-Agent": "SpicyDevs-Rasterizer/7.2" },
       });
       if (!r.ok) {
         recordError();
@@ -199,16 +146,14 @@ export default async function handler(req, res) {
     }
   }
 
-  // ── POST ──────────────────────────────────────────────────────────────────
+  // ── POST (JSON single / JSON bulk / raw SVG) ──────────────────────────────
   if (req.method === "POST") {
     const ct = req.headers["content-type"] || "";
-    const encoding = req.headers["x-svg-encoding"] || "";
     const bodyBuf = await readBody(req);
 
-    // ── JSON body (single or bulk) ────────────────────────────────────────
+    // JSON body
     if (ct.includes("application/json")) {
       if (!bodyBuf.length) return sendJson(res, 400, { error: "Empty body" });
-
       let payload;
       try {
         payload = JSON.parse(bodyBuf);
@@ -216,7 +161,7 @@ export default async function handler(req, res) {
         return sendJson(res, 400, { error: "Invalid JSON" });
       }
 
-      // Single job
+      // Single
       if (payload.svgText) {
         recordRequest();
         const fmt = payload.format || format;
@@ -233,14 +178,13 @@ export default async function handler(req, res) {
         }
       }
 
-      // Bulk jobs
+      // Bulk
       if (Array.isArray(payload.jobs)) {
         const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT || "4", 10);
         const results = [];
         for (let i = 0; i < payload.jobs.length; i += MAX_CONCURRENT) {
-          const slice = payload.jobs.slice(i, i + MAX_CONCURRENT);
           const batch = await Promise.all(
-            slice.map(async (job) => {
+            payload.jobs.slice(i, i + MAX_CONCURRENT).map(async (job) => {
               recordRequest();
               const fmt = job.format || "png";
               try {
@@ -269,17 +213,15 @@ export default async function handler(req, res) {
         });
         return res.end(JSON.stringify({ results }));
       }
-
       return sendJson(res, 400, {
         error: "Expected { svgText } or { jobs: [] }",
       });
     }
 
-    // ── Raw SVG body (may be gzip-compressed) ─────────────────────────────
+    // Raw SVG POST (no gzip: vercel has acceptsCompression: false)
     if (!bodyBuf.length) return sendJson(res, 400, { error: "Empty SVG body" });
-
     recordRequest();
-    const svgText = decompressBody(bodyBuf, encoding);
+    const svgText = bodyBuf.toString("utf8");
     try {
       const { buffer, mimeType } = await renderAndRecord(svgText, format);
       maybeReport(NODE_NAME).catch(() => {});
