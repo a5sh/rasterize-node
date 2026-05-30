@@ -15,10 +15,10 @@ import {
   buildResvgOpts,
   generatePosterFromBackdrop,
   generateSquareCropFromBackdrop,
-  expandIconPlaceholder,
   warmIconCache,
   RESOLVED_LIB_DIR,
 } from './lib.js';
+import { embedExternalImages } from './lib/embedImages.js';
 import {
   stats, logError, notifyOnline, notifyOffline,
   recordRequest, recordJobDuration, recordResvgFail, recordWsrvFallback,
@@ -32,55 +32,11 @@ const WORKER_PATH = join(RESOLVED_LIB_DIR, 'renderWorker.js');
 // Warm icon cache at startup (fire-and-forget)
 warmIconCache();
 
-// ── Server-level image embedding ──────────────────────────────────────────────
-// Worker threads can't reliably reach external URLs (proxied poster hrefs) on
-// VPS / container networks. Embed poster image hrefs as base64 data URIs here,
-// in the main process, before the SVG is handed to the render pool.
-// This mirrors how Netlify/Vercel handle it — they embed in the lambda itself.
-
-const EMBED_IMG_RE = /href="(https?:\/\/[^"]+)"/g;
-
-async function serverEmbedImages(svgText) {
-  const matches = [...svgText.matchAll(EMBED_IMG_RE)];
-  if (matches.length === 0) return svgText;
-
-  const uniqueUrls = [...new Set(matches.map(m => m[1]))];
-
-  const replacements = await Promise.all(
-    uniqueUrls.map(async url => {
-      const ac = new AbortController();
-      const t  = setTimeout(() => ac.abort(), 8_000);
-      try {
-        const res = await fetch(url, {
-          signal:  ac.signal,
-          headers: { 'User-Agent': 'SpicyDevs-Rasterizer/3.0' },
-        });
-        clearTimeout(t);
-        if (!res.ok) return { url, dataUri: null };
-        const buf = Buffer.from(await res.arrayBuffer());
-        const ct  = res.headers.get('content-type') || 'image/jpeg';
-        return { url, dataUri: `data:${ct};base64,${buf.toString('base64')}` };
-      } catch {
-        clearTimeout(t);
-        return { url, dataUri: null };
-      }
-    }),
-  );
-
-  for (const { url, dataUri } of replacements) {
-    if (dataUri) svgText = svgText.split(`href="${url}"`).join(`href="${dataUri}"`);
-  }
-  return svgText;
-}
-
 // ── Render wrapper ─────────────────────────────────────────────────────────────
-// Expands the icon placeholder and embeds external images before dispatching
-// to the worker pool. Worker threads have no network access of their own.
+// Icons are already expanded by the main API worker.
 
 async function renderSvg(svgText, format) {
-  const withIcons  = await expandIconPlaceholder(svgText);
-  const withImages = await serverEmbedImages(withIcons);
-  return pool.render(withImages, format);
+  return pool.render(await embedExternalImages(svgText, 'SpicyDevs-Rasterizer/3.1'), format);
 }
 
 // ── wsrv fallback ─────────────────────────────────────────────────────────────

@@ -19,21 +19,24 @@ export const RESOLVED_LIB_DIR = useCore ? coreDir : libDir;
 
 console.log(`[lib-resolver] Using ${useCore ? '../core (direct)' : './lib (built)'}`);
 
-const [poolMod, renderMod, iconMod, b2pMod] = useCore
+const [poolMod, renderMod, iconMod, b2pMod, embedMod] = useCore
   ? await Promise.all([
       import('../core/renderPool.js'),
       import('../core/sharedRender.js'),
       import('../core/iconCache.js'),
       import('../core/b2p.js'),
+      import('../core/embedImages.js'),
     ])
   : await Promise.all([
       import('./lib/renderPool.js'),
       import('./lib/sharedRender.js'),
       import('./lib/iconCache.js'),
       import('./lib/b2p.js'),
+      import('./lib/embedImages.js'),
     ]);
 
 export const { RenderPool }                                          = poolMod;
 export const { buildResvgOpts }                                      = renderMod;
 export const { expandIconPlaceholder, warmIconCache, iconCacheStatus } = iconMod;
 export const { generatePosterFromBackdrop, generateSquareCropFromBackdrop } = b2pMod;
+export const { embedExternalImages }                                 = embedMod;
