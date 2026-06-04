@@ -549,4 +549,116 @@ export default {
       if (!targetUrl) return jsonError(400, 'Missing ?url= parameter');
       
       try {
-        const parsedTarget = new URL(targ
+        const parsedTarget = new URL(targetUrl);
+        if (!['http:', 'https:'].includes(parsedTarget.protocol)) {
+            return jsonError(400, 'Invalid or unsupported URL protocol');
+        }
+        const r = await fetch(parsedTarget.toString(), { headers: { 'User-Agent': 'SpicyDevs-Rasterizer/10.0' } });
+        if (!r.ok) return jsonError(502, `SVG fetch failed: ${r.status}`);
+        svgText = await r.text();
+      } catch (e) {
+        return jsonError(502, `SVG fetch error: ${e.message}`);
+      }
+    } else {
+      return jsonError(405, 'Method not allowed');
+    }
+
+    // ── Route: distributed T1/EUC/wsrv chain vs local WASM ────────────────────
+    if (!isSimple && request.method !== 'GET') {
+      return _distributedRender(svgText, svgUrl, format, colo, fallbackImageUrl);
+    }
+
+    // ── WASM render ───────────────────────────────────────────────────────────
+    try { await ensureWasm(); }
+    catch (e) { return jsonError(503, `WASM init failed: ${e.message}`); }
+
+    try {
+      const tEmbed0   = Date.now();
+      const embedded  = await embedExternalImages(svgText);
+      const tEmbedMs  = Date.now() - tEmbed0;
+
+      const tBold0    = Date.now();
+      const processed = applyFauxBold(embedded);
+      const tBoldMs   = Date.now() - tBold0;
+
+      const tRender0  = Date.now();
+      const resvg     = new Resvg(processed, RESVG_OPTS);
+      const rendered  = resvg.render();
+      const tRenderMs = Date.now() - tRender0;
+
+      const tEncode0  = Date.now();
+      let imageBuffer, mimeType;
+      
+      // Flattened capabilities logic block
+      if ((format === 'jpg' || format === 'jpeg') && typeof rendered.asJpeg === 'function') {
+        imageBuffer = rendered.asJpeg(85);
+        mimeType    = 'image/jpeg';
+      } else if (format === 'webp' && typeof rendered.asWebp === 'function') {
+        imageBuffer = rendered.asWebp(85);
+        mimeType    = 'image/webp';
+      } else {
+        imageBuffer = rendered.asPng();
+        mimeType    = 'image/png';
+      }
+      
+      const tEncodeMs = Date.now() - tEncode0;
+      const tTotalMs  = Date.now() - tWall0;
+
+      // ── Debug mode ──────────────────────────────────────────────────────────
+      if (debugMode) {
+        return new Response(JSON.stringify({
+          source:  'cf-wasm',
+          format,
+          timing: {
+            embed_images_ms: tEmbedMs,
+            faux_bold_ms:    tBoldMs,
+            render_ms:       tRenderMs,
+            encode_ms:       tEncodeMs,
+            total_wall_ms:   tTotalMs,
+          },
+          output: {
+            width:  rendered.width,
+            height: rendered.height,
+            bytes:  imageBuffer.byteLength,
+            mime:   mimeType,
+          },
+        }), {
+          status:  200,
+          headers: {
+            'Content-Type':                'application/json',
+            'Cache-Control':               'no-store',
+            'Access-Control-Allow-Origin': '*',
+          },
+        });
+      }
+
+      const response = new Response(imageBuffer, {
+        status:  200,
+        headers: {
+          'Content-Type':                mimeType,
+          'Cache-Control':               'public, max-age=86400',
+          'Access-Control-Allow-Origin': '*',
+          'X-Queue-Depth':               '0',
+          'X-Node':                      'cloudflare-wasm',
+          'X-Raster-Source':             'cf-wasm',
+          'X-Render-Ms':                 String(tRenderMs),
+          'X-Total-Ms':                  String(tTotalMs),
+        },
+      });
+      if (request.method === 'GET') ctx.waitUntil(caches.default.put(request, response.clone()));
+      return response;
+    } catch (e) {
+      _log('error', 'wasm_render_failed', { error: e instanceof Error ? e.message : String(e) });
+      return jsonError(500, e instanceof Error ? e.message : String(e));
+    }
+  },
+
+  async scheduled(_event, env, ctx) {
+    ctx.waitUntil(updateDashboard(env, true));
+  },
+};
+
+// ── JSON helpers ──────────────────────────────────────────────
+// (remainder of file unchanged — jsonOk, jsonError, handleReport,
+//  handleScreenshot, handleProxy, getNodes, fetchNodeHealth,
+//  updateDashboard, embedExternalImages definitions follow here)
