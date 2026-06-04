@@ -65,7 +65,7 @@ const RESVG_OPTS = {
     monospaceFamily:   'Noto Sans',
     fontBuffers:       [new Uint8Array(fontBuffer)],
   },
-  imageRendering: 1,
+  imageRendering: 0,
 };
 
 // ── Proxy allowlist ───────────────────────────────────────────────────────────
