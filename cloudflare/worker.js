@@ -4,7 +4,8 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // Roles:
 //   1. WASM rasterizer  — X-Simple: 1 requests (poster blur/grayscale, no ratings)
-//   2. Load balancer    — all other rasterization; sequential T1 fallback chain:
+//                       — GET ?url= requests  (mirrors all other nodes' own-renderer path)
+//   2. Load balancer    — all POST requests without X-Simple: 1; sequential T1 fallback:
 //
 //        T1 pool (geo-ordered, nodes.config.js inLbWorker):
 //          Node 0 — geo-closest (≈40% of traffic)
@@ -25,6 +26,13 @@
 //     X-CF-Colo:             → CF colo of the original request (geo routing)
 //     X-Format:              → output format
 //     X-Fallback-Image-Url:  → original TMDB poster URL (last-resort redirect)
+//
+//   GET /?url=<svg_url>[&format=png|jpg|webp][&_debug=1]
+//                            → WASM render (mirrors other nodes' own ?url= path)
+//     _debug=1               → return JSON timing breakdown instead of image
+//
+//   GET /perf               → WASM benchmark: renders a fixed test SVG,
+//                             returns JSON with wasm_init_ms / render_ms / total_wall_ms
 
 import { initWasm, Resvg }  from '@resvg/resvg-wasm';
 import resvgWasm            from '@resvg/resvg-wasm/index_bg.wasm';
@@ -399,6 +407,87 @@ const _nodeMetrics = new Map();
 let _lastDiscordUpdate = 0;
 const DISCORD_MIN_INTERVAL_MS = 90_000;
 
+// ══════════════════════════════════════════════════════════════════════════════
+// ── WASM PERFORMANCE BENCHMARK ────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// GET /perf  — renders a fixed two-badge SVG through the WASM pipeline and
+// returns JSON with per-stage timing.  Never cached (Cache-Control: no-store).
+// Useful for cold-start vs warm comparisons and cross-region benchmarking.
+
+const _PERF_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="500" height="750" viewBox="0 0 500 750">
+  <rect width="500" height="750" fill="#1a1a1a"/>
+  <rect x="30" y="30"  width="140" height="60" rx="12" fill="rgba(0,0,0,0.45)"/>
+  <text x="100" y="61" dy="0.35em" text-anchor="middle"
+        font-family="Noto Sans,Arial,sans-serif" font-size="28"
+        font-weight="bold" fill="#ffffff">8.5</text>
+  <rect x="30" y="110" width="140" height="60" rx="12" fill="rgba(0,0,0,0.45)"/>
+  <text x="100" y="141" dy="0.35em" text-anchor="middle"
+        font-family="Noto Sans,Arial,sans-serif" font-size="28"
+        font-weight="bold" fill="#f5c518">7.2</text>
+</svg>`;
+
+async function handlePerf(request) {
+  const t0   = Date.now();
+  const colo = request.cf?.colo ?? null;
+
+  // Ensure WASM is initialised (may be a cold start).
+  // tWasmMs ≈ 0 on warm isolates where wasmReady is already true.
+  try { await ensureWasm(); }
+  catch (e) {
+    return new Response(JSON.stringify({ error: `WASM init failed: ${e.message}` }), {
+      status:  503,
+      headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*' },
+    });
+  }
+  const tWasmMs = Date.now() - t0;
+
+  try {
+    // No embedExternalImages call — the bench SVG has no external hrefs.
+    const tRender0  = Date.now();
+    const processed = applyFauxBold(_PERF_SVG);
+    const resvg     = new Resvg(processed, RESVG_OPTS);
+    const rendered  = resvg.render();
+    const tRenderMs = Date.now() - tRender0;
+
+    const tEncode0  = Date.now();
+    const png       = rendered.asPng();
+    const tEncodeMs = Date.now() - tEncode0;
+
+    const tTotalMs  = Date.now() - t0;
+
+    return new Response(JSON.stringify({
+      status:    'ok',
+      node:      'cloudflare-wasm',
+      colo,
+      wasmReady,
+      timing: {
+        wasm_init_ms:  tWasmMs,  // ≈0 on warm isolate
+        render_ms:     tRenderMs,
+        encode_ms:     tEncodeMs,
+        total_wall_ms: tTotalMs,
+      },
+      output: {
+        width:  rendered.width,
+        height: rendered.height,
+        bytes:  png.byteLength,
+      },
+    }), {
+      status:  200,
+      headers: {
+        'Content-Type':                'application/json',
+        'Cache-Control':               'no-store',
+        'Access-Control-Allow-Origin': '*',
+      },
+    });
+  } catch (e) {
+    return new Response(JSON.stringify({ error: `Perf render failed: ${e instanceof Error ? e.message : String(e)}` }), {
+      status:  500,
+      headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*' },
+    });
+  }
+}
+
 // ── Main handler ──────────────────────────────────────────────────────────────
 
 export default {
@@ -441,6 +530,7 @@ export default {
       });
     }
 
+    if (url.pathname === '/perf')   return handlePerf(request);
     if (url.pathname === '/report') return handleReport(request, env, ctx);
     if (url.pathname === '/ss')     return handleScreenshot(request, env);
     if (url.pathname === '/proxy')  return handleProxy(request);
@@ -457,93 +547,8 @@ export default {
     }
 
     // ── Rasterization entry point ─────────────────────────────────────────────
+    const tWall0            = Date.now();
+    const debugMode         = url.searchParams.get('_debug') === '1';
     const isSimple          = request.headers.get('X-Simple')            === '1';
     const svgUrl            = request.headers.get('X-SVG-Url')           || null;
-    const colo              = request.headers.get('X-CF-Colo')           || request.cf?.colo || null;
-    const fallbackImageUrl  = request.headers.get('X-Fallback-Image-Url') || null;
-    const formatHeader      = request.headers.get('X-Format')            || '';
-    const formatParam       = url.searchParams.get('format')             || '';
-    const format            = (['png','jpg','jpeg','webp'].find(
-      f => f === (formatHeader || formatParam).toLowerCase(),
-    )) || 'png';
-
-    // ── Parse SVG body ────────────────────────────────────────────────────────
-    let svgText;
-    if (request.method === 'POST') {
-      const ct = request.headers.get('content-type') || '';
-      if (ct.includes('application/json')) {
-        let payload;
-        try   { payload = await request.json(); }
-        catch { return jsonError(400, 'Invalid JSON'); }
-        if (!payload?.svgText) return jsonError(400, 'Expected { svgText }');
-        svgText = payload.svgText;
-      } else {
-        svgText = await request.text();
-        if (!svgText?.trim()) return jsonError(400, 'Empty body');
-      }
-    } else if (request.method === 'GET') {
-      const targetUrl = url.searchParams.get('url');
-      if (!targetUrl) return jsonError(400, 'Missing ?url= parameter');
-      try {
-        const r = await fetch(targetUrl, { headers: { 'User-Agent': 'SpicyDevs-Rasterizer/10.0' } });
-        if (!r.ok) return jsonError(502, `SVG fetch failed: ${r.status}`);
-        svgText = await r.text();
-      } catch (e) {
-        return jsonError(502, `SVG fetch error: ${e.message}`);
-      }
-    } else {
-      return jsonError(405, 'Method not allowed');
-    }
-
-    // ── Distributed render (all non-simple) ───────────────────────────────────
-    if (!isSimple) {
-      return _distributedRender(svgText, svgUrl, format, colo, fallbackImageUrl);
-    }
-
-    // ── WASM render (simple: poster blur/grayscale, no ratings) ───────────────
-    try { await ensureWasm(); }
-    catch (e) { return jsonError(503, `WASM init failed: ${e.message}`); }
-
-    try {
-      const embedded  = await embedExternalImages(svgText);
-      const processed = applyFauxBold(embedded);
-      const resvg     = new Resvg(processed, RESVG_OPTS);
-      const rendered  = resvg.render();
-
-      let imageBuffer, mimeType;
-      if (format === 'jpg' || format === 'jpeg') {
-        imageBuffer = typeof rendered.asJpeg === 'function' ? rendered.asJpeg(85) : rendered.asPng();
-        mimeType    = typeof rendered.asJpeg === 'function' ? 'image/jpeg'        : 'image/png';
-      } else if (format === 'webp') {
-        imageBuffer = typeof rendered.asWebp === 'function' ? rendered.asWebp(85) : rendered.asPng();
-        mimeType    = typeof rendered.asWebp === 'function' ? 'image/webp'        : 'image/png';
-      } else {
-        imageBuffer = rendered.asPng();
-        mimeType    = 'image/png';
-      }
-
-      const response = new Response(imageBuffer, {
-        status:  200,
-        headers: {
-          'Content-Type':                mimeType,
-          'Cache-Control':               'public, max-age=86400',
-          'Access-Control-Allow-Origin': '*',
-          'X-Queue-Depth':               '0',
-          'X-Node':                      'cloudflare-wasm',
-          'X-Raster-Source':             'cf-wasm',
-        },
-      });
-      if (request.method === 'GET') ctx.waitUntil(caches.default.put(request, response.clone()));
-      return response;
-    } catch (e) {
-      _log('error', 'wasm_render_failed', { error: e instanceof Error ? e.message : String(e) });
-      return jsonError(500, e instanceof Error ? e.message : String(e));
-    }
-  },
-
-  async scheduled(_event, env, ctx) {
-    ctx.waitUntil(updateDashboard(env, true));
-  },
-};
-
-// ── JSON helpers ──────────────────────────────────────────────
+    const colo 
