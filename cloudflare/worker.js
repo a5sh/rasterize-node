@@ -168,12 +168,6 @@ function _region(colo) {
   return (colo && _COLO_REGION[colo.toUpperCase()]) || 'NA';
 }
 
-/**
- * Return T1_NODES ordered geo-closest first, stressed/failing nodes demoted.
- * This naturally produces a 40/30/30 traffic distribution — the closest node
- * handles ~40% of requests (it almost always succeeds), the others catch
- * successive failures.
- */
 function _nodeOrder(colo) {
   const req   = _region(colo);
   const same  = T1_NODES.filter(n => n.region === req);
@@ -288,13 +282,6 @@ function _imageResp(upstream, source, format) {
 // ══════════════════════════════════════════════════════════════════════════════
 // ── SEQUENTIAL T1 FALLBACK  (40 / 30 / 30 distribution)
 // ══════════════════════════════════════════════════════════════════════════════
-//
-// Chain: T1[0] → T1[1] → T1[2] → EUC(T2) → wsrv.nl → 302 TMDB
-//
-// Each step is tried only if the previous one fails.  The geo-closest T1 node
-// gets ~40% of requests (it succeeds most of the time); the second and third
-// each absorb ~30% of the failures.  wsrv.nl is ALWAYS tried before
-// redirecting to the TMDB fallback image URL.
 
 async function _distributedRender(svgText, svgUrl, format, colo, fallbackImageUrl) {
   const ordered = _nodeOrder(colo);
@@ -362,10 +349,6 @@ async function _distributedRender(svgText, svgUrl, format, colo, fallbackImageUr
   return _wsrvOrRedirect(svgUrl, format, fallbackImageUrl, 'all_nodes_exhausted');
 }
 
-/**
- * Always tries wsrv.nl first.  Only redirects to the original TMDB poster
- * image when wsrv also fails.  Logs every step.
- */
 async function _wsrvOrRedirect(svgUrl, format, fallbackImageUrl, reason) {
   _log('warn', 'wsrv_attempt', { reason, svgUrl: (svgUrl || '').slice(0, 120) });
 
@@ -377,12 +360,8 @@ async function _wsrvOrRedirect(svgUrl, format, fallbackImageUrl, reason) {
 
   _log('error', 'wsrv_failed', { reason });
 
-  // Last resort — redirect to original TMDB poster image
   if (fallbackImageUrl) {
-    _log('warn', 'tmdb_redirect_issued', {
-      reason,
-      url: fallbackImageUrl.slice(0, 120),
-    });
+    _log('warn', 'tmdb_redirect_issued', { reason, url: fallbackImageUrl.slice(0, 120) });
     return new Response(null, {
       status: 302,
       headers: {
@@ -410,10 +389,6 @@ const DISCORD_MIN_INTERVAL_MS = 90_000;
 // ══════════════════════════════════════════════════════════════════════════════
 // ── WASM PERFORMANCE BENCHMARK ────────────────────────────────────────────────
 // ══════════════════════════════════════════════════════════════════════════════
-//
-// GET /perf  — renders a fixed two-badge SVG through the WASM pipeline and
-// returns JSON with per-stage timing.  Never cached (Cache-Control: no-store).
-// Useful for cold-start vs warm comparisons and cross-region benchmarking.
 
 const _PERF_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="500" height="750" viewBox="0 0 500 750">
   <rect width="500" height="750" fill="#1a1a1a"/>
@@ -431,8 +406,6 @@ async function handlePerf(request) {
   const t0   = Date.now();
   const colo = request.cf?.colo ?? null;
 
-  // Ensure WASM is initialised (may be a cold start).
-  // tWasmMs ≈ 0 on warm isolates where wasmReady is already true.
   try { await ensureWasm(); }
   catch (e) {
     return new Response(JSON.stringify({ error: `WASM init failed: ${e.message}` }), {
@@ -443,7 +416,6 @@ async function handlePerf(request) {
   const tWasmMs = Date.now() - t0;
 
   try {
-    // No embedExternalImages call — the bench SVG has no external hrefs.
     const tRender0  = Date.now();
     const processed = applyFauxBold(_PERF_SVG);
     const resvg     = new Resvg(processed, RESVG_OPTS);
@@ -462,7 +434,7 @@ async function handlePerf(request) {
       colo,
       wasmReady,
       timing: {
-        wasm_init_ms:  tWasmMs,  // ≈0 on warm isolate
+        wasm_init_ms:  tWasmMs,
         render_ms:     tRenderMs,
         encode_ms:     tEncodeMs,
         total_wall_ms: tTotalMs,
@@ -551,4 +523,30 @@ export default {
     const debugMode         = url.searchParams.get('_debug') === '1';
     const isSimple          = request.headers.get('X-Simple')            === '1';
     const svgUrl            = request.headers.get('X-SVG-Url')           || null;
-    const colo 
+    const colo              = request.headers.get('X-CF-Colo')           || request.cf?.colo || null;
+    const fallbackImageUrl  = request.headers.get('X-Fallback-Image-Url') || null;
+    
+    // Extracted invariant parsing
+    const rawFormat         = (request.headers.get('X-Format') || url.searchParams.get('format') || '').toLowerCase();
+    const format            = ['jpg', 'jpeg', 'webp'].includes(rawFormat) ? rawFormat : 'png';
+
+    // ── Parse SVG body ────────────────────────────────────────────────────────
+    let svgText;
+    if (request.method === 'POST') {
+      const ct = request.headers.get('content-type') || '';
+      if (ct.includes('application/json')) {
+        let payload;
+        try   { payload = await request.json(); }
+        catch { return jsonError(400, 'Invalid JSON'); }
+        if (!payload?.svgText) return jsonError(400, 'Expected { svgText }');
+        svgText = payload.svgText;
+      } else {
+        svgText = await request.text();
+        if (!svgText?.trim()) return jsonError(400, 'Empty body');
+      }
+    } else if (request.method === 'GET') {
+      const targetUrl = url.searchParams.get('url');
+      if (!targetUrl) return jsonError(400, 'Missing ?url= parameter');
+      
+      try {
+        const parsedTarget = new URL(targ
