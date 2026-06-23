@@ -658,7 +658,217 @@ export default {
   },
 };
 
-// ── JSON helpers ──────────────────────────────────────────────
-// (remainder of file unchanged — jsonOk, jsonError, handleReport,
-//  handleScreenshot, handleProxy, getNodes, fetchNodeHealth,
-//  updateDashboard, embedExternalImages definitions follow here)
+// ── JSON helpers ──────────────────────────────────────────────────────────────
+
+function jsonOk(body) {
+  return new Response(JSON.stringify(body), {
+    status:  200,
+    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' },
+  });
+}
+
+function jsonError(status, message) {
+  return new Response(JSON.stringify({ error: message }), {
+    status,
+    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' },
+  });
+}
+
+// ── External image embedding (WASM path) ──────────────────────────────────────
+// Only used for GET ?url= requests and X-Simple WASM renders.
+// POST requests from Worker A already have the poster embedded via /cache/img proxy,
+// so embedExternalImages is a no-op for most production traffic.
+
+const _EXT_IMG_RE = /href="(https?:\/\/[^"]+)"/g;
+
+async function embedExternalImages(svgText) {
+  const matches = [...svgText.matchAll(_EXT_IMG_RE)];
+  if (matches.length === 0) return svgText;
+
+  const uniqueUrls = [...new Set(matches.map(m => m[1]))];
+
+  const replacements = await Promise.all(
+    uniqueUrls.map(async url => {
+      try {
+        const res = await fetch(url, {
+          signal:  AbortSignal.timeout(6_000),
+          headers: { 'User-Agent': 'SpicyDevs-Rasterizer/10.0' },
+        });
+        if (!res.ok) return { url, dataUri: null };
+        const buf = await res.arrayBuffer();
+        const ct  = res.headers.get('content-type') || 'image/jpeg';
+        const b64 = btoa(String.fromCharCode(...new Uint8Array(buf)));
+        return { url, dataUri: `data:${ct};base64,${b64}` };
+      } catch {
+        return { url, dataUri: null };
+      }
+    }),
+  );
+
+  for (const { url, dataUri } of replacements) {
+    if (dataUri) svgText = svgText.split(`href="${url}"`).join(`href="${dataUri}"`);
+  }
+  return svgText;
+}
+
+// ── Node health fetch ─────────────────────────────────────────────────────────
+
+async function fetchNodeHealth(nodeUrl) {
+  try {
+    const res = await fetch(`${nodeUrl}/health`, {
+      signal:  AbortSignal.timeout(3_000),
+      headers: { 'User-Agent': 'SpicyDevs-LB/10.0' },
+    });
+    return res.ok ? res.json() : null;
+  } catch {
+    return null;
+  }
+}
+
+// ── Node registry for /hub-test ───────────────────────────────────────────────
+
+function getNodes(env) {
+  return [
+    { id: 'washington', name: 'US East',  url: env.VERCEL_NODE_URL  || 'https://us-r-vercel.vercel.app' },
+    { id: 'ohio',       name: 'Ohio',     url: env.NETLIFY_NODE_URL || 'https://r-netlify.netlify.app' },
+    { id: 'render_eu',  name: 'EUC',      url: env.RENDER_NODE_URL  || 'https://euc-r-render.onrender.com' },
+    { id: 'midas',      name: 'DE 2',     url: env.VPS1_NODE_URL    || 'http://node-3.midas.host:25108' },
+    { id: 'germany',    name: 'DE 20',    url: env.VPS2_NODE_URL    || 'http://de20.spaceify.eu:26100' },
+  ];
+}
+
+// ── /report handler ───────────────────────────────────────────────────────────
+
+async function handleReport(request, env, ctx) {
+  let body;
+  try   { body = await request.json(); }
+  catch { return jsonError(400, 'Invalid JSON'); }
+
+  const { type, node, ts, snapshot } = body || {};
+  if (!type || !node) return jsonError(400, 'Missing type or node');
+
+  if (env.DASHBOARD_KV) {
+    const key  = `node:${node}`;
+    const prev = await env.DASHBOARD_KV.get(key, { type: 'json' }).catch(() => null) || {};
+    const next = { ...prev, type, node, ts, ...(snapshot ? { snapshot } : {}), lastSeen: Date.now() };
+    await env.DASHBOARD_KV.put(key, JSON.stringify(next), { expirationTtl: 3600 });
+    _nodeMetrics.set(node, next);
+  }
+
+  const now = Date.now();
+  if (env.DISCORD_WEBHOOK_URL && (now - _lastDiscordUpdate) > DISCORD_MIN_INTERVAL_MS) {
+    ctx.waitUntil(updateDashboard(env, false));
+  }
+
+  return jsonOk({ ok: true });
+}
+
+// ── /ss (screenshot) handler ─────────────────────────────────────────────────
+
+async function handleScreenshot(request, env) {
+  if (!env.MYBROWSER) return jsonError(503, 'Browser binding not configured');
+
+  const url    = new URL(request.url);
+  const target = url.searchParams.get('url');
+  if (!target) return jsonError(400, 'Missing ?url= parameter');
+
+  try {
+    const browser = await puppeteer.launch(env.MYBROWSER);
+    const page    = await browser.newPage();
+    await page.setViewport({ width: 1280, height: 800 });
+    await page.goto(target, { waitUntil: 'networkidle0', timeout: 15_000 });
+    const screenshot = await page.screenshot({ type: 'png' });
+    await browser.close();
+    return new Response(screenshot, {
+      status:  200,
+      headers: { 'Content-Type': 'image/png', 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*' },
+    });
+  } catch (e) {
+    return jsonError(500, `Screenshot failed: ${e.message}`);
+  }
+}
+
+// ── /proxy handler ────────────────────────────────────────────────────────────
+
+async function handleProxy(request) {
+  const url    = new URL(request.url);
+  const target = url.searchParams.get('url');
+  if (!target) return jsonError(400, 'Missing ?url= parameter');
+
+  let parsed;
+  try   { parsed = new URL(target); }
+  catch { return jsonError(400, 'Invalid URL'); }
+
+  const allowed = PROXY_ALLOWLIST.some(a => target.startsWith(a));
+  if (!allowed) return jsonError(403, 'URL not in proxy allowlist');
+
+  try {
+    const res = await fetch(parsed.toString(), {
+      signal:  AbortSignal.timeout(10_000),
+      headers: { 'User-Agent': 'SpicyDevs-Proxy/1.0' },
+    });
+    const headers = new Headers(res.headers);
+    headers.set('Access-Control-Allow-Origin', '*');
+    return new Response(res.body, { status: res.status, headers });
+  } catch (e) {
+    return jsonError(502, `Proxy fetch failed: ${e.message}`);
+  }
+}
+
+// ── Discord dashboard update ──────────────────────────────────────────────────
+
+async function updateDashboard(env, fromCron) {
+  if (!env.DISCORD_WEBHOOK_URL) return;
+
+  _lastDiscordUpdate = Date.now();
+
+  const nodes   = getNodes(env);
+  const healths = await Promise.all(nodes.map(n => fetchNodeHealth(n.url)));
+
+  const lines = nodes.map((n, i) => {
+    const h   = healths[i];
+    const t1  = T1_NODES.find(t => t.id === n.id);
+    const err = _errCount(n.id);
+    const inf = _inFlight(n.id);
+    const status = !h ? '🔴 offline' : err >= FAILING_THRESHOLD ? '🟠 failing' : err >= STRESS_THRESHOLD ? '🟡 stressed' : '🟢 ok';
+    const pool   = t1 ? ' [T1]' : n.id === EUC_NODE?.id ? ' [EUC]' : '';
+    return `**${n.name}**${pool} — ${status} · err:${err} in-flight:${inf}`;
+  }).join('\n');
+
+  const payload = {
+    username: 'Posterium Fleet',
+    embeds: [{
+      title:       'Fleet Status' + (fromCron ? ' (cron)' : ''),
+      description: lines,
+      color:       healths.every(Boolean) ? 0x4ade80 : 0xf87171,
+      footer:      { text: new Date().toISOString() },
+    }],
+  };
+
+  try {
+    const kv  = env.DASHBOARD_KV;
+    const mid = kv ? await kv.get('discord_message_id').catch(() => null) : null;
+
+    if (mid) {
+      const webhookBase = env.DISCORD_WEBHOOK_URL.replace(/\/+$/, '');
+      const editRes = await fetch(`${webhookBase}/messages/${mid}`, {
+        method:  'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify(payload),
+      });
+      if (editRes.ok) return;
+    }
+
+    const postRes = await fetch(env.DISCORD_WEBHOOK_URL + '?wait=true', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify(payload),
+    });
+    if (postRes.ok && kv) {
+      const data = await postRes.json();
+      if (data.id) await kv.put('discord_message_id', data.id);
+    }
+  } catch (e) {
+    _log('error', 'discord_update_failed', { error: e?.message });
+  }
+}
