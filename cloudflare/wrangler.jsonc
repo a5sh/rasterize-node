@@ -18,7 +18,7 @@
   ],
   // Cron: refresh fleet Discord embed every 5 minutes regardless of node reports.
   "triggers": {
-    "crons": ["*/15 * * * *"],
+    "crons": ["0 * * * *"],
   },
   // Node URLs — set real values with: wrangler vars set KEY value
   // Or set in the Cloudflare dashboard under Workers > Settings > Variables.
