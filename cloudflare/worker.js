@@ -56,6 +56,7 @@
 //   double3 = 1                for count queries
 //   double4 = posterEmbedMs
 //   double5 = payloadKb
+// double6 = nodeScoreAtSelection  EMA score at moment of selection (lower = better)
 //
 // ── CPU performance proxy (useful AE query) ───────────────────────────────────
 //   Serial-equivalent CPU time ≈ double1 * (1 + double4)
@@ -439,7 +440,6 @@ async function _tryNode(node, svgText, svgUrl, format, signal) {
 }
 
 // ── Analytics helpers ──────────────────────────────────────────────────────────
-
 function _logAttempt(
   env,
   {
@@ -455,6 +455,7 @@ function _logAttempt(
     httpStatus,
     inflightCount,
     payloadKb,
+    nodeScore = 0, // ← ADD
   },
 ) {
   try {
@@ -475,7 +476,8 @@ function _logAttempt(
         isWinner ? 1 : 0,
         inflightCount,
         payloadKb,
-      ],
+        nodeScore,
+      ], // ← ADD nodeScore
       indexes: [nodeId],
     });
   } catch (_) {}
@@ -609,6 +611,8 @@ async function _distributedRender(
 
     const ac = new AbortController();
     const tm = setTimeout(() => ac.abort(), nodeTimeout);
+    const scoreAtSelection = Math.round(_nodeScore(node.id)); // ← ADD before _tryNode
+
     const t0 = Date.now();
     const { ok, res, error, status, inflightAtStart } = await _tryNode(
       node,
@@ -632,6 +636,7 @@ async function _distributedRender(
       httpStatus: status,
       inflightCount: inflightAtStart,
       payloadKb,
+      nodeScore: scoreAtSelection,
     });
 
     if (ok) {
@@ -776,8 +781,6 @@ async function _distributedRender(
 }
 
 // ── Fleet dashboard ────────────────────────────────────────────────────────────
-
-const _nodeMetrics = new Map();
 let _lastDiscordUpdate = 0;
 const DISCORD_INTERVAL_MS = 90_000;
 
@@ -854,10 +857,6 @@ async function _handleReport(request, env, ctx) {
   }
   const { node, type, snapshot } = body ?? {};
   if (!node) return _jsonError(400, "Missing node");
-  if (type === "metrics" && snapshot)
-    _nodeMetrics.set(node, { ...snapshot, receivedAt: Date.now() });
-  if (type === "online")
-    _nodeMetrics.set(node, { online: true, receivedAt: Date.now() });
   ctx.waitUntil(_updateDashboard(env, false));
   return _jsonOk({ ok: true, node, type });
 }
@@ -1014,7 +1013,6 @@ export default {
           concurrencyLimit: n.concurrencyLimit,
         })),
         t2Pool: T2_NODES.map((n) => ({ id: n.id, errors: _errCount(n.id) })),
-        storedNodeMetrics: Object.fromEntries(_nodeMetrics),
         liveHealth,
       });
     }
