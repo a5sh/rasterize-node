@@ -1,74 +1,90 @@
-// cloudflare/worker.js — v11
+// cloudflare/worker.js — v12
 //
-// PURE LOAD BALANCER — no WASM rendering
+// PURE LOAD BALANCER — No WASM, No Puppeteer
 //
-// ── Architecture ──────────────────────────────────────────────────────────────
+// Worker A builds SVG (icons expanded, poster as href URL) and sends to Worker B.
+// Worker B fetches the poster image ONCE, embeds it, then distributes to nodes.
 //
-// Worker A (posterium-backend) sends:
-//   POST /
-//     Body:                   SVG text (icons expanded, poster as href URL)
-//     X-Poster-Url:           TMDB/fanart poster image URL → Worker B fetches
-//                             & embeds ONCE (eliminates double-fetch bug)
-//     X-SVG-Url:              canonical .svg URL (for wsrv / Vercel URL-payload)
-//     X-CF-Colo:              requesting datacenter colo (geo routing)
-//     X-Format:               png | jpg | webp
-//     X-Fallback-Image-Url:   original TMDB poster URL for last-resort 302
-//     X-Input-Type:           movie | tv | anime (analytics only)
-//     X-Request-Id:           trace ID
+// Header contract (Worker A → Worker B):
+//   X-Poster-Url          poster image URL → Worker B embeds once
+//   X-SVG-Url             canonical .svg URL (wsrv / Vercel URL-payload path)
+//   X-CF-Colo             requesting CF datacenter for geo routing
+//   X-Format              png | jpg | webp
+//   X-Fallback-Image-Url  TMDB direct URL — used for last-resort 302
+//   X-Input-Type          movie | tv | anime (analytics only)
+//   X-Request-Id          trace ID
 //
-// Worker B flow:
-//   1. Fetch X-Poster-Url → embed as base64 in SVG (single fetch, ~200ms)
-//   2. Geo-order T1 pool (skip over-capacity / failing nodes)
-//   3. Try each T1 node sequentially:
-//        - URL-payload (wsrv, Vercel): pass X-SVG-Url directly (no embedded body needed)
-//        - Body nodes (Netlify, Spaceify, DanBot): POST fully-embedded SVG
-//   4. First success → stream to caller with X-Raster-* health headers
-//   5. All T1 fail → try T2 pool (france, render_eu) with longer timeout
-//   6. T2 fail → 302 to X-Fallback-Image-Url (TMDB original)
-//   7. No fallback URL → 502
+// Response headers (Worker B → Worker A):
+//   X-Raster-Source       winning node id
+//   X-Attempt-Count       total node attempts made
+//   X-Wall-Ms             total wall time ms
+//   X-Poster-Embed-Ms     time to fetch & embed poster
+//   X-Node-Score          winning node's current EMA score (lower = faster)
+//   X-LB-Version          lb version string
 //
-// ── Analytics (RASTER_METRICS) ───────────────────────────────────────────────
+// ── T1 Pool (geo+score ordered, tried first) ──────────────────────────────────
+//   washington  Vercel US East      — URL-payload (GET ?url=)
+//   ohio        Netlify US Central  — POST body
+//   midas       Spaceify DE2        — POST body
+//   germany     Spaceify DE20       — POST body
+//   danbot      DanBot EU           — POST body
+//   wsrv        wsrv.nl Global      — URL-payload (librsvg)
 //
+// ── T2 Pool (extreme fallback only, longer timeout) ───────────────────────────
+//   france      Spaceify FR         — POST body
+//   render_eu   Render EUC          — POST body
+//
+// ── Analytics schema (RASTER_METRICS) ────────────────────────────────────────
 // Per-attempt datapoint:
-//   blob1  = node_id          e.g. 'midas', 'wsrv', 'danbot'
-//   blob2  = format           'png' | 'jpg' | 'webp'
-//   blob3  = input_type       'movie' | 'tv' | 'anime'
-//   blob4  = colo             CF datacenter code
-//   blob5  = outcome          'success' | 'failure'
-//   blob6  = error_reason     timeout | http_NNN | throw | '' on success
-//   blob7  = lane             't1' | 't2' | 'wsrv' | 'url_payload'
-//   blob8  = was_winner       '1' | '0'
-//   double1 = attempt_ms      wall time for this single node attempt
-//   double2 = http_status     200 / 502 / 504 / 0
-//   double3 = is_winner       1.0 | 0.0  (sum() = total wins per node)
-//   double4 = inflight_count  snapshot at attempt start (concurrency indicator)
-//   double5 = payload_kb      SVG payload size in KB
+//   blob1 = nodeId
+//   blob2 = format             'png' | 'jpg' | 'webp'
+//   blob3 = inputType          'movie' | 'tv' | 'anime'
+//   blob4 = colo               CF datacenter code
+//   blob5 = outcome            'success' | 'failure' | 'skipped'
+//   blob6 = errorReason        '' on success, 'timeout' | 'http_NNN' | 'throw:...' on fail
+//   blob7 = lane               't1' | 't2' | 'url_payload'
+//   blob8 = wasWinner          '1' | '0'
+//   double1 = attemptMs        wall time for this single node attempt
+//   double2 = httpStatus       200 | 502 | 504 | 0
+//   double3 = isWinner         1.0 | 0.0  — sum() gives wins per node
+//   double4 = inflightCount    concurrent requests on node at attempt start
+//   double5 = payloadKb        SVG payload size in KB
 //
-// Per-request summary (blob1 = 'req'):
-//   double1 = total_wall_ms
-//   double2 = attempts_made
-//   double3 = 1  (for count)
-//   double4 = poster_embed_ms
-//   double5 = payload_kb
+// Per-request summary datapoint (blob1 = 'req'):
+//   double1 = totalWallMs
+//   double2 = attemptsMade
+//   double3 = 1                for count queries
+//   double4 = posterEmbedMs
+//   double5 = payloadKb
+//
+// ── CPU performance proxy (useful AE query) ───────────────────────────────────
+//   Serial-equivalent CPU time ≈ double1 * (1 + double4)
+//   Compare this across nodes to rank relative CPU speed without knowing specs:
+//   SELECT blob1 AS node,
+//          avg(double1) AS avg_ms,
+//          avg(double1 * (1 + double4)) AS cpu_proxy_ms,
+//          count() AS samples
+//   FROM raster_metrics
+//   WHERE timestamp > now() - INTERVAL '7' DAY
+//     AND blob5 = 'success' AND blob1 != 'req'
+//   GROUP BY node ORDER BY cpu_proxy_ms ASC
 
-import puppeteer from "@cloudflare/puppeteer";
 import NODE_CONFIG from "../assets/nodes.config.js";
 
-// ── Structured logger ─────────────────────────────────────────────────────────
+// ── Structured logger ──────────────────────────────────────────────────────────
 
 function _log(level, event, meta = {}) {
   const entry = {
     ts: new Date().toISOString(),
     level,
     event,
-    node: "cf-lb",
+    lb: "cf-v12",
     ...meta,
   };
-  if (level === "error") console.error(JSON.stringify(entry));
-  else console.log(JSON.stringify(entry));
+  (level === "error" ? console.error : console.log)(JSON.stringify(entry));
 }
 
-// ── Node pool ──────────────────────────────────────────────────────────────────
+// ── Node pools ─────────────────────────────────────────────────────────────────
 
 const T1_NODES = NODE_CONFIG.nodes
   .filter((n) => n.features.inLbWorker)
@@ -77,12 +93,9 @@ const T1_NODES = NODE_CONFIG.nodes
     id: n.id,
     url: `${n.url}${n.features.apiPath ?? ""}`,
     lbRegion: n.lbRegion,
-    concurrencyLimit: n.concurrencyLimit,
-    cpuAlloc: n.cpuAlloc,
+    concurrencyLimit: n.concurrencyLimit ?? null,
     useUrlPayload: n.features.useUrlPayload ?? false,
     acceptsGzip: n.features.acceptsCompression ?? false,
-    supportsHealth: n.features.supportsHealthCheck ?? false,
-    zones: n.zones ?? {},
   }));
 
 const T2_NODES = NODE_CONFIG.nodes
@@ -91,7 +104,7 @@ const T2_NODES = NODE_CONFIG.nodes
     id: n.id,
     url: `${n.url}${n.features.apiPath ?? ""}`,
     lbRegion: n.lbRegion,
-    concurrencyLimit: n.concurrencyLimit,
+    concurrencyLimit: n.concurrencyLimit ?? null,
     useUrlPayload: false,
     acceptsGzip: n.features.acceptsCompression ?? false,
   }));
@@ -100,19 +113,28 @@ const {
   t1TimeoutMs = 5_000,
   t2TimeoutMs = 8_000,
   posterEmbedTimeoutMs = 6_000,
+  maxWallTimeMs = 7_000,
+  stressThreshold = 3,
+  failingThreshold = 8,
+  errWindowMs = 60_000,
 } = NODE_CONFIG.settings;
 
-// ── Per-isolate health state ───────────────────────────────────────────────────
+// ── Per-isolate health & EMA performance state ─────────────────────────────────
 
-const _errMap = new Map(); // node id → { count, windowEnd }
-const _inflightMap = new Map(); // node id → current in-flight count
-const ERR_WINDOW = 60_000;
-const { stressThreshold = 3, failingThreshold = 8 } = NODE_CONFIG.settings;
+/** nodeId → { count, windowEnd } */
+const _errMap = new Map();
+/** nodeId → current in-flight count */
+const _inflightMap = new Map();
+/** nodeId → { emaMs, sampleCount } */
+const _perfMap = new Map();
 
+const EMA_ALPHA = 0.2; // smoothing factor — higher = more reactive
+
+// Error tracking
 function _recordErr(id) {
   const now = Date.now();
-  let e = _errMap.get(id) ?? { count: 0, windowEnd: now + ERR_WINDOW };
-  if (now > e.windowEnd) e = { count: 0, windowEnd: now + ERR_WINDOW };
+  let e = _errMap.get(id) ?? { count: 0, windowEnd: now + errWindowMs };
+  if (now > e.windowEnd) e = { count: 0, windowEnd: now + errWindowMs };
   e.count++;
   _errMap.set(id, e);
 }
@@ -130,6 +152,8 @@ function _isStressed(id) {
 function _isFailing(id) {
   return _errCount(id) >= failingThreshold;
 }
+
+// In-flight tracking
 function _acqIF(id) {
   _inflightMap.set(id, (_inflightMap.get(id) ?? 0) + 1);
 }
@@ -143,9 +167,36 @@ function _atCapacity(n) {
   return n.concurrencyLimit !== null && _inFlight(n.id) >= n.concurrencyLimit;
 }
 
-// ── Geo region mapping ────────────────────────────────────────────────────────
+// EMA performance tracking
+function _recordPerf(id, ms) {
+  const p = _perfMap.get(id);
+  if (!p) {
+    _perfMap.set(id, { emaMs: ms, sampleCount: 1 });
+  } else {
+    p.emaMs = EMA_ALPHA * ms + (1 - EMA_ALPHA) * p.emaMs;
+    p.sampleCount += 1;
+  }
+}
+function _emaMs(id) {
+  return _perfMap.get(id)?.emaMs ?? 9_999;
+}
 
-const _COLO_REGION = (() => {
+/**
+ * Node score — lower is better.
+ * Combines EMA response time + error penalty + concurrency penalty.
+ * Use this to compare node performance even without knowing their CPU specs.
+ */
+function _nodeScore(id) {
+  return (
+    _emaMs(id) +
+    _errCount(id) * 500 + // 500 ms penalty per recent error
+    _inFlight(id) * 80
+  ); // 80 ms penalty per concurrent inflight request
+}
+
+// ── Geo region mapping ─────────────────────────────────────────────────────────
+
+const COLO_REGION = (() => {
   const m = {};
   const zones = {
     NA: [
@@ -225,15 +276,23 @@ const _COLO_REGION = (() => {
   return m;
 })();
 
+/**
+ * Returns T1 nodes in geo-preferred + score order.
+ * Same-region nodes first, both halves sorted by _nodeScore ascending.
+ * Failing nodes are pushed to the back within each group.
+ */
 function _geoOrderNodes(colo) {
-  const req = (colo && _COLO_REGION[colo.toUpperCase()]) || "NA";
+  const req = (colo && COLO_REGION[colo.toUpperCase()]) || "NA";
   const same = T1_NODES.filter((n) => n.lbRegion === req);
   const other = T1_NODES.filter((n) => n.lbRegion !== req);
-  // Within each geo group: healthy first, stressed second, failing last; then by capacity
-  const rank = (n) =>
-    (_isFailing(n.id) ? 20 : _isStressed(n.id) ? 10 : 0) +
-    (_atCapacity(n) ? 5 : 0);
-  return [...same, ...other].sort((a, b) => rank(a) - rank(b));
+  const byScore = (a, b) => {
+    // Hard-failing nodes always go last within their geo group
+    const fa = _isFailing(a.id) ? 1 : 0;
+    const fb = _isFailing(b.id) ? 1 : 0;
+    if (fa !== fb) return fa - fb;
+    return _nodeScore(a.id) - _nodeScore(b.id);
+  };
+  return [...same.sort(byScore), ...other.sort(byScore)];
 }
 
 // ── Gzip helper ────────────────────────────────────────────────────────────────
@@ -252,20 +311,19 @@ async function _gzip(text) {
 
 // ── Poster embedding (single fetch, Worker B side) ─────────────────────────────
 //
-// Worker A sends the poster as an href URL in the SVG. Worker B fetches it ONCE
-// and replaces all occurrences with a base64 data URI before distributing to nodes.
-// This fixes the double-fetch bug where both Worker A and each node independently
-// fetched the same poster image.
+// Worker A sends poster image as an href URL in the SVG body.
+// We fetch it once here and replace all occurrences with a base64 data URI.
+// This eliminates the double-fetch problem where each raster node would have
+// independently fetched the same poster image.
 
-async function embedPosterInSvg(svgText, posterUrl) {
+async function _embedPoster(svgText, posterUrl) {
   if (!posterUrl) return { svg: svgText, embedMs: 0, embedded: false };
   const t0 = Date.now();
   try {
     const res = await fetch(posterUrl, {
       signal: AbortSignal.timeout(posterEmbedTimeoutMs),
-      headers: { "User-Agent": "SpicyDevs-LB/11.0", Accept: "image/*" },
-      // CF edge cache — posters are CDN-cached already
-      cf: { cacheTtl: 86400, cacheEverything: true },
+      headers: { "User-Agent": "SpicyDevs-LB/12.0", Accept: "image/*" },
+      cf: { cacheTtl: 86_400, cacheEverything: true },
     });
     if (!res.ok) {
       _log("warn", "poster_embed_http_err", {
@@ -276,11 +334,9 @@ async function embedPosterInSvg(svgText, posterUrl) {
     }
     const buf = await res.arrayBuffer();
     const ct = res.headers.get("content-type") || "image/jpeg";
-    const b64 = _bufToB64(buf);
-    const uri = `data:${ct};base64,${b64}`;
-    // Replace the URL href with data URI — works for both quoted and unquoted
-    const embedded = svgText.split(`href="${posterUrl}"`).join(`href="${uri}"`);
-    return { svg: embedded, embedMs: Date.now() - t0, embedded: true };
+    const uri = `data:${ct};base64,${_bufToB64(buf)}`;
+    const svg = svgText.split(`href="${posterUrl}"`).join(`href="${uri}"`);
+    return { svg, embedMs: Date.now() - t0, embedded: true };
   } catch (e) {
     _log("warn", "poster_embed_failed", {
       reason: e?.message,
@@ -294,14 +350,12 @@ async function embedPosterInSvg(svgText, posterUrl) {
 
 async function _tryNode(node, svgText, svgUrl, format, signal) {
   _acqIF(node.id);
+  const inflightAtStart = _inFlight(node.id);
   try {
     let res;
     if (node.useUrlPayload && svgUrl) {
-      // URL-payload path (wsrv.nl, Vercel washington)
-      // These nodes fetch the SVG themselves — no embedded body needed
       let target;
       if (node.id === "wsrv") {
-        // wsrv.nl needs the posterium backend URL (no_embed=1 version)
         const src = new URL(svgUrl);
         src.hostname = "posterium-backend.aayu5h.workers.dev";
         src.searchParams.delete("no_embed");
@@ -318,7 +372,7 @@ async function _tryNode(node, svgText, svgUrl, format, signal) {
         u.searchParams.set("q", "100");
         target = u.toString();
       } else {
-        // Vercel: GET ?url=[svgUrl]&format=[fmt]
+        // Vercel: GET ?url=&format=
         const u = new URL(node.url);
         u.searchParams.set("url", svgUrl);
         u.searchParams.set("format", format);
@@ -326,20 +380,20 @@ async function _tryNode(node, svgText, svgUrl, format, signal) {
       }
       res = await fetch(target, {
         method: "GET",
-        headers: { "User-Agent": "SpicyDevs-LB/11.0" },
+        headers: { "User-Agent": "SpicyDevs-LB/12.0" },
         signal,
       });
     } else {
-      // Body-POST path: send fully-embedded SVG
+      // Body POST path — optionally gzip
       let body = svgText,
         ct = "image/svg+xml";
-      const extraHeaders = {};
+      const extra = {};
       if (node.acceptsGzip) {
         const gz = await _gzip(svgText);
         if (gz) {
           body = gz;
           ct = "application/octet-stream";
-          extraHeaders["X-SVG-Encoding"] = "gzip";
+          extra["X-SVG-Encoding"] = "gzip";
         }
       }
       res = await fetch(node.url, {
@@ -348,8 +402,8 @@ async function _tryNode(node, svgText, svgUrl, format, signal) {
         headers: {
           "Content-Type": ct,
           "X-Format": format,
-          "User-Agent": "SpicyDevs-LB/11.0",
-          ...extraHeaders,
+          "User-Agent": "SpicyDevs-LB/12.0",
+          ...extra,
         },
         signal,
       });
@@ -362,15 +416,17 @@ async function _tryNode(node, svgText, svgUrl, format, signal) {
         res: null,
         error: `http_${res.status}`,
         status: res.status,
+        inflightAtStart,
       };
     }
     _recordOk(node.id);
-    return { ok: true, res, error: "", status: res.status };
+    return { ok: true, res, error: "", status: res.status, inflightAtStart };
   } catch (e) {
     if (e?.name !== "AbortError") _recordErr(node.id);
     return {
       ok: false,
       res: null,
+      inflightAtStart,
       error:
         e?.name === "AbortError"
           ? "timeout"
@@ -382,7 +438,7 @@ async function _tryNode(node, svgText, svgUrl, format, signal) {
   }
 }
 
-// ── Analytics logging ─────────────────────────────────────────────────────────
+// ── Analytics helpers ──────────────────────────────────────────────────────────
 
 function _logAttempt(
   env,
@@ -447,6 +503,25 @@ function _logRequest(
   } catch (_) {}
 }
 
+// ── Response builder ───────────────────────────────────────────────────────────
+
+function _buildImageResp(upstream, nodeId, attemptCount, wallMs, embedMs) {
+  const h = new Headers(upstream.headers);
+  h.set("Access-Control-Allow-Origin", "*");
+  h.set("X-Raster-Source", nodeId);
+  h.set("X-Attempt-Count", String(attemptCount));
+  h.set("X-Wall-Ms", String(wallMs));
+  h.set("X-Poster-Embed-Ms", String(embedMs));
+  h.set("X-Node-Score", String(Math.round(_nodeScore(nodeId))));
+  h.set("X-LB-Version", "cf-v12");
+  h.set("Cache-Control", "public, max-age=172800");
+  h.set(
+    "Access-Control-Expose-Headers",
+    "X-Raster-Source,X-Attempt-Count,X-Wall-Ms,X-Poster-Embed-Ms,X-Node-Score,X-LB-Version",
+  );
+  return new Response(upstream.body, { status: 200, headers: h });
+}
+
 // ── Main render dispatch ───────────────────────────────────────────────────────
 
 async function _distributedRender(
@@ -463,37 +538,42 @@ async function _distributedRender(
   const payloadKb = Math.round(new Blob([svgText]).size / 1024);
   let attemptsMade = 0;
 
-  // ── Step 1: Embed poster (single fetch) ────────────────────────────────────
+  const _elapsed = () => Date.now() - tWall0;
+  const _timedOut = () => _elapsed() >= maxWallTimeMs;
+
+  // Step 1: Embed poster once in this worker
   const {
     svg: embeddedSvg,
     embedMs,
     embedded,
-  } = await embedPosterInSvg(svgText, posterUrl);
+  } = await _embedPoster(svgText, posterUrl);
 
   _log("info", "render_start", {
     colo,
     format,
     inputType,
     payloadKb,
-    posterEmbedMs: embedMs,
-    posterEmbedded: embedded,
-    svgUrlSet: !!svgUrl,
-    fallbackUrlSet: !!fallbackImageUrl,
+    embedMs,
+    embedded,
   });
 
-  // ── Step 2: Try T1 nodes (geo-ordered) ────────────────────────────────────
+  // Step 2: T1 nodes (geo + EMA-score ordered)
   const ordered = _geoOrderNodes(colo);
-  let winnerSource = null;
 
   for (const node of ordered) {
-    attemptsMade++;
-    const inflightCount = _inFlight(node.id);
+    if (_timedOut()) {
+      _log("warn", "t1_wall_timeout_abort", {
+        elapsed: _elapsed(),
+        node: node.id,
+      });
+      break;
+    }
 
-    // Skip at-capacity nodes (but still try if it's the last one)
+    // Skip at-capacity nodes unless it's the last available one
     if (_atCapacity(node) && ordered.indexOf(node) < ordered.length - 1) {
       _log("info", "t1_skip_capacity", {
         node: node.id,
-        inflight: inflightCount,
+        inflight: _inFlight(node.id),
         limit: node.concurrencyLimit,
       });
       _logAttempt(env, {
@@ -507,24 +587,30 @@ async function _distributedRender(
         isWinner: false,
         attemptMs: 0,
         httpStatus: 0,
-        inflightCount,
+        inflightCount: _inFlight(node.id),
         payloadKb,
       });
       continue;
     }
 
+    attemptsMade++;
+    const inflightSnapshot = _inFlight(node.id);
+    // Respect max wall time for individual attempt timeout
+    const budget = Math.max(500, maxWallTimeMs - _elapsed() - 150);
+    const nodeTimeout = Math.min(t1TimeoutMs, budget);
+
     _log("info", "t1_attempt", {
       node: node.id,
       attempt: attemptsMade,
-      inflight: inflightCount,
-      failing: _isFailing(node.id),
-      stressed: _isStressed(node.id),
+      inflight: inflightSnapshot,
+      score: Math.round(_nodeScore(node.id)),
+      timeout: nodeTimeout,
     });
 
     const ac = new AbortController();
-    const tm = setTimeout(() => ac.abort(), t1TimeoutMs);
+    const tm = setTimeout(() => ac.abort(), nodeTimeout);
     const t0 = Date.now();
-    const { ok, res, error, status } = await _tryNode(
+    const { ok, res, error, status, inflightAtStart } = await _tryNode(
       node,
       embeddedSvg,
       svgUrl,
@@ -544,34 +630,29 @@ async function _distributedRender(
       isWinner: ok,
       attemptMs,
       httpStatus: status,
-      inflightCount,
+      inflightCount: inflightAtStart,
       payloadKb,
     });
 
     if (ok) {
-      winnerSource = node.id;
+      _recordPerf(node.id, attemptMs);
       _log("info", "t1_success", {
         node: node.id,
         attempt: attemptsMade,
         attemptMs,
+        score: Math.round(_nodeScore(node.id)),
       });
       _logRequest(env, {
         format,
         inputType,
         colo,
-        totalWallMs: Date.now() - tWall0,
+        totalWallMs: _elapsed(),
         attemptsMade,
         posterEmbedMs: embedMs,
         payloadKb,
         outcome: "success",
       });
-      return _buildImageResp(
-        res,
-        node.id,
-        attemptsMade,
-        Date.now() - tWall0,
-        embedMs,
-      );
+      return _buildImageResp(res, node.id, attemptsMade, _elapsed(), embedMs);
     }
 
     _log("warn", "t1_failed", {
@@ -582,15 +663,27 @@ async function _distributedRender(
     });
   }
 
-  // ── Step 3: Try T2 (extreme fallback) ────────────────────────────────────
+  // Step 3: T2 extreme fallback (only if wall time budget remains)
   for (const node of T2_NODES) {
+    if (_timedOut()) {
+      _log("warn", "t2_wall_timeout_abort", { elapsed: _elapsed() });
+      break;
+    }
+
     attemptsMade++;
-    _log("warn", "t2_attempt", { node: node.id, reason: "all_t1_failed" });
+    const budget = Math.max(1_000, maxWallTimeMs - _elapsed() - 150);
+    const nodeTimeout = Math.min(t2TimeoutMs, budget);
+
+    _log("warn", "t2_attempt", {
+      node: node.id,
+      reason: "all_t1_failed",
+      timeout: nodeTimeout,
+    });
 
     const ac = new AbortController();
-    const tm = setTimeout(() => ac.abort(), t2TimeoutMs);
+    const tm = setTimeout(() => ac.abort(), nodeTimeout);
     const t0 = Date.now();
-    const { ok, res, error, status } = await _tryNode(
+    const { ok, res, error, status, inflightAtStart } = await _tryNode(
       node,
       embeddedSvg,
       svgUrl,
@@ -610,46 +703,42 @@ async function _distributedRender(
       isWinner: ok,
       attemptMs,
       httpStatus: status,
-      inflightCount: 0,
+      inflightCount: inflightAtStart,
       payloadKb,
     });
 
     if (ok) {
+      _recordPerf(node.id, attemptMs);
       _log("info", "t2_success", { node: node.id, attemptMs });
       _logRequest(env, {
         format,
         inputType,
         colo,
-        totalWallMs: Date.now() - tWall0,
+        totalWallMs: _elapsed(),
         attemptsMade,
         posterEmbedMs: embedMs,
         payloadKb,
         outcome: "success_t2",
       });
-      return _buildImageResp(
-        res,
-        node.id,
-        attemptsMade,
-        Date.now() - tWall0,
-        embedMs,
-      );
+      return _buildImageResp(res, node.id, attemptsMade, _elapsed(), embedMs);
     }
 
     _log("error", "t2_failed", { node: node.id, error, attemptMs });
   }
 
-  // ── Step 4: Last resort — 302 to TMDB original ───────────────────────────
+  // Step 4: All exhausted — 302 to fallback image or 502
+  const wallMs = _elapsed();
   _log("error", "chain_exhausted", {
     colo,
     format,
     attempts: attemptsMade,
-    wallMs: Date.now() - tWall0,
+    wallMs,
   });
   _logRequest(env, {
     format,
     inputType,
     colo,
-    totalWallMs: Date.now() - tWall0,
+    totalWallMs: wallMs,
     attemptsMade,
     posterEmbedMs: embedMs,
     payloadKb,
@@ -662,9 +751,10 @@ async function _distributedRender(
       headers: {
         Location: fallbackImageUrl,
         "Access-Control-Allow-Origin": "*",
-        "X-Raster-Source": "tmdb-fallback-redirect",
+        "X-Raster-Source": "fallback-redirect",
         "X-Failure-Reason": "all_nodes_exhausted",
         "X-Attempt-Count": String(attemptsMade),
+        "X-Wall-Ms": String(wallMs),
         "Cache-Control": "no-store",
       },
     });
@@ -685,56 +775,17 @@ async function _distributedRender(
   );
 }
 
-// ── Image response builder ─────────────────────────────────────────────────────
+// ── Fleet dashboard ────────────────────────────────────────────────────────────
 
-function _buildImageResp(upstream, source, attemptCount, wallMs, embedMs) {
-  const h = new Headers(upstream.headers);
-  h.set("Access-Control-Allow-Origin", "*");
-  h.set("X-Raster-Source", source);
-  h.set("X-Attempt-Count", String(attemptCount));
-  h.set("X-Wall-Ms", String(wallMs));
-  h.set("X-Poster-Embed-Ms", String(embedMs));
-  h.set("X-LB-Node", "cf-lb-v11");
-  h.set("Cache-Control", "public, max-age=172800");
-  // Expose headers so callers / CDNs can read them
-  h.set(
-    "Access-Control-Expose-Headers",
-    "X-Raster-Source,X-Attempt-Count,X-Wall-Ms,X-Poster-Embed-Ms,X-LB-Node",
-  );
-  return new Response(upstream.body, { status: 200, headers: h });
-}
-
-// ── Fleet dashboard helpers ────────────────────────────────────────────────────
-
-let _lastDiscordUpdate = 0;
 const _nodeMetrics = new Map();
-const DISCORD_MIN_INTERVAL_MS = 90_000;
+let _lastDiscordUpdate = 0;
+const DISCORD_INTERVAL_MS = 90_000;
 
-function getNodes(env) {
-  const vars = { env };
-  return NODE_CONFIG.nodes
-    .filter(
-      (n) =>
-        n.features.supportsHealthCheck ??
-        n.features.inLbWorker ??
-        n.features.isLbFallback,
-    )
-    .map((n) => ({
-      id: n.id,
-      name: n.label,
-      url: n.url,
-      region: n.specs.description || n.region,
-      tier: n.specs.tier,
-      cpuAlloc: n.cpuAlloc,
-      concurrencyLimit: n.concurrencyLimit,
-    }));
-}
-
-async function fetchNodeHealth(baseUrl) {
+async function _fetchNodeHealth(baseUrl) {
   try {
     const r = await fetch(`${baseUrl}/health`, {
       signal: AbortSignal.timeout(4_000),
-      headers: { "User-Agent": "SpicyDevs-LB/11.0" },
+      headers: { "User-Agent": "SpicyDevs-LB/12.0" },
     });
     return r.ok ? await r.json().catch(() => null) : null;
   } catch {
@@ -742,160 +793,116 @@ async function fetchNodeHealth(baseUrl) {
   }
 }
 
-async function updateDashboard(env, isCron = false) {
+async function _updateDashboard(env, isCron = false) {
   if (!env.DISCORD_WEBHOOK_URL) return;
-  const now = Date.now();
-  if (!isCron && now - _lastDiscordUpdate < DISCORD_MIN_INTERVAL_MS) return;
-  _lastDiscordUpdate = now;
+  if (!isCron && Date.now() - _lastDiscordUpdate < DISCORD_INTERVAL_MS) return;
+  _lastDiscordUpdate = Date.now();
 
-  const nodes = getNodes(env);
-  const healthResults = await Promise.all(
-    nodes.map((n) => fetchNodeHealth(n.url).then((h) => ({ ...n, health: h }))),
+  const allNodes = [...T1_NODES, ...T2_NODES];
+  const healths = await Promise.all(
+    allNodes.map((n) => _fetchNodeHealth(n.url).then((h) => ({ ...n, h }))),
   );
 
-  const t1Pool = T1_NODES.map((n) => ({
-    id: n.id,
-    errors: _errCount(n.id),
-    inFlight: _inFlight(n.id),
-    stressed: _isStressed(n.id),
-    failing: _isFailing(n.id),
-    cpuAlloc: n.cpuAlloc,
-    concurrencyLimit: n.concurrencyLimit,
-  }));
+  const emoji = (n, health) =>
+    !health ? "🔴" : _isFailing(n.id) ? "🟠" : _isStressed(n.id) ? "🟡" : "🟢";
 
-  function statusEmoji(h, t1) {
-    if (!h) return "🔴";
-    if (t1?.failing) return "🟠";
-    if (t1?.stressed) return "🟡";
-    return "🟢";
-  }
-
-  const fields = healthResults.map((n) => {
-    const t1 = t1Pool.find((x) => x.id === n.id);
-    const h = n.health;
+  const fields = healths.map(({ id, h }) => {
+    const perf = _perfMap.get(id);
     const lines = [
-      `${statusEmoji(h, t1)} **${n.name}**`,
+      `${emoji({ id }, h)} **${id}**`,
       h
-        ? `⏱ Active: ${h.activeJobs ?? "?"} | Queue: ${h.queuedJobs ?? "?"}`
+        ? `Active: ${h.activeJobs ?? "?"} Queue: ${h.queuedJobs ?? "?"}`
         : "❌ Offline",
-      t1
-        ? `Errors: ${t1.errors} | In-flight: ${t1.inFlight}/${t1.concurrencyLimit ?? "∞"} | CPU: ${n.cpuAlloc ?? "?"}%`
-        : "",
-    ]
-      .filter(Boolean)
-      .join("\n");
+      `Errors: ${_errCount(id)} In-flight: ${_inFlight(id)}`,
+      perf
+        ? `EMA: ${Math.round(perf.emaMs)}ms  Score: ${Math.round(_nodeScore(id))}  n=${perf.sampleCount}`
+        : "No samples yet",
+    ].join("\n");
     return { name: "\u200B", value: lines, inline: true };
   });
 
-  const payload = {
-    username: "Posterium LB — v11",
-    embeds: [
-      {
-        title: "🖼️ Raster Node Fleet Status",
-        color: t1Pool.some((n) => n.failing)
-          ? 0xf87171
-          : t1Pool.some((n) => n.stressed)
-            ? 0xfacc15
-            : 0x4ade80,
-        fields,
-        footer: {
-          text: `${isCron ? "Cron" : "Report"} · ${new Date().toISOString()}`,
-        },
-      },
-    ],
-  };
+  const anyFailing = allNodes.some((n) => _isFailing(n.id));
+  const anyStressed = allNodes.some((n) => _isStressed(n.id));
 
-  try {
-    await fetch(env.DISCORD_WEBHOOK_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-  } catch (e) {
-    _log("warn", "discord_webhook_failed", { reason: e?.message });
-  }
+  await fetch(env.DISCORD_WEBHOOK_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      username: "Posterium LB — v12",
+      embeds: [
+        {
+          title: "🖼️ Raster Node Fleet",
+          color: anyFailing ? 0xf87171 : anyStressed ? 0xfacc15 : 0x4ade80,
+          fields,
+          footer: {
+            text: `${isCron ? "Cron" : "Report"} · ${new Date().toISOString()}`,
+          },
+        },
+      ],
+    }),
+  }).catch((e) => _log("warn", "discord_failed", { reason: e?.message }));
 }
 
-// ── Misc handlers ─────────────────────────────────────────────────────────────
+// ── Metrics report handler (VPS nodes POST here) ───────────────────────────────
 
-async function handleReport(request, env, ctx) {
+async function _handleReport(request, env, ctx) {
   let body;
   try {
     body = await request.json();
   } catch {
-    return jsonError(400, "Invalid JSON");
+    return _jsonError(400, "Invalid JSON");
   }
   const { node, type, snapshot } = body ?? {};
-  if (!node) return jsonError(400, "Missing node");
-
+  if (!node) return _jsonError(400, "Missing node");
   if (type === "metrics" && snapshot)
     _nodeMetrics.set(node, { ...snapshot, receivedAt: Date.now() });
   if (type === "online")
     _nodeMetrics.set(node, { online: true, receivedAt: Date.now() });
-
-  ctx.waitUntil(updateDashboard(env, false));
-  return jsonOk({ ok: true, node, type });
+  ctx.waitUntil(_updateDashboard(env, false));
+  return _jsonOk({ ok: true, node, type });
 }
 
-async function handleScreenshot(request, env) {
-  const url = new URL(request.url);
-  const target = url.searchParams.get("url");
-  if (!target) return jsonError(400, "Missing ?url=");
-  if (!env.MYBROWSER) return jsonError(503, "Browser binding not configured");
-  try {
-    const browser = await puppeteer.launch(env.MYBROWSER);
-    const page = await browser.newPage();
-    await page.setViewport({ width: 1280, height: 720 });
-    await page.goto(target, { waitUntil: "networkidle0", timeout: 10_000 });
-    const screenshot = await page.screenshot({ type: "png" });
-    await browser.close();
-    return new Response(screenshot, {
-      status: 200,
-      headers: {
-        "Content-Type": "image/png",
-        "Cache-Control": "no-store",
-        "Access-Control-Allow-Origin": "*",
-      },
-    });
-  } catch (e) {
-    return jsonError(500, `Screenshot failed: ${e?.message}`);
-  }
-}
+// ── Proxy helper (dashboard — proxies health checks through CF to avoid mixed-content) ──
 
-async function handleProxy(request) {
+async function _handleProxy(request) {
   const url = new URL(request.url);
   const target = url.searchParams.get("url");
-  if (!target) return jsonError(400, "Missing ?url=");
-  const ALLOWLIST = NODE_CONFIG.nodes.map((n) => new URL(n.url).host);
-  const tUrl = new URL(target);
-  if (!ALLOWLIST.includes(tUrl.host))
-    return jsonError(403, "URL not in allowlist");
+  if (!target) return _jsonError(400, "Missing ?url=");
+  const allowed = NODE_CONFIG.nodes.map((n) => new URL(n.url).host);
+  const tHost = (() => {
+    try {
+      return new URL(target).host;
+    } catch {
+      return "";
+    }
+  })();
+  if (!allowed.includes(tHost)) return _jsonError(403, "URL not in allowlist");
   try {
     const res = await fetch(target, {
-      headers: { "User-Agent": "SpicyDevs-LB/11.0" },
+      headers: { "User-Agent": "SpicyDevs-LB/12.0" },
       signal: AbortSignal.timeout(8_000),
     });
     const h = new Headers(res.headers);
     h.set("Access-Control-Allow-Origin", "*");
     return new Response(res.body, { status: res.status, headers: h });
   } catch (e) {
-    return jsonError(502, e?.message);
+    return _jsonError(502, e?.message);
   }
 }
 
-// ── Utilities ─────────────────────────────────────────────────────────────────
+// ── Utilities ──────────────────────────────────────────────────────────────────
 
 function _bufToB64(buffer) {
   const bytes = new Uint8Array(buffer);
   let bin = "";
-  for (let i = 0; i < bytes.length; i += 32768)
+  for (let i = 0; i < bytes.length; i += 32_768)
     bin += String.fromCharCode(
-      ...bytes.subarray(i, Math.min(i + 32768, bytes.length)),
+      ...bytes.subarray(i, Math.min(i + 32_768, bytes.length)),
     );
   return btoa(bin);
 }
 
-function jsonOk(body) {
+function _jsonOk(body) {
   return new Response(JSON.stringify(body), {
     status: 200,
     headers: {
@@ -905,7 +912,7 @@ function jsonOk(body) {
     },
   });
 }
-function jsonError(status, msg) {
+function _jsonError(status, msg) {
   return new Response(JSON.stringify({ error: msg }), {
     status,
     headers: {
@@ -921,7 +928,6 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // ── CORS preflight ──────────────────────────────────────────────────────
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
@@ -943,11 +949,11 @@ export default {
       });
     }
 
-    // ── Health check ────────────────────────────────────────────────────────
+    // ── /health ────────────────────────────────────────────────────────────
     if (url.pathname === "/health") {
-      return jsonOk({
+      return _jsonOk({
         status: "ok",
-        version: "11.0",
+        version: "12.0",
         node: "cf-lb",
         t1Pool: T1_NODES.map((n) => ({
           id: n.id,
@@ -955,30 +961,47 @@ export default {
           inFlight: _inFlight(n.id),
           stressed: _isStressed(n.id),
           failing: _isFailing(n.id),
-          capacity: n.concurrencyLimit
-            ? `${_inFlight(n.id)}/${n.concurrencyLimit}`
-            : "unlimited",
+          emaMs: Math.round(_emaMs(n.id)),
+          score: Math.round(_nodeScore(n.id)),
+          samples: _perfMap.get(n.id)?.sampleCount ?? 0,
+          capacity:
+            n.concurrencyLimit != null
+              ? `${_inFlight(n.id)}/${n.concurrencyLimit}`
+              : "unlimited",
         })),
-        t2Pool: T2_NODES.map((n) => ({ id: n.id, errors: _errCount(n.id) })),
-        fleetNodes: _nodeMetrics.size,
+        t2Pool: T2_NODES.map((n) => ({
+          id: n.id,
+          errors: _errCount(n.id),
+          emaMs: Math.round(_emaMs(n.id)),
+          score: Math.round(_nodeScore(n.id)),
+        })),
+        settings: {
+          t1TimeoutMs,
+          t2TimeoutMs,
+          maxWallTimeMs,
+          posterEmbedTimeoutMs,
+        },
       });
     }
 
-    // ── Hub test ────────────────────────────────────────────────────────────
+    // ── /hub-test ──────────────────────────────────────────────────────────
     if (url.pathname === "/hub-test") {
-      const nodes = getNodes(env);
+      const allNodes = [...T1_NODES, ...T2_NODES];
       const liveHealth = await Promise.all(
-        nodes.map((n) =>
-          fetchNodeHealth(n.url).then((h) => ({
+        allNodes.map((n) =>
+          _fetchNodeHealth(n.url).then((h) => ({
             id: n.id,
-            name: n.name,
             health: h,
+            emaMs: Math.round(_emaMs(n.id)),
+            score: Math.round(_nodeScore(n.id)),
+            errors: _errCount(n.id),
+            inFlight: _inFlight(n.id),
+            samples: _perfMap.get(n.id)?.sampleCount ?? 0,
           })),
         ),
       );
-      return jsonOk({
+      return _jsonOk({
         discordConfigured: !!env.DISCORD_WEBHOOK_URL,
-        kvConfigured: !!env.DASHBOARD_KV,
         lastDiscordUpdate: _lastDiscordUpdate
           ? new Date(_lastDiscordUpdate).toISOString()
           : null,
@@ -986,25 +1009,23 @@ export default {
           id: n.id,
           errors: _errCount(n.id),
           inFlight: _inFlight(n.id),
-          cpuAlloc: n.cpuAlloc,
+          emaMs: Math.round(_emaMs(n.id)),
+          score: Math.round(_nodeScore(n.id)),
           concurrencyLimit: n.concurrencyLimit,
         })),
-        t2Pool: T2_NODES.map((n) => ({ id: n.id })),
-        storedMetrics: Object.fromEntries(_nodeMetrics),
+        t2Pool: T2_NODES.map((n) => ({ id: n.id, errors: _errCount(n.id) })),
+        storedNodeMetrics: Object.fromEntries(_nodeMetrics),
         liveHealth,
       });
     }
 
-    // ── Fleet dashboard helpers ─────────────────────────────────────────────
-    if (url.pathname === "/report") return handleReport(request, env, ctx);
-    if (url.pathname === "/ss") return handleScreenshot(request, env);
-    if (url.pathname === "/proxy") return handleProxy(request);
+    if (url.pathname === "/report") return _handleReport(request, env, ctx);
+    if (url.pathname === "/proxy") return _handleProxy(request);
 
-    // ── Main rasterization entry point ──────────────────────────────────────
+    // ── Main rasterization ─────────────────────────────────────────────────
     if (request.method !== "POST" && request.method !== "GET")
-      return jsonError(405, "Method not allowed");
+      return _jsonError(405, "Method not allowed");
 
-    // Read headers
     const svgUrl = request.headers.get("X-SVG-Url") || null;
     const colo = request.headers.get("X-CF-Colo") || request.cf?.colo || null;
     const fallbackImageUrl =
@@ -1020,26 +1041,21 @@ export default {
       ? rawFormat
       : "png";
 
-    // Parse SVG body
     let svgText;
     if (request.method === "POST") {
       svgText = await request.text();
-      if (!svgText?.trim()) return jsonError(400, "Empty SVG body");
+      if (!svgText?.trim()) return _jsonError(400, "Empty SVG body");
     } else {
-      // GET ?url= path (from external callers, not from Worker A)
       const targetUrl = url.searchParams.get("url");
-      if (!targetUrl) return jsonError(400, "Missing ?url= parameter");
+      if (!targetUrl) return _jsonError(400, "Missing ?url= parameter");
       try {
-        const parsedTarget = new URL(targetUrl);
-        if (!["http:", "https:"].includes(parsedTarget.protocol))
-          return jsonError(400, "Invalid URL protocol");
-        const r = await fetch(parsedTarget.toString(), {
-          headers: { "User-Agent": "SpicyDevs-LB/11.0" },
+        const r = await fetch(targetUrl, {
+          headers: { "User-Agent": "SpicyDevs-LB/12.0" },
         });
-        if (!r.ok) return jsonError(502, `SVG fetch failed: ${r.status}`);
+        if (!r.ok) return _jsonError(502, `SVG fetch failed: ${r.status}`);
         svgText = await r.text();
       } catch (e) {
-        return jsonError(502, `SVG fetch error: ${e?.message}`);
+        return _jsonError(502, `SVG fetch error: ${e?.message}`);
       }
     }
 
@@ -1056,6 +1072,6 @@ export default {
   },
 
   async scheduled(_event, env, ctx) {
-    ctx.waitUntil(updateDashboard(env, true));
+    ctx.waitUntil(_updateDashboard(env, true));
   },
 };

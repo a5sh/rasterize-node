@@ -2,60 +2,51 @@
   "name": "rasterize",
   "main": "worker.js",
   "compatibility_date": "2026-05-27",
-  "compatibility_flags": [
-    "nodejs_compat"
-  ],
+  "compatibility_flags": ["nodejs_compat"],
   "routes": [
     {
       "pattern": "r-cf.spicydevs.xyz",
       "zone_name": "spicydevs.xyz",
-      "custom_domain": true
-    }
+      "custom_domain": true,
+    },
   ],
-  "browser": {
-    "binding": "MYBROWSER"
-  },
   // KV namespace for fleet dashboard state (message ID, node metrics, rate-limit timestamps).
   // Create with: wrangler kv:namespace create DASHBOARD_KV
   // Then replace the id below with the output ID.
   "kv_namespaces": [
-    { "binding": "DASHBOARD_KV", "id": "c0547489012a48368146b53c1227f1f2" }
+    { "binding": "DASHBOARD_KV", "id": "c0547489012a48368146b53c1227f1f2" },
   ],
   // Cron: refresh fleet Discord embed every 5 minutes regardless of node reports.
   "triggers": {
-  "crons": ["*/15 * * * *"]
-},
+    "crons": ["*/15 * * * *"],
+  },
   // Node URLs — set real values with: wrangler vars set KEY value
   // Or set in the Cloudflare dashboard under Workers > Settings > Variables.
   // DISCORD_WEBHOOK_URL must be set as a secret:
   //   wrangler secret put DISCORD_WEBHOOK_URL
   "vars": {
-    "VERCEL_NODE_URL":  "https://us-r-vercel.vercel.app",
+    "VERCEL_NODE_URL": "https://us-r-vercel.vercel.app",
     "NETLIFY_NODE_URL": "https://r-netlify.netlify.app",
-    "RENDER_NODE_URL":  "https://euc-r-render.onrender.com",
-    "VPS1_NODE_URL":    "http://node-3.midas.host:25108",
-    "VPS2_NODE_URL":    "http://de20.spaceify.eu:26100",
-    "VPS3_NODE_URL":    "http://fr1.spaceify.eu:25980/",
-    "DISCORD_WEBHOOK_URL": "https://discord.com/api/webhooks/1484521396326502511/hOSVLWiK3MKCXzzwujgYtIa6zOiTkHnjO4GmGYvTeGTLmBjEO0kTvs5x4ySWFC4htpg5"
+    "RENDER_NODE_URL": "https://euc-r-render.onrender.com",
+    "VPS1_NODE_URL": "http://node-3.midas.host:25108",
+    "VPS2_NODE_URL": "http://de20.spaceify.eu:26100",
+    "VPS3_NODE_URL": "http://fr1.spaceify.eu:25980/",
+    "DISCORD_WEBHOOK_URL": "https://discord.com/api/webhooks/1484521396326502511/hOSVLWiK3MKCXzzwujgYtIa6zOiTkHnjO4GmGYvTeGTLmBjEO0kTvs5x4ySWFC4htpg5",
   },
   "rules": [
     {
       "type": "CompiledWasm",
-      "globs": [
-        "**/*.wasm"
-      ],
-      "fallthrough": true
+      "globs": ["**/*.wasm"],
+      "fallthrough": true,
     },
     {
       "type": "Data",
-      "globs": [
-        "**/*.ttf"
-      ],
-      "fallthrough": true
-    }
+      "globs": ["**/*.ttf"],
+      "fallthrough": true,
+    },
   ],
   "observability": {
     "enabled": true,
-    "head_sampling_rate": 1
-  }
+    "head_sampling_rate": 1,
+  },
 }
