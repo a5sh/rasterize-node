@@ -12,15 +12,16 @@ import http from "node:http";
 import { gunzipSync, brotliDecompressSync } from "node:zlib";
 import path, { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+// ADD embedExternalImages to the existing lib.js import destructure:
 import {
   RenderPool,
   buildResvgOpts,
   generatePosterFromBackdrop,
   generateSquareCropFromBackdrop,
   warmIconCache,
+  embedExternalImages, // ← add this
   RESOLVED_LIB_DIR,
 } from "./lib.js";
-import { embedExternalImages } from "./lib/embedImages.js";
 import {
   stats,
   logError,
