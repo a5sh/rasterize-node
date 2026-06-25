@@ -26,8 +26,9 @@ const BRANCH = process.env.GITHUB_BRANCH || "main";
 const TOKEN = process.env.GITHUB_TOKEN || "";
 const SKIP_UPDATE = process.env.SKIP_UPDATE === "1";
 
-const GH_RAW = `https://raw.githubusercontent.com/a5sh/rasterize-node`;
-const GH_API = `https://api.github.com/repos/a5sh/rasterize-node/commits/main`;
+// AFTER
+const GH_RAW = `https://raw.githubusercontent.com/${REPO}/${BRANCH}`;
+const GH_API = `https://api.github.com/repos/${REPO}/commits/${BRANCH}`;
 const VERSION_FILE = join(__dir, ".version");
 
 // Files to sync on each restart.

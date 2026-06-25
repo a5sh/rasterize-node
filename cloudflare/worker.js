@@ -869,8 +869,6 @@ async function _distributedRender(
 }
 
 // ── Fleet dashboard ────────────────────────────────────────────────────────────
-let _lastDiscordUpdate = 0;
-const DISCORD_INTERVAL_MS = 90_000;
 
 async function _fetchNodeHealth(baseUrl) {
   try {
@@ -887,7 +885,6 @@ async function _fetchNodeHealth(baseUrl) {
 
 async function _updateDashboard(env, isCron = false) {
   if (!env.DISCORD_WEBHOOK_URL) return;
-  if (!isCron && Date.now() - _lastDiscordUpdate < DISCORD_INTERVAL_MS) return;
   _lastDiscordUpdate = Date.now();
 
   const allNodes = [...T1_NODES, ...T2_NODES];
@@ -957,9 +954,8 @@ async function _updateDashboard(env, isCron = false) {
         title: "🖼️ Raster Node Fleet",
         color: anyFailing ? 0xf87171 : anyStressed ? 0xfacc15 : 0x4ade80,
         fields,
-        footer: {
-          text: `${isCron ? "Cron" : "Report"} · ${new Date().toISOString()}`,
-        },
+        // AFTER
+        footer: { text: `Hourly poll · ${new Date().toISOString()}` },
       },
     ],
   };
@@ -1015,21 +1011,6 @@ async function _updateDashboard(env, isCron = false) {
   } catch (e) {
     _log("warn", "discord_post_threw", { reason: e?.message });
   }
-}
-
-// ── Metrics report handler (VPS nodes POST here) ───────────────────────────────
-
-async function _handleReport(request, env, ctx) {
-  let body;
-  try {
-    body = await request.json();
-  } catch {
-    return _jsonError(400, "Invalid JSON");
-  }
-  const { node, type, snapshot } = body ?? {};
-  if (!node) return _jsonError(400, "Missing node");
-  ctx.waitUntil(_updateDashboard(env, false));
-  return _jsonOk({ ok: true, node, type });
 }
 
 // ── Proxy helper (dashboard — proxies health checks through CF to avoid mixed-content) ──
@@ -1273,9 +1254,6 @@ export default {
       });
     }
 
-    if (url.pathname === "/report") return _handleReport(request, env, ctx);
-    if (url.pathname === "/proxy") return _handleProxy(request);
-
     // ── Main rasterization ─────────────────────────────────────────────────
     if (request.method !== "POST" && request.method !== "GET")
       return _jsonError(405, "Method not allowed");
@@ -1329,7 +1307,7 @@ export default {
   async scheduled(_event, env, ctx) {
     ctx.waitUntil(
       (async () => {
-        // Load any previously persisted tuned limits into module-level map
+        // Load persisted tuned limits into module-level map
         try {
           const stored = await env.DASHBOARD_KV?.get("tuned_limits", {
             type: "json",
@@ -1340,7 +1318,7 @@ export default {
           }
         } catch (_) {}
 
-        await Promise.all([_updateDashboard(env, true), _autoTuneLimits(env)]);
+        await Promise.all([_updateDashboard(env), _autoTuneLimits(env)]);
       })(),
     );
   },
