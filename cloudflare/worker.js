@@ -85,31 +85,53 @@ function _log(level, event, meta = {}) {
   (level === "error" ? console.error : console.log)(JSON.stringify(entry));
 }
 
-// ── Node pools ─────────────────────────────────────────────────────────────────
+// ADD near top of cloudflare/worker.js
+async function resolveSecret(binding) {
+  if (!binding) return null;
+  if (typeof binding === "string") return binding;
+  if (typeof binding.get === "function") {
+    try {
+      return await binding.get();
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
 
+// ── Node pools ─────────────────────────────────────────────────────────────────
+// AFTER
 const T1_NODES = NODE_CONFIG.nodes
   .filter((n) => n.features.inLbWorker)
   .sort((a, b) => (a.specs.tier ?? 99) - (b.specs.tier ?? 99))
   .map((n) => ({
     id: n.id,
-    url: `${n.url}${n.features.apiPath ?? ""}`,
+    type: n.type,
+    baseUrl: n.url, // health check URL (no apiPath)
+    url: `${n.url}${n.features.apiPath ?? ""}`, // raster POST URL
     lbRegion: n.lbRegion,
     concurrencyLimit: n.concurrencyLimit ?? null,
     useUrlPayload: n.features.useUrlPayload ?? false,
-    acceptsGzip: n.features.acceptsCompression ?? false,
+    acceptsCompression: n.features.acceptsCompression ?? false, // 'gzip' | 'br' | false
+    supportsHealthCheck: n.features.supportsHealthCheck ?? false,
   }));
 
 const T2_NODES = NODE_CONFIG.nodes
   .filter((n) => n.features.isLbFallback)
   .map((n) => ({
     id: n.id,
+    type: n.type,
+    baseUrl: n.url,
     url: `${n.url}${n.features.apiPath ?? ""}`,
     lbRegion: n.lbRegion,
     concurrencyLimit: n.concurrencyLimit ?? null,
     useUrlPayload: false,
-    acceptsGzip: n.features.acceptsCompression ?? false,
+    acceptsCompression: n.features.acceptsCompression ?? false,
+    supportsHealthCheck: n.features.supportsHealthCheck ?? false,
   }));
 
+// Module-level tuned concurrency limits written by auto-tune cron
+const _tunedLimits = new Map(); // nodeId → number
 const {
   t1TimeoutMs = 5_000,
   t2TimeoutMs = 8_000,
@@ -130,7 +152,16 @@ const _inflightMap = new Map();
 const _perfMap = new Map();
 
 const EMA_ALPHA = 0.2; // smoothing factor — higher = more reactive
-
+// ADD (new function)
+function _hashStr(str) {
+  let h = 0x811c9dc5;
+  const len = Math.min(str.length, 512);
+  for (let i = 0; i < len; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(36);
+}
 // Error tracking
 function _recordErr(id) {
   const now = Date.now();
@@ -165,7 +196,8 @@ function _inFlight(id) {
   return _inflightMap.get(id) ?? 0;
 }
 function _atCapacity(n) {
-  return n.concurrencyLimit !== null && _inFlight(n.id) >= n.concurrencyLimit;
+  const limit = _tunedLimits.get(n.id) ?? n.concurrencyLimit;
+  return limit !== null && _inFlight(n.id) >= limit;
 }
 
 // EMA performance tracking
@@ -316,14 +348,31 @@ async function _gzip(text) {
 // We fetch it once here and replace all occurrences with a base64 data URI.
 // This eliminates the double-fetch problem where each raster node would have
 // independently fetched the same poster image.
-
+// AFTER
 async function _embedPoster(svgText, posterUrl) {
   if (!posterUrl) return { svg: svgText, embedMs: 0, embedded: false };
+
+  // Cache key: poster URL + hash of first 512 chars of SVG (captures layout but not base64 poster)
+  const cacheKey = `poster-embed:${_hashStr(posterUrl)}:${_hashStr(svgText.slice(0, 512))}`;
+  const cacheReq = new Request(`https://embed-cache.internal/${cacheKey}`);
+  const cache = caches.default;
+
+  try {
+    const hit = await cache.match(cacheReq);
+    if (hit) {
+      const svg = await hit.text();
+      _log("debug", "embed_cache_hit", { key: cacheKey.slice(0, 40) });
+      return { svg, embedMs: 0, embedded: true, fromCache: true };
+    }
+  } catch (_) {
+    /* cache miss on error is fine */
+  }
+
   const t0 = Date.now();
   try {
     const res = await fetch(posterUrl, {
       signal: AbortSignal.timeout(posterEmbedTimeoutMs),
-      headers: { "User-Agent": "SpicyDevs-LB/12.0", Accept: "image/*" },
+      headers: { "User-Agent": "SpicyDevs-LB/13.0", Accept: "image/*" },
       cf: { cacheTtl: 86_400, cacheEverything: true },
     });
     if (!res.ok) {
@@ -337,6 +386,22 @@ async function _embedPoster(svgText, posterUrl) {
     const ct = res.headers.get("content-type") || "image/jpeg";
     const uri = `data:${ct};base64,${_bufToB64(buf)}`;
     const svg = svgText.split(`href="${posterUrl}"`).join(`href="${uri}"`);
+
+    // Cache embedded SVG for 5 minutes — burst traffic for same title reuses it
+    try {
+      await cache.put(
+        cacheReq,
+        new Response(svg, {
+          headers: {
+            "Content-Type": "image/svg+xml",
+            "Cache-Control": "public, max-age=300",
+          },
+        }),
+      );
+    } catch (_) {
+      /* non-fatal */
+    }
+
     return { svg, embedMs: Date.now() - t0, embedded: true };
   } catch (e) {
     _log("warn", "poster_embed_failed", {
@@ -346,7 +411,6 @@ async function _embedPoster(svgText, posterUrl) {
     return { svg: svgText, embedMs: Date.now() - t0, embedded: false };
   }
 }
-
 // ── Single node attempt ────────────────────────────────────────────────────────
 
 async function _tryNode(node, svgText, svgUrl, format, signal) {
@@ -389,7 +453,11 @@ async function _tryNode(node, svgText, svgUrl, format, signal) {
       let body = svgText,
         ct = "image/svg+xml";
       const extra = {};
-      if (node.acceptsGzip) {
+      // AFTER
+      if (
+        node.acceptsCompression === "gzip" ||
+        node.acceptsCompression === true
+      ) {
         const gz = await _gzip(svgText);
         if (gz) {
           body = gz;
@@ -397,6 +465,7 @@ async function _tryNode(node, svgText, svgUrl, format, signal) {
           extra["X-SVG-Encoding"] = "gzip";
         }
       }
+      // 'br' reserved for when CF Workers' CompressionStream adds brotli support
       res = await fetch(node.url, {
         method: "POST",
         body,
@@ -507,23 +576,34 @@ function _logRequest(
 
 // ── Response builder ───────────────────────────────────────────────────────────
 
-function _buildImageResp(upstream, nodeId, attemptCount, wallMs, embedMs) {
+// AFTER
+function _buildImageResp(
+  upstream,
+  nodeId,
+  attemptCount,
+  wallMs,
+  embedMs,
+  colo,
+) {
   const h = new Headers(upstream.headers);
+  const geoRegion = (colo && COLO_REGION[colo.toUpperCase()]) || "UNKNOWN";
   h.set("Access-Control-Allow-Origin", "*");
   h.set("X-Raster-Source", nodeId);
   h.set("X-Attempt-Count", String(attemptCount));
   h.set("X-Wall-Ms", String(wallMs));
   h.set("X-Poster-Embed-Ms", String(embedMs));
   h.set("X-Node-Score", String(Math.round(_nodeScore(nodeId))));
-  h.set("X-LB-Version", "cf-v12");
+  h.set("X-Score", String(Math.round(_nodeScore(nodeId)))); // alias for debugging
+  h.set("X-Geo-Preferred", geoRegion); // which region was preferred
+  h.set("X-CF-Colo", colo || ""); // exact CF datacenter
+  h.set("X-LB-Version", "cf-v13");
   h.set("Cache-Control", "public, max-age=172800");
   h.set(
     "Access-Control-Expose-Headers",
-    "X-Raster-Source,X-Attempt-Count,X-Wall-Ms,X-Poster-Embed-Ms,X-Node-Score,X-LB-Version",
+    "X-Raster-Source,X-Attempt-Count,X-Wall-Ms,X-Poster-Embed-Ms,X-Node-Score,X-Score,X-Geo-Preferred,X-CF-Colo,X-LB-Version",
   );
   return new Response(upstream.body, { status: 200, headers: h });
 }
-
 // ── Main render dispatch ───────────────────────────────────────────────────────
 
 async function _distributedRender(
@@ -657,7 +737,15 @@ async function _distributedRender(
         payloadKb,
         outcome: "success",
       });
-      return _buildImageResp(res, node.id, attemptsMade, _elapsed(), embedMs);
+      // AFTER (both success paths — pass colo)
+      return _buildImageResp(
+        res,
+        node.id,
+        attemptsMade,
+        _elapsed(),
+        embedMs,
+        colo,
+      );
     }
 
     _log("warn", "t1_failed", {
@@ -795,6 +883,7 @@ async function _fetchNodeHealth(baseUrl) {
     return null;
   }
 }
+// REPLACE the entire _updateDashboard function:
 
 async function _updateDashboard(env, isCron = false) {
   if (!env.DISCORD_WEBHOOK_URL) return;
@@ -802,48 +891,130 @@ async function _updateDashboard(env, isCron = false) {
   _lastDiscordUpdate = Date.now();
 
   const allNodes = [...T1_NODES, ...T2_NODES];
+
+  // Only health-check nodes that expose /health; skip CDN/wsrv nodes
   const healths = await Promise.all(
-    allNodes.map((n) => _fetchNodeHealth(n.url).then((h) => ({ ...n, h }))),
+    allNodes.map(async (n) => {
+      if (!n.supportsHealthCheck) return { ...n, h: null };
+      const h = await _fetchNodeHealth(n.baseUrl);
+      return { ...n, h };
+    }),
   );
 
-  const emoji = (n, health) =>
-    !health ? "🔴" : _isFailing(n.id) ? "🟠" : _isStressed(n.id) ? "🟡" : "🟢";
+  // 🟢 online  🟡 stressed  🟠 failing  🔴 VPS down  💤 serverless cold  ⚪ CDN/no-healthcheck
+  const emoji = (n, health) => {
+    if (!n.supportsHealthCheck) return "⚪"; // CDN or no endpoint
+    if (!health) {
+      if (n.type === "vercel" || n.type === "netlify") return "💤"; // cold start
+      return "🔴"; // VPS actually down
+    }
+    if (_isFailing(n.id)) return "🟠";
+    if (_isStressed(n.id)) return "🟡";
+    return "🟢";
+  };
 
-  const fields = healths.map(({ id, h }) => {
+  const fields = healths.map(({ id, type, h, supportsHealthCheck }) => {
     const perf = _perfMap.get(id);
+    const limit =
+      _tunedLimits.get(id) ??
+      T1_NODES.find((n) => n.id === id)?.concurrencyLimit ??
+      T2_NODES.find((n) => n.id === id)?.concurrencyLimit ??
+      null;
+    const limitStr = limit != null ? `/${limit}` : "/∞";
+
+    const healthLine = !supportsHealthCheck
+      ? "CDN / No health endpoint"
+      : !h
+        ? type === "vercel" || type === "netlify"
+          ? "Serverless — may be cold"
+          : "❌ Offline"
+        : `Active: ${h.activeJobs ?? "?"}  Queue: ${h.queuedJobs ?? "?"}  Up: ${h.uptime != null ? `${Math.floor(h.uptime / 3600)}h${Math.floor((h.uptime % 3600) / 60)}m` : "?"}`;
+
     const lines = [
-      `${emoji({ id }, h)} **${id}**`,
-      h
-        ? `Active: ${h.activeJobs ?? "?"} Queue: ${h.queuedJobs ?? "?"}`
-        : "❌ Offline",
-      `Errors: ${_errCount(id)} In-flight: ${_inFlight(id)}`,
+      `${emoji({ id, type, supportsHealthCheck }, h)} **${id}**`,
+      healthLine,
+      `Errors: ${_errCount(id)}  In-flight: ${_inFlight(id)}${limitStr}`,
       perf
         ? `EMA: ${Math.round(perf.emaMs)}ms  Score: ${Math.round(_nodeScore(id))}  n=${perf.sampleCount}`
         : "No samples yet",
-    ].join("\n");
+      limit !== (T1_NODES.find((n) => n.id === id)?.concurrencyLimit ?? limit)
+        ? `⚡ Tuned limit: ${limit}`
+        : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+
     return { name: "\u200B", value: lines, inline: true };
   });
 
   const anyFailing = allNodes.some((n) => _isFailing(n.id));
   const anyStressed = allNodes.some((n) => _isStressed(n.id));
 
-  await fetch(env.DISCORD_WEBHOOK_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      username: "Posterium LB — v12",
-      embeds: [
-        {
-          title: "🖼️ Raster Node Fleet",
-          color: anyFailing ? 0xf87171 : anyStressed ? 0xfacc15 : 0x4ade80,
-          fields,
-          footer: {
-            text: `${isCron ? "Cron" : "Report"} · ${new Date().toISOString()}`,
-          },
+  const payload = {
+    username: "Posterium LB — v13",
+    embeds: [
+      {
+        title: "🖼️ Raster Node Fleet",
+        color: anyFailing ? 0xf87171 : anyStressed ? 0xfacc15 : 0x4ade80,
+        fields,
+        footer: {
+          text: `${isCron ? "Cron" : "Report"} · ${new Date().toISOString()}`,
         },
-      ],
-    }),
-  }).catch((e) => _log("warn", "discord_failed", { reason: e?.message }));
+      },
+    ],
+  };
+
+  // ── Edit existing message or create new ───────────────────────────────────
+  let messageId = null;
+  try {
+    messageId = await env.DASHBOARD_KV?.get("discord:messageId");
+  } catch (_) {}
+
+  if (messageId) {
+    try {
+      const editRes = await fetch(
+        `${env.DISCORD_WEBHOOK_URL}/messages/${messageId}`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+          signal: AbortSignal.timeout(8_000),
+        },
+      );
+      if (editRes.ok) return; // success — done
+      if (editRes.status === 404) {
+        // Message was deleted from Discord — clear the stored ID and fall through
+        await env.DASHBOARD_KV?.delete("discord:messageId").catch(() => {});
+        messageId = null;
+      } else {
+        _log("warn", "discord_edit_failed", { status: editRes.status });
+      }
+    } catch (e) {
+      _log("warn", "discord_edit_threw", { reason: e?.message });
+    }
+  }
+
+  // Create new message — use ?wait=true to get message ID back
+  try {
+    const postRes = await fetch(`${env.DISCORD_WEBHOOK_URL}?wait=true`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(8_000),
+    });
+    if (postRes.ok) {
+      const data = await postRes.json();
+      if (data.id) {
+        await env.DASHBOARD_KV?.put("discord:messageId", data.id).catch(
+          () => {},
+        );
+      }
+    } else {
+      _log("warn", "discord_post_failed", { status: postRes.status });
+    }
+  } catch (e) {
+    _log("warn", "discord_post_threw", { reason: e?.message });
+  }
 }
 
 // ── Metrics report handler (VPS nodes POST here) ───────────────────────────────
@@ -919,6 +1090,91 @@ function _jsonError(status, msg) {
       "Access-Control-Allow-Origin": "*",
     },
   });
+}
+
+// ADD new function
+async function _autoTuneLimits(env) {
+  const [accountId, apiToken] = await Promise.all([
+    resolveSecret(env.CF_ACCOUNT_ID),
+    resolveSecret(env.CF_API_TOKEN),
+  ]).catch(() => [null, null]);
+  if (!accountId || !apiToken) return;
+
+  const sql = `
+    SELECT
+      blob1                                                               AS node,
+      avg(double4)                                                        AS avg_inflight,
+      max(double4)                                                        AS max_inflight,
+      quantileTDigest(0.95)(double4)                                      AS p95_inflight,
+      count()                                                             AS total_attempts,
+      countIf(blob5 = 'success')                                         AS successes,
+      round(100.0 * countIf(blob5 = 'success') / count())               AS success_rate_pct,
+      avgIf(double1, blob5 = 'success')                                  AS avg_ms
+    FROM raster_metrics
+    WHERE timestamp > now() - INTERVAL '24' HOUR
+      AND blob1 != 'req' AND blob5 != 'skipped'
+    GROUP BY blob1
+    HAVING total_attempts > 50
+    ORDER BY node
+  `;
+
+  try {
+    const res = await fetch(
+      `https://api.cloudflare.com/client/v4/accounts/${accountId}/analytics_engine/sql`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiToken}`,
+          "Content-Type": "text/plain",
+        },
+        body: sql,
+      },
+    );
+    if (!res.ok) return;
+    const { data = [] } = await res.json();
+    const adjustments = {};
+
+    for (const row of data) {
+      const nodeId = row.node;
+      const n = [...T1_NODES, ...T2_NODES].find((x) => x.id === nodeId);
+      if (!n || n.concurrencyLimit === null) continue; // unlimited or unknown
+
+      const baseLine = n.concurrencyLimit;
+      const currentLim = _tunedLimits.get(nodeId) ?? baseLine;
+      const p95 = parseFloat(row.p95_inflight ?? 0);
+      const successPct = parseFloat(row.success_rate_pct ?? 0);
+      const avgMs = parseFloat(row.avg_ms ?? 9999);
+
+      // Raise limit: p95 inflight ≥ 85% of current limit AND success > 90% AND fast
+      if (p95 >= 0.85 * currentLim && successPct > 90 && avgMs < 3000) {
+        adjustments[nodeId] = Math.min(currentLim + 1, baseLine * 3);
+      }
+      // Lower limit: poor success rate
+      else if (successPct < 65 && currentLim > 1) {
+        adjustments[nodeId] = Math.max(1, Math.floor(currentLim * 0.75));
+      }
+      // Decay toward baseline when healthy (prevent runaway increases)
+      else if (currentLim > baseLine && successPct > 85) {
+        adjustments[nodeId] = Math.max(baseLine, currentLim - 1);
+      }
+    }
+
+    if (Object.keys(adjustments).length > 0) {
+      for (const [id, limit] of Object.entries(adjustments)) {
+        const prev =
+          _tunedLimits.get(id) ??
+          [...T1_NODES, ...T2_NODES].find((n) => n.id === id)?.concurrencyLimit;
+        _tunedLimits.set(id, limit);
+        _log("info", "auto_tune", { node: id, prev, next: limit });
+      }
+      await env.DASHBOARD_KV?.put(
+        "tuned_limits",
+        JSON.stringify(Object.fromEntries(_tunedLimits)),
+      ).catch(() => {});
+    }
+  } catch (e) {
+    _log("warn", "auto_tune_failed", { reason: e?.message });
+  }
 }
 
 // ── Main export ────────────────────────────────────────────────────────────────
@@ -1069,7 +1325,23 @@ export default {
     );
   },
 
+  // AFTER
   async scheduled(_event, env, ctx) {
-    ctx.waitUntil(_updateDashboard(env, true));
+    ctx.waitUntil(
+      (async () => {
+        // Load any previously persisted tuned limits into module-level map
+        try {
+          const stored = await env.DASHBOARD_KV?.get("tuned_limits", {
+            type: "json",
+          });
+          if (stored && typeof stored === "object") {
+            for (const [id, limit] of Object.entries(stored))
+              _tunedLimits.set(id, limit);
+          }
+        } catch (_) {}
+
+        await Promise.all([_updateDashboard(env, true), _autoTuneLimits(env)]);
+      })(),
+    );
   },
 };
