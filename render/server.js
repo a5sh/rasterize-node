@@ -1,120 +1,65 @@
-// render/discord.js — local metrics + rate-limited Discord error alerts
+//render/server.js
 //
-// CF hub reporting not included — same reasoning as vps/discord.js.
-// Render.com nodes are short-lived containers; the CF worker observes health
-// by polling each node's /health endpoint directly.
-//
-// ENV VARS:
-//   CF_NODE_ID             optional — display name (must match CF registry id)
-//   RENDER_SERVICE_NAME    auto-set by Render.com
-//   DISCORD_WEBHOOK_URL    optional — critical errors POST here (rate-limited)
+// Render.com rasterizer boot script.
+// build.mjs always populates ./lib/ before this runs — import directly,
+// no dynamic resolver needed (that's a VPS concern for Pterodactyl).
+// Render rebuilds the container on every GitHub push; no auto-updater.
 
-import os from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const NODE_NAME =
-  process.env.CF_NODE_ID ||
-  process.env.RENDER_SERVICE_NAME ||
-  process.env.NODE_NAME ||
-  os.hostname();
+import { RenderPool } from "./lib/renderPool.js";
+import { buildResvgOpts } from "./lib/sharedRender.js";
+import {
+  generatePosterFromBackdrop,
+  generateSquareCropFromBackdrop,
+} from "./lib/b2p.js";
+import { warmIconCache } from "./lib/iconCache.js";
+import { embedExternalImages } from "./lib/embedImages.js";
+import { createRasterServer } from "./lib/httpServer.js";
+import * as discord from "./discord.js";
 
-const DISCORD_WEBHOOK = process.env.DISCORD_WEBHOOK_URL || null;
+// Render injects PORT automatically; default matches Render's expectation.
+const PORT = parseInt(process.env.PORT || "10000", 10);
+// Render free tier has limited shared CPU — keep threads conservative.
+// Override via MAX_CONCURRENT in the Render dashboard env vars.
+const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT || "2", 10);
 
-// ── Error-post rate limiter ───────────────────────────────────────────────────
+const __dir = dirname(fileURLToPath(import.meta.url));
+const WORKER_PATH = join(__dir, "lib", "renderWorker.js");
 
-const ERR_WINDOW_MS = 5 * 60_000;
-const ERR_BURST_MAX = 3;
-const ERR_MIN_GAP_MS = 10_000;
+// Stagger icon-cache fetch to prevent burst on redeploy / rolling restart
+setTimeout(() => warmIconCache(), Math.floor(Math.random() * 20_000));
 
-let _errCount = 0;
-let _errWindowEnd = 0;
-let _lastPost = 0;
+(async () => {
+  const resvgOpts = buildResvgOpts();
+  console.log("[resvg] Font config:", JSON.stringify(resvgOpts.font, null, 2));
 
-function _canPostDiscord() {
-  const now = Date.now();
-  if (now > _errWindowEnd) {
-    _errCount = 0;
-    _errWindowEnd = now + ERR_WINDOW_MS;
+  const pool = new RenderPool(WORKER_PATH, __dir, MAX_CONCURRENT, resvgOpts);
+  console.log(`[pool]  ${MAX_CONCURRENT} worker threads spawned`);
+
+  const server = createRasterServer({
+    pool,
+    embedImages: embedExternalImages,
+    generatePoster: generatePosterFromBackdrop,
+    generateSquare: generateSquareCropFromBackdrop,
+    discord,
+    version: "3.2",
+    maxConcurrent: MAX_CONCURRENT,
+  });
+
+  server.listen(PORT, "0.0.0.0", async () => {
+    console.log(`Rasterizer ready on :${PORT} (${MAX_CONCURRENT} workers)`);
+    await discord.notifyOnline();
+  });
+
+  async function shutdown(signal) {
+    console.log(`[${signal}] shutting down`);
+    await discord.notifyOffline(signal);
+    await pool.destroy();
+    process.exit(0);
   }
-  if (_errCount >= ERR_BURST_MAX) return false;
-  if (now - _lastPost < ERR_MIN_GAP_MS) return false;
-  return true;
-}
 
-// ── Stats (mutated by httpServer syncStats) ───────────────────────────────────
-
-export const stats = {
-  startedAt: Date.now(),
-  activeJobs: 0,
-  queuedJobs: 0,
-  status: "starting",
-  lastError: null,
-};
-
-// ── Counters ──────────────────────────────────────────────────────────────────
-
-export function recordRequest() {
-  /* counted via pool.activeJobs */
-}
-export function recordJobDuration() {
-  /* future: local p95 histogram  */
-}
-export function recordResvgFail() {
-  stats.lastError = { message: "resvg fail", ts: Date.now() };
-}
-export function recordWsrvFallback() {
-  /* logged inline by server */
-}
-export function recordError(msg) {
-  stats.lastError = { message: msg, ts: Date.now() };
-}
-
-// ── Discord webhook ───────────────────────────────────────────────────────────
-
-async function _postDiscord(title, description) {
-  if (!DISCORD_WEBHOOK || !_canPostDiscord()) return;
-  _errCount++;
-  _lastPost = Date.now();
-  try {
-    await fetch(DISCORD_WEBHOOK, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        username: `Posterium Render — ${NODE_NAME}`,
-        embeds: [
-          {
-            title,
-            description: description?.slice(0, 2000),
-            color: 0xf87171,
-            timestamp: new Date().toISOString(),
-            footer: { text: NODE_NAME },
-          },
-        ],
-      }),
-      signal: AbortSignal.timeout(5_000),
-    });
-  } catch {
-    // fire-and-forget
-  }
-}
-
-// ── Public API ────────────────────────────────────────────────────────────────
-
-export async function logError(title, description) {
-  recordError(description);
-  console.error(`[error] ${title}: ${description}`);
-  _postDiscord(title, description).catch(() => {});
-}
-
-export async function notifyOnline() {
-  stats.status = "online";
-  console.log(`[reporter] Node "${NODE_NAME}" online — health at /health`);
-}
-
-export async function notifyOffline(reason = "SIGTERM") {
-  stats.status = "offline";
-  console.log(`[reporter] Node "${NODE_NAME}" shutting down (${reason})`);
-  await _postDiscord(
-    "Node Offline",
-    `**${NODE_NAME}** shutting down: \`${reason}\``,
-  );
-}
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
+})();
