@@ -19,10 +19,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-// ── Resolve paths ─────────────────────────────────────────────────────────────
-
 const __dir = path.dirname(fileURLToPath(import.meta.url));
-const REPO_ROOT = path.resolve(__dir, ".."); // scripts/ is one level below root
+const REPO_ROOT = path.resolve(__dir, "..");
 const CORE_DIR = path.join(REPO_ROOT, "core");
 
 const CORE_FILES = [
@@ -33,12 +31,11 @@ const CORE_FILES = [
   "iconCache.js",
   "serverlessReporter.js",
   "embedImages.js",
+  "httpServer.js", // ← shared HTTP server factory (vps + render)
   "NotoSans-Subset.ttf",
   "b2p.js",
   "cache.js",
 ];
-
-// ── CLI arg ───────────────────────────────────────────────────────────────────
 
 const platform = process.argv[2];
 const SUPPORTED = ["vercel", "netlify", "render", "vps"];
@@ -48,16 +45,7 @@ if (!platform || !SUPPORTED.includes(platform)) {
   process.exit(1);
 }
 
-// ── Destination ───────────────────────────────────────────────────────────────
-
-// When invoked from within the platform directory (e.g. `cd vercel && npm run build`)
-// the cwd is the platform dir, so REPO_ROOT/../{platform}/lib works.
-// When invoked from repo root (e.g. CI), path is repo_root/{platform}/lib.
-// We resolve relative to REPO_ROOT so both cases work.
 const DEST_DIR = path.join(REPO_ROOT, platform, "lib");
-
-// ── Copy ──────────────────────────────────────────────────────────────────────
-
 fs.mkdirSync(DEST_DIR, { recursive: true });
 
 let copied = 0;
@@ -65,15 +53,12 @@ let skipped = 0;
 
 for (const file of CORE_FILES) {
   const src = path.join(CORE_DIR, file);
-
   if (!fs.existsSync(src)) {
     console.warn(`[build] WARNING: core/${file} not found — skipping`);
     skipped++;
     continue;
   }
-
-  const dest = path.join(DEST_DIR, file);
-  fs.copyFileSync(src, dest);
+  fs.copyFileSync(src, path.join(DEST_DIR, file));
   console.log(`[build] ${file} → ${platform}/lib/${file}`);
   copied++;
 }
@@ -82,11 +67,9 @@ console.log(
   `[build] Done. ${copied} file(s) copied to ${platform}/lib/${skipped > 0 ? ` (${skipped} skipped)` : ""}`,
 );
 
-// Verify the critical JS files are present
-const REQUIRED = ["fauxBold.js", "sharedRender.js"];
+const REQUIRED = ["fauxBold.js", "sharedRender.js", "httpServer.js"];
 for (const f of REQUIRED) {
-  const p = path.join(DEST_DIR, f);
-  if (!fs.existsSync(p)) {
+  if (!fs.existsSync(path.join(DEST_DIR, f))) {
     console.error(
       `[build] FATAL: ${f} missing from ${platform}/lib/ — build will fail at runtime`,
     );

@@ -1,175 +1,120 @@
-// render/discord.js — CF hub reporter
+// render/discord.js — local metrics + rate-limited Discord error alerts
 //
-// ENV VARS
-//   CF_NODE_ID           REQUIRED — must match the id in CF worker's getNodes().
-//                        Set to 'render' in Render dashboard env vars.
-//                        Without this, the Discord embed won't show metrics for
-//                        this node (names won't match).
-//   CF_REPORT_URL        Override hub URL (default: https://r-cf.spicydevs.xyz/report)
-//   RENDER_SERVICE_NAME  Auto-injected by Render.com (used as fallback display name only)
+// CF hub reporting not included — same reasoning as vps/discord.js.
+// Render.com nodes are short-lived containers; the CF worker observes health
+// by polling each node's /health endpoint directly.
+//
+// ENV VARS:
+//   CF_NODE_ID             optional — display name (must match CF registry id)
+//   RENDER_SERVICE_NAME    auto-set by Render.com
+//   DISCORD_WEBHOOK_URL    optional — critical errors POST here (rate-limited)
 
-import os from 'node:os';
+import os from "node:os";
 
-const CF_REPORT_URL = process.env.CF_REPORT_URL || 'https://r-cf.spicydevs.xyz/report';
+const NODE_NAME =
+  process.env.CF_NODE_ID ||
+  process.env.RENDER_SERVICE_NAME ||
+  process.env.NODE_NAME ||
+  os.hostname();
 
-// CF_NODE_ID MUST match the id key in the CF worker's getNodes() registry.
-// e.g. if CF worker has: add('render', 'Render', env.RENDER_NODE_URL)
-// then set CF_NODE_ID=render in Render's environment variables.
-const NODE_NAME = process.env.CF_NODE_ID
-               || process.env.RENDER_SERVICE_NAME
-               || os.hostname();
+const DISCORD_WEBHOOK = process.env.DISCORD_WEBHOOK_URL || null;
 
-const REPORT_INTERVAL_MS = 5 * 60_000;
-const MAX_JITTER_MS      = 60_000;
-const WINDOW_SIZE        = 2000;
+// ── Error-post rate limiter ───────────────────────────────────────────────────
 
-const _window = {
-  jobDurationsMs: [],
-  cpuSamples:     [],
-  memSamples:     [],
-  queueDepths:    [],
-  wsrvFallbacks:  0,
-  resvgFails:     0,
-  requests:       0,
-  errors:         0,
-};
+const ERR_WINDOW_MS = 5 * 60_000;
+const ERR_BURST_MAX = 3;
+const ERR_MIN_GAP_MS = 10_000;
+
+let _errCount = 0;
+let _errWindowEnd = 0;
+let _lastPost = 0;
+
+function _canPostDiscord() {
+  const now = Date.now();
+  if (now > _errWindowEnd) {
+    _errCount = 0;
+    _errWindowEnd = now + ERR_WINDOW_MS;
+  }
+  if (_errCount >= ERR_BURST_MAX) return false;
+  if (now - _lastPost < ERR_MIN_GAP_MS) return false;
+  return true;
+}
+
+// ── Stats (mutated by httpServer syncStats) ───────────────────────────────────
 
 export const stats = {
-  startedAt:  Date.now(),
+  startedAt: Date.now(),
   activeJobs: 0,
   queuedJobs: 0,
-  status:     'starting',
-  lastError:  null,
+  status: "starting",
+  lastError: null,
 };
 
-export function recordRequest()      { _window.requests++;                                                         }
-export function recordResvgFail()    { _window.resvgFails++;   stats.lastError = { message: 'resvg fail', ts: Date.now() }; }
-export function recordWsrvFallback() { _window.wsrvFallbacks++;                                                    }
-export function recordError(msg)     { _window.errors++;       stats.lastError = { message: msg, ts: Date.now() }; }
+// ── Counters ──────────────────────────────────────────────────────────────────
 
-export function recordJobDuration(ms) {
-  if (_window.jobDurationsMs.length < WINDOW_SIZE) _window.jobDurationsMs.push(ms);
+export function recordRequest() {
+  /* counted via pool.activeJobs */
+}
+export function recordJobDuration() {
+  /* future: local p95 histogram  */
+}
+export function recordResvgFail() {
+  stats.lastError = { message: "resvg fail", ts: Date.now() };
+}
+export function recordWsrvFallback() {
+  /* logged inline by server */
+}
+export function recordError(msg) {
+  stats.lastError = { message: msg, ts: Date.now() };
 }
 
-// ── CPU / memory sampler ──────────────────────────────────────────────────────
+// ── Discord webhook ───────────────────────────────────────────────────────────
 
-let _prevCpuSample = _takeCpuSample();
-
-function _takeCpuSample() {
-  return os.cpus().map(c => ({ ...c.times }));
-}
-
-setInterval(() => {
-  const next = _takeCpuSample();
-  let totalIdle = 0, totalBusy = 0;
-  next.forEach((cpu, i) => {
-    const prev = _prevCpuSample[i];
-    const idle = cpu.idle - prev.idle;
-    const busy = (cpu.user - prev.user) + (cpu.sys - prev.sys)
-               + (cpu.nice - prev.nice) + (cpu.irq - prev.irq);
-    totalIdle += idle;
-    totalBusy += busy;
-  });
-  const total  = totalIdle + totalBusy;
-  const cpuPct = total > 0 ? Math.round((totalBusy / total) * 100) : 0;
-  _prevCpuSample = next;
-
-  const memPct = Math.round(((os.totalmem() - os.freemem()) / os.totalmem()) * 100);
-
-  if (_window.cpuSamples.length  < WINDOW_SIZE) _window.cpuSamples.push(cpuPct);
-  if (_window.memSamples.length  < WINDOW_SIZE) _window.memSamples.push(memPct);
-  if (_window.queueDepths.length < WINDOW_SIZE) _window.queueDepths.push(stats.queuedJobs);
-}, 5_000);
-
-// ── Percentile helpers ────────────────────────────────────────────────────────
-
-function pct(sorted, p) {
-  if (sorted.length === 0) return 0;
-  return sorted[Math.max(0, Math.ceil((p / 100) * sorted.length) - 1)];
-}
-
-function summarise(arr) {
-  if (arr.length === 0) return { min: 0, max: 0, p50: 0, p95: 0, p99: 0, avg: 0, n: 0 };
-  const s   = [...arr].sort((a, b) => a - b);
-  const avg = Math.round(s.reduce((a, b) => a + b, 0) / s.length);
-  return { min: s[0], max: s[s.length - 1], p50: pct(s, 50), p95: pct(s, 95), p99: pct(s, 99), avg, n: s.length };
-}
-
-function flushWindow() {
-  const snap = {
-    ts:            Date.now(),
-    requests:      _window.requests,
-    errors:        _window.errors,
-    resvgFails:    _window.resvgFails,
-    wsrvFallbacks: _window.wsrvFallbacks,
-    jobDuration:   summarise(_window.jobDurationsMs),
-    cpu:           summarise(_window.cpuSamples),
-    mem:           summarise(_window.memSamples),
-    queueDepth:    summarise(_window.queueDepths),
-    cores:         os.cpus().length,
-    totalMemMB:    Math.round(os.totalmem() / 1024 / 1024),
-  };
-  _window.jobDurationsMs = [];
-  _window.cpuSamples     = [];
-  _window.memSamples     = [];
-  _window.queueDepths    = [];
-  _window.requests       = 0;
-  _window.errors         = 0;
-  _window.resvgFails     = 0;
-  _window.wsrvFallbacks  = 0;
-  return snap;
-}
-
-// ── CF Hub reporting ──────────────────────────────────────────────────────────
-
-async function reportToCF(type, extra = {}) {
+async function _postDiscord(title, description) {
+  if (!DISCORD_WEBHOOK || !_canPostDiscord()) return;
+  _errCount++;
+  _lastPost = Date.now();
   try {
-    await fetch(CF_REPORT_URL, {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({
-        type,
-        node:  NODE_NAME,
-        ts:    Date.now(),
-        stats: {
-          startedAt:  stats.startedAt,
-          activeJobs: stats.activeJobs,
-          queuedJobs: stats.queuedJobs,
-          status:     stats.status,
-          lastError:  stats.lastError,
-        },
-        ...extra,
+    await fetch(DISCORD_WEBHOOK, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        username: `Posterium Render — ${NODE_NAME}`,
+        embeds: [
+          {
+            title,
+            description: description?.slice(0, 2000),
+            color: 0xf87171,
+            timestamp: new Date().toISOString(),
+            footer: { text: NODE_NAME },
+          },
+        ],
       }),
       signal: AbortSignal.timeout(5_000),
     });
-  } catch (e) {
-    console.warn('[reporter] CF hub unreachable:', e.message);
+  } catch {
+    // fire-and-forget
   }
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-export async function logError(title, description, _fields = []) {
+export async function logError(title, description) {
   recordError(description);
-  await reportToCF('error', { title, description });
+  console.error(`[error] ${title}: ${description}`);
+  _postDiscord(title, description).catch(() => {});
 }
 
 export async function notifyOnline() {
-  stats.status = 'online';
-  console.log(`[reporter] Node name: "${NODE_NAME}" — must match CF worker registry id`);
-
-  const jitter = Math.floor(Math.random() * MAX_JITTER_MS);
-  await new Promise(r => setTimeout(r, jitter));
-  await reportToCF('online');
-
-  setInterval(async () => {
-    const snapshot = flushWindow();
-    stats.status   = snapshot.errors > 5 ? 'degraded' : 'online';
-    await reportToCF('metrics', { snapshot });
-  }, REPORT_INTERVAL_MS);
+  stats.status = "online";
+  console.log(`[reporter] Node "${NODE_NAME}" online — health at /health`);
 }
 
-export async function notifyOffline(reason = 'SIGTERM') {
-  stats.status = 'offline';
-  await reportToCF('offline', { reason, snapshot: flushWindow() });
+export async function notifyOffline(reason = "SIGTERM") {
+  stats.status = "offline";
+  console.log(`[reporter] Node "${NODE_NAME}" shutting down (${reason})`);
+  await _postDiscord(
+    "Node Offline",
+    `**${NODE_NAME}** shutting down: \`${reason}\``,
+  );
 }

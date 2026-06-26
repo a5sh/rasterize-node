@@ -3,13 +3,11 @@
 // Pterodactyl entry point — auto-fetches latest code from GitHub before starting.
 //
 // ENV VARS:
-//   GITHUB_REPO    REQUIRED  — "owner/repo" (e.g. "aayu5h/posterium-backend")
+//   GITHUB_REPO    REQUIRED  — "owner/repo" (e.g. "a5sh/rasterize-node")
 //   GITHUB_BRANCH  optional  — default "main"
 //   GITHUB_TOKEN   optional  — personal access token for private repos
 //   SKIP_UPDATE    optional  — set to "1" to skip update check (debug)
-//
-// On every restart: fetch latest SHA → compare → sync changed files → start server.js
-// No child processes. On restart Node clears the module cache, so fresh imports work.
+//   FORCE_SYNC     optional  — set to "1" to re-sync all files even if SHA matches
 
 import { writeFile, readFile, mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
@@ -25,17 +23,17 @@ const REPO = process.env.GITHUB_REPO || "a5sh/rasterize-node";
 const BRANCH = process.env.GITHUB_BRANCH || "main";
 const TOKEN = process.env.GITHUB_TOKEN || "";
 const SKIP_UPDATE = process.env.SKIP_UPDATE === "1";
+const FORCE_SYNC = process.env.FORCE_SYNC === "1";
 
-// AFTER
 const GH_RAW = `https://raw.githubusercontent.com/${REPO}/${BRANCH}`;
 const GH_API = `https://api.github.com/repos/${REPO}/commits/${BRANCH}`;
 const VERSION_FILE = join(__dir, ".version");
 
 // Files to sync on each restart.
 // Format: [localPath relative to ROOT, path in repo]
-// Core files (../core from vps/) are preferred by lib.js resolver over ./lib/ copies.
 const SYNC_FILES = [
   // VPS-specific
+  ["vps/index.js", "vps/index.js"], // self-update: picked up on NEXT restart
   ["vps/server.js", "vps/server.js"],
   ["vps/discord.js", "vps/discord.js"],
   ["vps/lib.js", "vps/lib.js"],
@@ -48,7 +46,8 @@ const SYNC_FILES = [
   ["core/iconCache.js", "core/iconCache.js"],
   ["core/b2p.js", "core/b2p.js"],
   ["core/embedImages.js", "core/embedImages.js"],
-  // Node registry (concurrency limits, feature flags, etc.)
+  ["core/httpServer.js", "core/httpServer.js"],
+  // Node registry
   ["assets/nodes.config.js", "assets/nodes.config.js"],
 ];
 
@@ -98,7 +97,6 @@ async function downloadFile(repoPath) {
 async function syncAllFiles(sha) {
   let ok = 0,
     fail = 0;
-
   for (const [localRel, repoPath] of SYNC_FILES) {
     const dest = join(ROOT, localRel);
     const dir = dirname(dest);
@@ -113,8 +111,6 @@ async function syncAllFiles(sha) {
       process.stderr.write(`[updater] ✗  ${repoPath} — ${e.message}\n`);
     }
   }
-
-  // Only record the new SHA if every file succeeded
   if (fail === 0) {
     await writeFile(VERSION_FILE, sha, "utf8");
   } else {
@@ -122,18 +118,16 @@ async function syncAllFiles(sha) {
       `[updater] ${fail} file(s) failed — version file NOT updated (will retry next restart)\n`,
     );
   }
-
   return { ok, fail };
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 async function main() {
-  const banner = `═══════════════════════════════════════
+  console.log(`═══════════════════════════════════════
   Posterium VPS  |  ${new Date().toISOString()}
   Repo: ${REPO || "(GITHUB_REPO not set)"}@${BRANCH}
-═══════════════════════════════════════`;
-  console.log(banner);
+═══════════════════════════════════════`);
 
   if (!REPO) {
     console.warn(
@@ -148,17 +142,18 @@ async function main() {
       const shortStored = stored ? stored.slice(0, 7) : "none";
       const shortLatest = latest.slice(0, 7);
 
-      if (stored === latest) {
+      if (!FORCE_SYNC && stored === latest) {
         console.log(`[updater] ✓ Already at latest  (${shortLatest})`);
       } else {
+        if (FORCE_SYNC)
+          console.log(`[updater] FORCE_SYNC=1 — re-syncing all files`);
         console.log(
           `[updater] Update available: ${shortStored} → ${shortLatest}`,
         );
         const t0 = Date.now();
         const { ok, fail } = await syncAllFiles(latest);
-        const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
         console.log(
-          `[updater] Sync complete in ${elapsed}s — ${ok} updated, ${fail} failed`,
+          `[updater] Sync complete in ${((Date.now() - t0) / 1000).toFixed(1)}s — ${ok} updated, ${fail} failed`,
         );
       }
     } catch (e) {
@@ -167,14 +162,11 @@ async function main() {
     }
   }
 
-  // Log the actual running version for clear restart confirmation in Pterodactyl console
   const runSha = await readStoredSha().catch(() => "unknown");
   console.log(
     `\n[updater] ► Starting server  version=${runSha?.slice(0, 7) ?? "unknown"}\n`,
   );
 
-  // Dynamic import — module cache is always cold on process restart,
-  // so this always loads the freshly-written server.js from disk.
   try {
     await import("./server.js");
   } catch (e) {
