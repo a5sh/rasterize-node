@@ -132,6 +132,7 @@ const T2_NODES = NODE_CONFIG.nodes
 
 // Module-level tuned concurrency limits written by auto-tune cron
 const _tunedLimits = new Map(); // nodeId → number
+let _lastDiscordUpdate = 0; // ADD THIS
 const {
   t1TimeoutMs = 5_000,
   t2TimeoutMs = 8_000,
@@ -737,7 +738,6 @@ async function _distributedRender(
         payloadKb,
         outcome: "success",
       });
-      // AFTER (both success paths — pass colo)
       return _buildImageResp(
         res,
         node.id,
@@ -1225,7 +1225,7 @@ export default {
       const allNodes = [...T1_NODES, ...T2_NODES];
       const liveHealth = await Promise.all(
         allNodes.map((n) =>
-          _fetchNodeHealth(n.url).then((h) => ({
+          _fetchNodeHealth(n.baseUrl).then((h) => ({
             id: n.id,
             health: h,
             emaMs: Math.round(_emaMs(n.id)),

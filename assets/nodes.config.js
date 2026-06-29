@@ -88,7 +88,7 @@ export default {
         apiPath: "/api/rasterize",
         supportsHealthCheck: true,
         useUrlPayload: false,
-        acceptsCompression: "gzip",
+        acceptsCompression: false,
       },
       zones: { NA_EAST: 2, NA_WEST: 2, NA_CENTRAL: 1, UNKNOWN: 2 },
     },
