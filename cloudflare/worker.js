@@ -131,7 +131,6 @@ const T2_NODES = NODE_CONFIG.nodes
   }));
 
 // Module-level tuned concurrency limits written by auto-tune cron
-const _tunedLimits = new Map(); // nodeId → number
 let _lastDiscordUpdate = 0; // ADD THIS
 const {
   t1TimeoutMs = 5_000,
@@ -144,7 +143,38 @@ const {
 } = NODE_CONFIG.settings;
 
 // ── Per-isolate health & EMA performance state ─────────────────────────────────
+// ADD near top of cloudflare/worker.js
+let _scoreCache = { data: {}, fetchedAt: 0 };
+const SCORE_CACHE_TTL_MS = 5_000;
 
+async function _refreshScores(env) {
+  if (Date.now() - _scoreCache.fetchedAt < SCORE_CACHE_TTL_MS)
+    return _scoreCache.data;
+  try {
+    const id = env.FLEET_HEALTH.idFromName("global");
+    const stub = env.FLEET_HEALTH.get(id);
+    const res = await stub.fetch("https://fleet-health.internal/scores");
+    _scoreCache = { data: await res.json(), fetchedAt: Date.now() };
+  } catch (_) {
+    /* keep stale cache on error */
+  }
+  return _scoreCache.data;
+}
+
+function _reportOutcome(env, ctx, nodeId, ok, ms) {
+  ctx.waitUntil(
+    (async () => {
+      try {
+        const id = env.FLEET_HEALTH.idFromName("global");
+        const stub = env.FLEET_HEALTH.get(id);
+        await stub.fetch("https://fleet-health.internal/report", {
+          method: "POST",
+          body: JSON.stringify({ nodeId, ok, ms }),
+        });
+      } catch (_) {}
+    })(),
+  );
+}
 /** nodeId → { count, windowEnd } */
 const _errMap = new Map();
 /** nodeId → current in-flight count */
@@ -185,8 +215,6 @@ function _isStressed(id) {
 function _isFailing(id) {
   return _errCount(id) >= failingThreshold;
 }
-
-// In-flight tracking
 function _acqIF(id) {
   _inflightMap.set(id, (_inflightMap.get(id) ?? 0) + 1);
 }
@@ -197,8 +225,7 @@ function _inFlight(id) {
   return _inflightMap.get(id) ?? 0;
 }
 function _atCapacity(n) {
-  const limit = _tunedLimits.get(n.id) ?? n.concurrencyLimit;
-  return limit !== null && _inFlight(n.id) >= limit;
+  return n.concurrencyLimit !== null && _inFlight(n.id) >= n.concurrencyLimit;
 }
 
 // EMA performance tracking
@@ -640,94 +667,131 @@ async function _distributedRender(
     embedded,
   });
 
-  // Step 2: T1 nodes (geo + EMA-score ordered)
+  // Step 2: T1 nodes with pair-racing concurrency
+  const HARD_WALL_MS = 5_000;
+  const wallDeadline = Math.min(maxWallTimeMs, HARD_WALL_MS);
   const ordered = _geoOrderNodes(colo);
 
-  for (const node of ordered) {
-    if (_timedOut()) {
-      _log("warn", "t1_wall_timeout_abort", {
-        elapsed: _elapsed(),
-        node: node.id,
-      });
-      break;
-    }
+  // Ensure wsrv is present as a fallback option within the pool if not already
+  const racePool = [...ordered];
+  if (!racePool.some((n) => n.id === "wsrv")) {
+    const wsrvNode = T1_NODES.find((n) => n.id === "wsrv");
+    if (wsrvNode) racePool.push(wsrvNode);
+  }
 
-    // Skip at-capacity nodes unless it's the last available one
-    if (_atCapacity(node) && ordered.indexOf(node) < ordered.length - 1) {
-      _log("info", "t1_skip_capacity", {
-        node: node.id,
-        inflight: _inFlight(node.id),
-        limit: node.concurrencyLimit,
-      });
+  const GROUP_SIZE = 2;
+
+  // Inline helper to preserve context and safely increment outer state
+  async function _raceGroup(nodes, budgetMs) {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), budgetMs);
+
+    const promises = nodes.map(async (node) => {
+      if (_atCapacity(node)) {
+        _log("info", "t1_skip_capacity", {
+          node: node.id,
+          inflight: _inFlight(node.id),
+        });
+        _logAttempt(env, {
+          nodeId: node.id,
+          format,
+          inputType,
+          colo,
+          outcome: "skipped",
+          errorReason: "at_capacity",
+          lane: "t1",
+          isWinner: false,
+          attemptMs: 0,
+          httpStatus: 0,
+          inflightCount: _inFlight(node.id),
+          payloadKb,
+        });
+        return { ok: false, node };
+      }
+
+      attemptsMade++;
+      const scoreAtSelection = Math.round(_nodeScore(node.id));
+      const t0 = Date.now();
+
+      const result = await _tryNode(
+        node,
+        embeddedSvg,
+        svgUrl,
+        format,
+        ac.signal,
+      );
+      const attemptMs = Date.now() - t0;
+
       _logAttempt(env, {
         nodeId: node.id,
         format,
         inputType,
         colo,
-        outcome: "skipped",
-        errorReason: "at_capacity",
-        lane: "t1",
-        isWinner: false,
-        attemptMs: 0,
-        httpStatus: 0,
-        inflightCount: _inFlight(node.id),
+        outcome: result.ok ? "success" : "failure",
+        errorReason: result.error,
+        lane: node.useUrlPayload ? "url_payload" : "t1_race",
+        isWinner: result.ok,
+        attemptMs,
+        httpStatus: result.status,
+        inflightCount: result.inflightAtStart,
         payloadKb,
+        nodeScore: scoreAtSelection,
       });
-      continue;
+
+      if (result.ok) {
+        _recordPerf(node.id, attemptMs);
+        _log("info", "t1_success", {
+          node: node.id,
+          attempt: attemptsMade,
+          attemptMs,
+        });
+      } else {
+        _log("warn", "t1_failed", {
+          node: node.id,
+          attempt: attemptsMade,
+          error: result.error,
+          attemptMs,
+        });
+      }
+
+      return { ...result, node, attemptMs };
+    });
+
+    try {
+      return await new Promise((resolve) => {
+        let remaining = promises.length;
+        if (remaining === 0) resolve({ ok: false });
+
+        promises.forEach((p) =>
+          p.then((r) => {
+            if (r.ok) {
+              ac.abort(); // Cancel the other runner in the pair immediately
+              resolve(r);
+            } else {
+              remaining--;
+              if (remaining === 0) resolve(r); // All items in this group failed
+            }
+          }),
+        );
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  // Execute race groups sequentially
+  for (let i = 0; i < racePool.length; i += GROUP_SIZE) {
+    if (Date.now() - tWall0 >= wallDeadline) {
+      _log("warn", "t1_race_wall_timeout_abort", { elapsed: _elapsed() });
+      break;
     }
 
-    attemptsMade++;
-    const inflightSnapshot = _inFlight(node.id);
-    // Respect max wall time for individual attempt timeout
-    const budget = Math.max(500, maxWallTimeMs - _elapsed() - 150);
-    const nodeTimeout = Math.min(t1TimeoutMs, budget);
+    const group = racePool.slice(i, i + GROUP_SIZE);
+    const remainingBudget = wallDeadline - _elapsed();
+    if (remainingBudget <= 200) break;
 
-    _log("info", "t1_attempt", {
-      node: node.id,
-      attempt: attemptsMade,
-      inflight: inflightSnapshot,
-      score: Math.round(_nodeScore(node.id)),
-      timeout: nodeTimeout,
-    });
-
-    const ac = new AbortController();
-    const tm = setTimeout(() => ac.abort(), nodeTimeout);
-    const scoreAtSelection = Math.round(_nodeScore(node.id)); // ← ADD before _tryNode
-
-    const t0 = Date.now();
-    const { ok, res, error, status, inflightAtStart } = await _tryNode(
-      node,
-      embeddedSvg,
-      svgUrl,
-      format,
-      ac.signal,
-    ).finally(() => clearTimeout(tm));
-    const attemptMs = Date.now() - t0;
-
-    _logAttempt(env, {
-      nodeId: node.id,
-      format,
-      inputType,
-      colo,
-      outcome: ok ? "success" : "failure",
-      errorReason: error,
-      lane: node.useUrlPayload ? "url_payload" : "t1",
-      isWinner: ok,
-      attemptMs,
-      httpStatus: status,
-      inflightCount: inflightAtStart,
-      payloadKb,
-      nodeScore: scoreAtSelection,
-    });
-
-    if (ok) {
-      _recordPerf(node.id, attemptMs);
-      _log("info", "t1_success", {
-        node: node.id,
-        attempt: attemptsMade,
-        attemptMs,
-        score: Math.round(_nodeScore(node.id)),
-      });
+    const winner = await _raceGroup(group, remainingBudget);
+    if (winner.ok) {
       _logRequest(env, {
         format,
         inputType,
@@ -739,21 +803,14 @@ async function _distributedRender(
         outcome: "success",
       });
       return _buildImageResp(
-        res,
-        node.id,
+        winner.res,
+        winner.node.id,
         attemptsMade,
         _elapsed(),
         embedMs,
         colo,
       );
     }
-
-    _log("warn", "t1_failed", {
-      node: node.id,
-      attempt: attemptsMade,
-      error,
-      attemptMs,
-    });
   }
 
   // Step 3: T2 extreme fallback (only if wall time budget remains)
@@ -913,7 +970,6 @@ async function _updateDashboard(env, isCron = false) {
   const fields = healths.map(({ id, type, h, supportsHealthCheck }) => {
     const perf = _perfMap.get(id);
     const limit =
-      _tunedLimits.get(id) ??
       T1_NODES.find((n) => n.id === id)?.concurrencyLimit ??
       T2_NODES.find((n) => n.id === id)?.concurrencyLimit ??
       null;
@@ -934,9 +990,6 @@ async function _updateDashboard(env, isCron = false) {
       perf
         ? `EMA: ${Math.round(perf.emaMs)}ms  Score: ${Math.round(_nodeScore(id))}  n=${perf.sampleCount}`
         : "No samples yet",
-      limit !== (T1_NODES.find((n) => n.id === id)?.concurrencyLimit ?? limit)
-        ? `⚡ Tuned limit: ${limit}`
-        : "",
     ]
       .filter(Boolean)
       .join("\n");
@@ -1073,93 +1126,8 @@ function _jsonError(status, msg) {
   });
 }
 
-// ADD new function
-async function _autoTuneLimits(env) {
-  const [accountId, apiToken] = await Promise.all([
-    resolveSecret(env.CF_ACCOUNT_ID),
-    resolveSecret(env.CF_API_TOKEN),
-  ]).catch(() => [null, null]);
-  if (!accountId || !apiToken) return;
-
-  const sql = `
-    SELECT
-      blob1                                                               AS node,
-      avg(double4)                                                        AS avg_inflight,
-      max(double4)                                                        AS max_inflight,
-      quantileTDigest(0.95)(double4)                                      AS p95_inflight,
-      count()                                                             AS total_attempts,
-      countIf(blob5 = 'success')                                         AS successes,
-      round(100.0 * countIf(blob5 = 'success') / count())               AS success_rate_pct,
-      avgIf(double1, blob5 = 'success')                                  AS avg_ms
-    FROM raster_metrics
-    WHERE timestamp > now() - INTERVAL '24' HOUR
-      AND blob1 != 'req' AND blob5 != 'skipped'
-    GROUP BY blob1
-    HAVING total_attempts > 50
-    ORDER BY node
-  `;
-
-  try {
-    const res = await fetch(
-      `https://api.cloudflare.com/client/v4/accounts/${accountId}/analytics_engine/sql`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${apiToken}`,
-          "Content-Type": "text/plain",
-        },
-        body: sql,
-      },
-    );
-    if (!res.ok) return;
-    const { data = [] } = await res.json();
-    const adjustments = {};
-
-    for (const row of data) {
-      const nodeId = row.node;
-      const n = [...T1_NODES, ...T2_NODES].find((x) => x.id === nodeId);
-      if (!n || n.concurrencyLimit === null) continue; // unlimited or unknown
-
-      const baseLine = n.concurrencyLimit;
-      const currentLim = _tunedLimits.get(nodeId) ?? baseLine;
-      const p95 = parseFloat(row.p95_inflight ?? 0);
-      const successPct = parseFloat(row.success_rate_pct ?? 0);
-      const avgMs = parseFloat(row.avg_ms ?? 9999);
-
-      // Raise limit: p95 inflight ≥ 85% of current limit AND success > 90% AND fast
-      if (p95 >= 0.85 * currentLim && successPct > 90 && avgMs < 3000) {
-        adjustments[nodeId] = Math.min(currentLim + 1, baseLine * 3);
-      }
-      // Lower limit: poor success rate
-      else if (successPct < 65 && currentLim > 1) {
-        adjustments[nodeId] = Math.max(1, Math.floor(currentLim * 0.75));
-      }
-      // Decay toward baseline when healthy (prevent runaway increases)
-      else if (currentLim > baseLine && successPct > 85) {
-        adjustments[nodeId] = Math.max(baseLine, currentLim - 1);
-      }
-    }
-
-    if (Object.keys(adjustments).length > 0) {
-      for (const [id, limit] of Object.entries(adjustments)) {
-        const prev =
-          _tunedLimits.get(id) ??
-          [...T1_NODES, ...T2_NODES].find((n) => n.id === id)?.concurrencyLimit;
-        _tunedLimits.set(id, limit);
-        _log("info", "auto_tune", { node: id, prev, next: limit });
-      }
-      await env.DASHBOARD_KV?.put(
-        "tuned_limits",
-        JSON.stringify(Object.fromEntries(_tunedLimits)),
-      ).catch(() => {});
-    }
-  } catch (e) {
-    _log("warn", "auto_tune_failed", { reason: e?.message });
-  }
-}
-
 // ── Main export ────────────────────────────────────────────────────────────────
-
+export { FleetHealth } from "./fleetHealth.js";
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -1303,23 +1271,7 @@ export default {
     );
   },
 
-  // AFTER
   async scheduled(_event, env, ctx) {
-    ctx.waitUntil(
-      (async () => {
-        // Load persisted tuned limits into module-level map
-        try {
-          const stored = await env.DASHBOARD_KV?.get("tuned_limits", {
-            type: "json",
-          });
-          if (stored && typeof stored === "object") {
-            for (const [id, limit] of Object.entries(stored))
-              _tunedLimits.set(id, limit);
-          }
-        } catch (_) {}
-
-        await Promise.all([_updateDashboard(env), _autoTuneLimits(env)]);
-      })(),
-    );
+    ctx.waitUntil(_updateDashboard(env));
   },
 };

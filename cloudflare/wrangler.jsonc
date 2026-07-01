@@ -16,10 +16,17 @@
   "kv_namespaces": [
     { "binding": "DASHBOARD_KV", "id": "c0547489012a48368146b53c1227f1f2" },
   ],
-  // Cron: refresh fleet Discord embed every 5 minutes regardless of node reports.
+  // AFTER
+  // Cron: refresh fleet Discord embed hourly. Nodes never push status to this
+  // worker — all health data is derived from live routing state / Analytics Engine.
   "triggers": {
     "crons": ["0 * * * *"],
   },
+
+  "durable_objects": {
+    "bindings": [{ "binding": "FLEET_HEALTH", "class_name": "FleetHealth" }],
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["FleetHealth"] }],
   // Node URLs — set real values with: wrangler vars set KEY value
   // Or set in the Cloudflare dashboard under Workers > Settings > Variables.
   // DISCORD_WEBHOOK_URL must be set as a secret:

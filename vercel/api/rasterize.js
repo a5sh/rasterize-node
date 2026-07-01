@@ -4,7 +4,20 @@
 //       icon placeholder expansion removed (main API worker pre-expands icons)
 //       embedExternalImages moved to shared lib/embedImages.js
 
+// AFTER
+import { gunzipSync } from "node:zlib";
 import { Resvg } from "@resvg/resvg-js";
+
+function decompressBody(buf, encoding) {
+  if (encoding === "gzip") {
+    try {
+      return gunzipSync(buf).toString("utf8");
+    } catch {
+      /* fall through */
+    }
+  }
+  return buf.toString("utf8");
+}
 import { applyFauxBold } from "../lib/fauxBold.js";
 import { buildResvgOpts } from "../lib/sharedRender.js";
 import { iconCacheStatus } from "../lib/iconCache.js";
@@ -219,9 +232,11 @@ export default async function handler(req, res) {
     }
 
     // Raw SVG POST (no gzip: vercel has acceptsCompression: false)
+    // AFTER
     if (!bodyBuf.length) return sendJson(res, 400, { error: "Empty SVG body" });
     recordRequest();
-    const svgText = bodyBuf.toString("utf8");
+    const encoding = (req.headers["x-svg-encoding"] || "").toLowerCase();
+    const svgText = decompressBody(bodyBuf, encoding);
     try {
       const { buffer, mimeType } = await renderAndRecord(svgText, format);
       maybeReport(NODE_NAME).catch(() => {});
