@@ -520,6 +520,10 @@ async function _tryNode(node, svgText, svgUrl, format, signal) {
     _recordOk(node.id);
     return { ok: true, res, error: "", status: res.status, inflightAtStart };
   } catch (e) {
+    // AbortError is expected/benign here — either our own budget timeout
+    // fired, or this racer lost the pair and ac.abort() cancelled it.
+    // Never record it as a node error (it's not the node's fault) and
+    // never let it escape uncaught.
     if (e?.name !== "AbortError") _recordErr(node.id);
     return {
       ok: false,
@@ -766,19 +770,21 @@ async function _distributedRender(
           p
             .then((r) => {
               if (r.ok) {
-                ac.abort();
+                ac.abort(); // Cancel the other runner in the pair immediately
                 resolve(r);
               } else {
                 remaining--;
-                if (remaining === 0) resolve(r);
+                if (remaining === 0) resolve(r); // All items in this group failed
               }
             })
             .catch((err) => {
-              // Guards against a stray unhandled rejection (e.g. AbortError firing
-              // outside _tryNode's own try/catch during teardown) crashing the
-              // isolate with outcome:"exception" instead of returning a Response.
+              // Defensive: _tryNode never rejects internally, but a rejection
+              // that lands after abort() has already fired (loser's fetch
+              // throwing AbortError post-resolve) was surfacing as an
+              // uncaught exception on the isolate (outcome:"exception")
+              // even though a valid response had already been returned.
               remaining--;
-              _log("warn", "race_promise_rejected", {
+              _log("warn", "race_promise_settle_error", {
                 reason: err?.message || String(err),
               });
               if (remaining === 0) resolve({ ok: false });
@@ -854,7 +860,7 @@ async function _distributedRender(
       .catch((err) => ({
         ok: false,
         res: null,
-        error: `throw:${err?.message?.slice(0, 60)}`,
+        error: `throw:${err?.message?.slice(0, 60) || "unknown"}`,
         status: 0,
         inflightAtStart: 0,
       }))
