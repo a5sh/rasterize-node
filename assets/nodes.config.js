@@ -81,6 +81,7 @@ export default {
         description: "Serverless — Ohio, US",
         tier: 1,
       },
+      // AFTER
       features: {
         inLbWorker: true,
         isLbFallback: false,
@@ -88,7 +89,7 @@ export default {
         apiPath: "/api/rasterize",
         supportsHealthCheck: true,
         useUrlPayload: false,
-        acceptsCompression: false,
+        acceptsCompression: "gzip", // netlify/functions/rasterize.js already handles x-svg-encoding: gzip
       },
       zones: { NA_EAST: 2, NA_WEST: 2, NA_CENTRAL: 1, UNKNOWN: 2 },
     },
