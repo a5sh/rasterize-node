@@ -763,15 +763,26 @@ async function _distributedRender(
         if (remaining === 0) resolve({ ok: false });
 
         promises.forEach((p) =>
-          p.then((r) => {
-            if (r.ok) {
-              ac.abort(); // Cancel the other runner in the pair immediately
-              resolve(r);
-            } else {
+          p
+            .then((r) => {
+              if (r.ok) {
+                ac.abort();
+                resolve(r);
+              } else {
+                remaining--;
+                if (remaining === 0) resolve(r);
+              }
+            })
+            .catch((err) => {
+              // Guards against a stray unhandled rejection (e.g. AbortError firing
+              // outside _tryNode's own try/catch during teardown) crashing the
+              // isolate with outcome:"exception" instead of returning a Response.
               remaining--;
-              if (remaining === 0) resolve(r); // All items in this group failed
-            }
-          }),
+              _log("warn", "race_promise_rejected", {
+                reason: err?.message || String(err),
+              });
+              if (remaining === 0) resolve({ ok: false });
+            }),
         );
       });
     } finally {
@@ -839,7 +850,15 @@ async function _distributedRender(
       svgUrl,
       format,
       ac.signal,
-    ).finally(() => clearTimeout(tm));
+    )
+      .catch((err) => ({
+        ok: false,
+        res: null,
+        error: `throw:${err?.message?.slice(0, 60)}`,
+        status: 0,
+        inflightAtStart: 0,
+      }))
+      .finally(() => clearTimeout(tm));
     const attemptMs = Date.now() - t0;
 
     _logAttempt(env, {
