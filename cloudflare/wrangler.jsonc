@@ -44,8 +44,8 @@
     "VPS1_NODE_URL": "http://node-3.midas.host:25108",
     "VPS2_NODE_URL": "http://de20.spaceify.eu:26100",
     "VPS3_NODE_URL": "http://fr1.spaceify.eu:25980/",
-    "DISCORD_WEBHOOK_URL": "https://discord.com/api/webhooks/1484521396326502511/hOSVLWiK3MKCXzzwujgYtIa6zOiTkHnjO4GmGYvTeGTLmBjEO0kTvs5x4ySWFC4htpg5",
-    "ALERTS_WEBHOOK_URL": "https://discord.com/api/webhooks/1484521396326502511/hOSVLWiK3MKCXzzwujgYtIa6zOiTkHnjO4GmGYvTeGTLmBjEO0kTvs5x4ySWFC4htpg5",
+    "DISCORD_WEBHOOK_URL": "https://discord.com/api/webhooks/1522125036109037703/ruJNatLHEuArZNkFxAY5oF2pupds5JALnqhwn18yUdzexyFtZxARQnAmyYAe77YThfw3",
+    "ALERTS_WEBHOOK_URL": "https://discord.com/api/webhooks/1522125036109037703/ruJNatLHEuArZNkFxAY5oF2pupds5JALnqhwn18yUdzexyFtZxARQnAmyYAe77YThfw3",
   },
   "rules": [
     {
