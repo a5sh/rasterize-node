@@ -12,27 +12,27 @@
 //
 // Crash-restart uses exponential backoff (200 ms → 30 s) to prevent spawn storms.
 
-import { Worker } from 'node:worker_threads';
+import { Worker } from "node:worker_threads";
 
-const HEALTHY_UPTIME_MS    = 5_000;
-const BASE_BACKOFF_MS      =   200;
-const MAX_BACKOFF_MS       = 30_000;
-const MAX_PENDING_RESPAWNS =     2;
+const HEALTHY_UPTIME_MS = 5_000;
+const BASE_BACKOFF_MS = 200;
+const MAX_BACKOFF_MS = 30_000;
+const MAX_PENDING_RESPAWNS = 2;
 
 export class RenderPool {
   constructor(workerPath, serverDir, size, resvgOpts) {
-    if (!workerPath) throw new Error('RenderPool: workerPath is required');
-    if (!serverDir)  throw new Error('RenderPool: serverDir is required');
+    if (!workerPath) throw new Error("RenderPool: workerPath is required");
+    if (!serverDir) throw new Error("RenderPool: serverDir is required");
 
-    this._workerPath      = workerPath;
-    this._serverDir       = serverDir;
-    this._resvgOpts       = resvgOpts;
-    this._size            = size;
-    this._workers         = [];
-    this._queue           = [];
-    this._inflight        = new Map();
-    this._seq             = 0;
-    this._failureCounts   = new Map();
+    this._workerPath = workerPath;
+    this._serverDir = serverDir;
+    this._resvgOpts = resvgOpts;
+    this._size = size;
+    this._workers = [];
+    this._queue = [];
+    this._inflight = new Map();
+    this._seq = 0;
+    this._failureCounts = new Map();
     this._pendingRespawns = 0;
 
     for (let i = 0; i < size; i++) this._spawn(i);
@@ -44,32 +44,40 @@ export class RenderPool {
       workerData: { resvgOpts: this._resvgOpts, serverDir: this._serverDir },
     });
     w._busy = false;
-    w._wid  = ++this._seq;
+    w._wid = ++this._seq;
     w._slot = slot;
 
-    w.on('message', msg => {
+    w.on("message", (msg) => {
       const prom = this._inflight.get(msg.jobId);
       this._inflight.delete(msg.jobId);
       w._busy = false;
       this._drain(w);
       if (!prom) return;
       if (msg.error) prom.reject(new Error(msg.error));
-      else           prom.resolve({ buffer: Buffer.from(msg.buffer), mimeType: msg.mimeType });
+      else
+        prom.resolve({
+          buffer: Buffer.from(msg.buffer),
+          mimeType: msg.mimeType,
+        });
     });
 
-    w.on('error', err => {
-      const n       = this._recordFailure(slot, Date.now() - spawnedAt);
+    w.on("error", (err) => {
+      const n = this._recordFailure(slot, Date.now() - spawnedAt);
       const backoff = this._calcBackoff(n);
-      console.error(`[pool] Worker ${w._wid} slot=${slot} error — respawn in ${backoff}ms (fail #${n}): ${err.message}`);
+      console.error(
+        `[pool] Worker ${w._wid} slot=${slot} error — respawn in ${backoff}ms (fail #${n}): ${err.message}`,
+      );
       this._evict(w);
       this._scheduleRespawn(slot, backoff);
     });
 
-    w.on('exit', code => {
+    w.on("exit", (code) => {
       if (code === 0) return;
-      const n       = this._recordFailure(slot, Date.now() - spawnedAt);
+      const n = this._recordFailure(slot, Date.now() - spawnedAt);
       const backoff = this._calcBackoff(n);
-      console.error(`[pool] Worker ${w._wid} slot=${slot} exit ${code} — respawn in ${backoff}ms (fail #${n})`);
+      console.error(
+        `[pool] Worker ${w._wid} slot=${slot} exit ${code} — respawn in ${backoff}ms (fail #${n})`,
+      );
       this._evict(w);
       this._scheduleRespawn(slot, backoff);
     });
@@ -85,18 +93,26 @@ export class RenderPool {
   }
 
   _calcBackoff(failures) {
-    const base   = Math.min(BASE_BACKOFF_MS * Math.pow(2, failures - 1), MAX_BACKOFF_MS);
+    const base = Math.min(
+      BASE_BACKOFF_MS * Math.pow(2, failures - 1),
+      MAX_BACKOFF_MS,
+    );
     const jitter = base * 0.2 * Math.random();
     return Math.round(base + jitter);
   }
 
   _scheduleRespawn(slot, delayMs) {
     if (this._pendingRespawns >= MAX_PENDING_RESPAWNS) {
-      console.warn(`[pool] slot=${slot} respawn skipped — ${this._pendingRespawns} already pending`);
+      console.warn(
+        `[pool] slot=${slot} respawn skipped — ${this._pendingRespawns} already pending`,
+      );
       return;
     }
     this._pendingRespawns++;
-    setTimeout(() => { this._pendingRespawns--; this._spawn(slot); }, delayMs);
+    setTimeout(() => {
+      this._pendingRespawns--;
+      this._spawn(slot);
+    }, delayMs);
   }
 
   _evict(w) {
@@ -107,30 +123,43 @@ export class RenderPool {
   _dispatch(worker, job) {
     worker._busy = true;
     this._inflight.set(job.jobId, { resolve: job.resolve, reject: job.reject });
-    worker.postMessage({ jobId: job.jobId, svgText: job.svgText, format: job.format });
+    worker.postMessage({
+      jobId: job.jobId,
+      svgText: job.svgText,
+      format: job.format,
+    });
   }
 
   _drain(worker) {
     if (this._queue.length > 0) this._dispatch(worker, this._queue.shift());
   }
 
-  render(svgText, format = 'png') {
+  render(svgText, format = "png") {
     return new Promise((resolve, reject) => {
       const jobId = ++this._seq;
-      const free  = this._workers.find(w => !w._busy);
-      if (free) this._dispatch(free, { jobId, svgText, format, resolve, reject });
-      else      this._queue.push({ jobId, svgText, format, resolve, reject });
+      const free = this._workers.find((w) => !w._busy);
+      if (free)
+        this._dispatch(free, { jobId, svgText, format, resolve, reject });
+      else this._queue.push({ jobId, svgText, format, resolve, reject });
     });
   }
 
-  get activeJobs()      { return this._workers.filter(w => w._busy).length; }
-  get queuedJobs()      { return this._queue.length; }
-  get workerCount()     { return this._workers.length; }
-  get pendingRespawns() { return this._pendingRespawns; }
+  get activeJobs() {
+    return this._workers.filter((w) => w._busy).length;
+  }
+  get queuedJobs() {
+    return this._queue.length;
+  }
+  get workerCount() {
+    return this._workers.length;
+  }
+  get pendingRespawns() {
+    return this._pendingRespawns;
+  }
 
   async destroy() {
-    await Promise.all(this._workers.map(w => w.terminate()));
+    await Promise.all(this._workers.map((w) => w.terminate()));
     this._workers = [];
-    this._queue   = [];
+    this._queue = [];
   }
 }

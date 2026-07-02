@@ -22,8 +22,8 @@ function styleValue(tag, prop) {
   const styleAttr = tag.match(/\bstyle=["']([^"']*)["']/i);
   if (!styleAttr) return null;
   // Match   ;font-weight: bold   or   font-weight:bold   at start of style
-  const re = new RegExp(`(?:^|;)\\s*${prop}\\s*:\\s*([^;]+)`, 'i');
-  const m  = styleAttr[1].match(re);
+  const re = new RegExp(`(?:^|;)\\s*${prop}\\s*:\\s*([^;]+)`, "i");
+  const m = styleAttr[1].match(re);
   return m ? m[1].trim() : null;
 }
 
@@ -36,7 +36,7 @@ function isBold(tag) {
   if (attr && BOLD_WEIGHT_RE.test(attr[1])) return true;
 
   // Inside style="…":  style="font-weight: bold"
-  const sv = styleValue(tag, 'font-weight');
+  const sv = styleValue(tag, "font-weight");
   if (sv && BOLD_WEIGHT_RE.test(sv)) return true;
 
   return false;
@@ -46,11 +46,11 @@ function isBold(tag) {
 function hasStroke(tag) {
   // Bare stroke attribute that is not "none"
   const strokeAttr = tag.match(/\bstroke=["']([^"']*)["']/i);
-  if (strokeAttr && strokeAttr[1] !== 'none') return true;
+  if (strokeAttr && strokeAttr[1] !== "none") return true;
 
   // stroke inside style
-  const sv = styleValue(tag, 'stroke');
-  if (sv && sv !== 'none') return true;
+  const sv = styleValue(tag, "stroke");
+  if (sv && sv !== "none") return true;
 
   return false;
 }
@@ -60,10 +60,10 @@ function strokeColor(tag) {
   const fillAttr = tag.match(/\bfill=["']([^"']+)["']/i);
   if (fillAttr) return fillAttr[1];
 
-  const sv = styleValue(tag, 'fill');
+  const sv = styleValue(tag, "fill");
   if (sv) return sv;
 
-  return 'currentColor';
+  return "currentColor";
 }
 
 // ── Main export ───────────────────────────────────────────────────────────────
@@ -79,7 +79,7 @@ function strokeColor(tag) {
  * @param {string} [sw]      CSS stroke-width  (default: '0.035em')
  * @returns {string}
  */
-export function applyFauxBold(svgText, sw = '0.035em') {
+export function applyFauxBold(svgText, sw = "0.035em") {
   // WHY TWO PASSES
   // ──────────────
   // A single combined regex /(<(?:text|tspan)…)>…<\/(?:text|tspan)>/g is
@@ -92,24 +92,25 @@ export function applyFauxBold(svgText, sw = '0.035em') {
   // modified tspan body, and hasStroke() will correctly skip it).
 
   function enhance(openTag, body, closeTag) {
-    if (!isBold(openTag))   return `${openTag}>${body}</${closeTag}>`;
+    if (!isBold(openTag)) return `${openTag}>${body}</${closeTag}>`;
     if (hasStroke(openTag)) return `${openTag}>${body}</${closeTag}>`;
-    const col      = strokeColor(openTag);
-    const enhanced = `${openTag} stroke="${col}" stroke-width="${sw}"` +
-                     ` stroke-linejoin="round" paint-order="stroke fill"`;
+    const col = strokeColor(openTag);
+    const enhanced =
+      `${openTag} stroke="${col}" stroke-width="${sw}"` +
+      ` stroke-linejoin="round" paint-order="stroke fill"`;
     return `${enhanced}>${body}</${closeTag}>`;
   }
 
   // Pass 1 — <tspan> elements (innermost first)
   const pass1 = svgText.replace(
     /(<tspan(?:\s[^>]*)?)>([\s\S]*?)<\/tspan>/gi,
-    (_, openTag, body) => enhance(openTag, body, 'tspan'),
+    (_, openTag, body) => enhance(openTag, body, "tspan"),
   );
 
   // Pass 2 — <text> elements (body now contains already-processed tspans)
   return pass1.replace(
     /(<text(?:\s[^>]*)?)>([\s\S]*?)<\/text>/gi,
-    (_, openTag, body) => enhance(openTag, body, 'text'),
+    (_, openTag, body) => enhance(openTag, body, "text"),
   );
 }
 

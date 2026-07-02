@@ -20,27 +20,27 @@ const FETCH_TIMEOUT_MS = 8_000;
  */
 export async function embedExternalImages(
   svgText,
-  userAgent = 'SpicyDevs-Rasterizer/1.0',
+  userAgent = "SpicyDevs-Rasterizer/1.0",
 ) {
   const matches = [...svgText.matchAll(EXTERNAL_IMG_RE)];
   if (matches.length === 0) return svgText;
 
-  const uniqueUrls = [...new Set(matches.map(m => m[1]))];
+  const uniqueUrls = [...new Set(matches.map((m) => m[1]))];
 
   const replacements = await Promise.all(
-    uniqueUrls.map(async url => {
+    uniqueUrls.map(async (url) => {
       const ac = new AbortController();
-      const t  = setTimeout(() => ac.abort(), FETCH_TIMEOUT_MS);
+      const t = setTimeout(() => ac.abort(), FETCH_TIMEOUT_MS);
       try {
         const res = await fetch(url, {
-          signal:  ac.signal,
-          headers: { 'User-Agent': userAgent },
+          signal: ac.signal,
+          headers: { "User-Agent": userAgent },
         });
         clearTimeout(t);
         if (!res.ok) return { url, dataUri: null };
         const buf = Buffer.from(await res.arrayBuffer());
-        const ct  = res.headers.get('content-type') || 'image/jpeg';
-        return { url, dataUri: `data:${ct};base64,${buf.toString('base64')}` };
+        const ct = res.headers.get("content-type") || "image/jpeg";
+        return { url, dataUri: `data:${ct};base64,${buf.toString("base64")}` };
       } catch {
         clearTimeout(t);
         return { url, dataUri: null };
@@ -49,7 +49,8 @@ export async function embedExternalImages(
   );
 
   for (const { url, dataUri } of replacements) {
-    if (dataUri) svgText = svgText.split(`href="${url}"`).join(`href="${dataUri}"`);
+    if (dataUri)
+      svgText = svgText.split(`href="${url}"`).join(`href="${dataUri}"`);
   }
   return svgText;
 }

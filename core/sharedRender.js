@@ -15,10 +15,10 @@
 // NotoSans-Subset.ttf is copied alongside it so the path.join(_moduleDir, …)
 // reference resolves correctly in both local dev and production bundles.
 
-import fs   from 'node:fs';
-import os   from 'node:os';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 // ── Module directory resolution ───────────────────────────────────────────────
 //
@@ -37,21 +37,27 @@ import { fileURLToPath } from 'node:url';
 //
 // eslint-disable-next-line no-undef
 const _moduleDir = (() => {
-  if (typeof __dirname !== 'undefined') return __dirname;           // NFT CJS
-  if (typeof import.meta?.url === 'string') {
-    try { return path.dirname(fileURLToPath(import.meta.url)); } catch { /* fall */ }
+  if (typeof __dirname !== "undefined") return __dirname; // NFT CJS
+  if (typeof import.meta?.url === "string") {
+    try {
+      return path.dirname(fileURLToPath(import.meta.url));
+    } catch {
+      /* fall */
+    }
   }
-  return process.cwd();                                             // last resort
+  return process.cwd(); // last resort
 })();
 
 // Resolved once at module load; null if the font file is missing.
 const FONT_SRC = (() => {
-  const p = path.join(_moduleDir, 'NotoSans-Subset.ttf');
+  const p = path.join(_moduleDir, "NotoSans-Subset.ttf");
   try {
     fs.accessSync(p, fs.constants.R_OK);
     return p;
   } catch {
-    console.error('[sharedRender] NotoSans-Subset.ttf not found next to sharedRender.js');
+    console.error(
+      "[sharedRender] NotoSans-Subset.ttf not found next to sharedRender.js",
+    );
     return null;
   }
 })();
@@ -70,9 +76,9 @@ let _tmpFontPath = null;
  */
 export function getFontPath() {
   if (_tmpFontPath) return _tmpFontPath;
-  if (!FONT_SRC)    return null;
+  if (!FONT_SRC) return null;
 
-  const dst = path.join(os.tmpdir(), 'NotoSans-Subset.ttf');
+  const dst = path.join(os.tmpdir(), "NotoSans-Subset.ttf");
   try {
     // Skip write if already there and non-empty (warm lambda / warm container).
     const stat = fs.existsSync(dst) && fs.statSync(dst);
@@ -100,17 +106,17 @@ export function getFontPath() {
 export function buildResvgOpts() {
   const fontPath = getFontPath();
   const fontConf = {
-    loadSystemFonts:   false,
-    defaultFontFamily: 'Noto Sans',
-    sansSerifFamily:   'Noto Sans',
-    serifFamily:       'Noto Sans',
-    monospaceFamily:   'Noto Sans',
+    loadSystemFonts: false,
+    defaultFontFamily: "Noto Sans",
+    sansSerifFamily: "Noto Sans",
+    serifFamily: "Noto Sans",
+    monospaceFamily: "Noto Sans",
   };
   if (fontPath) fontConf.fontFiles = [fontPath];
 
   return {
-    fitTo:          { mode: 'original' },
+    fitTo: { mode: "original" },
     imageRendering: 0,
-    font:           fontConf,
+    font: fontConf,
   };
 }
