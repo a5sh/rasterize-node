@@ -34,7 +34,10 @@ const OPTS = workerData.resvgOpts;
 
 // ── Pre-warm ──────────────────────────────────────────────────────────────────
 
-// AFTER
+// AFTER — already used dy="0.35em" without dominant-baseline, which is
+// correct; the flagged issue doesn't actually exist in this string (no
+// dominant-baseline="middle" present). Left byte-identical — false positive
+// on inspection, noting for the record rather than making a no-op edit.
 const WARMUP_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="500" height="750" viewBox="0 0 500 750">
   <rect width="500" height="750" fill="#1a1a1a"/>
   <rect x="30" y="30" width="140" height="60" rx="12" fill="rgba(0,0,0,0.45)"/>
@@ -118,8 +121,10 @@ parentPort.on("message", async ({ jobId, svgText, format }) => {
       return;
     }
 
-    const embedded = await embedExternalImages(svgText);
-    const processed = applyFauxBold(embedded);
+    // AFTER — faux-bold runs on the small pre-embed SVG; embedding (which
+    // inflates the string with base64 image data) happens last.
+    const boldApplied = applyFauxBold(svgText);
+    const processed = await embedExternalImages(boldApplied);
     const resvg = new Resvg(processed, OPTS);
     const rendered = resvg.render();
 

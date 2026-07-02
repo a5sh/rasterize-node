@@ -35,13 +35,15 @@ function decompressBody(buf, encoding) {
 
 // ── Render pipeline ───────────────────────────────────────────────────────────
 
+// AFTER
 async function renderToBuffer(svgText, format) {
-  // Icons are already expanded by the main API worker — no expansion needed.
-  const embedded = await embedExternalImages(
-    svgText,
+  // Faux-bold runs on the small pre-embed SVG first; embedding (base64
+  // inflation) happens last so the regex passes never scan image data.
+  const boldApplied = applyFauxBold(svgText);
+  const processed = await embedExternalImages(
+    boldApplied,
     "SpicyDevs-Rasterizer/7.2",
   );
-  const processed = applyFauxBold(embedded);
   const resvg = new Resvg(processed, RESVG_OPTS);
   const rendered = resvg.render();
 

@@ -31,6 +31,12 @@
   // Or set in the Cloudflare dashboard under Workers > Settings > Variables.
   // DISCORD_WEBHOOK_URL must be set as a secret:
   //   wrangler secret put DISCORD_WEBHOOK_URL
+  // AFTER — separate alerts webhook so a flapping node during a real incident
+  // doesn't bury the hourly dashboard channel. Set the real webhook URL via
+  // `wrangler secret put ALERTS_WEBHOOK_URL` — left as a var placeholder here
+  // since I don't have a real URL to put; swap to secrets_store_secrets if
+  // preferred, matching CF_ACCOUNT_ID/CF_API_TOKEN's pattern in the main
+  // wrangler.jsonc.
   "vars": {
     "VERCEL_NODE_URL": "https://us-r-vercel.vercel.app",
     "NETLIFY_NODE_URL": "https://r-netlify.netlify.app",
@@ -39,6 +45,7 @@
     "VPS2_NODE_URL": "http://de20.spaceify.eu:26100",
     "VPS3_NODE_URL": "http://fr1.spaceify.eu:25980/",
     "DISCORD_WEBHOOK_URL": "https://discord.com/api/webhooks/1484521396326502511/hOSVLWiK3MKCXzzwujgYtIa6zOiTkHnjO4GmGYvTeGTLmBjEO0kTvs5x4ySWFC4htpg5",
+    "ALERTS_WEBHOOK_URL": "https://discord.com/api/webhooks/1484521396326502511/hOSVLWiK3MKCXzzwujgYtIa6zOiTkHnjO4GmGYvTeGTLmBjEO0kTvs5x4ySWFC4htpg5",
   },
   "rules": [
     {
