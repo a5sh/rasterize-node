@@ -687,10 +687,29 @@ async function _distributedRender(
 
   // Inline helper to preserve context and safely increment outer state
   async function _raceGroup(nodes, budgetMs) {
-    const ac = new AbortController();
-    const timer = setTimeout(() => ac.abort(), budgetMs);
+    // FIX: previously ONE AbortController was shared by every racer in the
+    // pair. The moment a winner resolved we called ac.abort() to cancel the
+    // loser — but the winner's own in-flight fetch used that *same* signal,
+    // so the abort ALSO tore down the winner's still-streaming response
+    // body. Reading that body later (while proxying it back through Worker
+    // A) threw "The operation was aborted" outside any try/catch here —
+    // exactly the uncaught AbortError + outcome:"exception" in the
+    // rasterize worker logs, and "Rasterizer binding threw" one hop up.
+    //
+    // Fix: one controller per racer. On a win, abort every OTHER racer's
+    // controller — never the winner's — so its body stream survives.
+    const nodeControllers = nodes.map(() => new AbortController());
+    let winnerIdx = -1;
 
-    const promises = nodes.map(async (node) => {
+    const abortLosers = (exceptIdx) => {
+      nodeControllers.forEach((c, i) => {
+        if (i !== exceptIdx && !c.signal.aborted) c.abort();
+      });
+    };
+
+    const timer = setTimeout(() => abortLosers(winnerIdx), budgetMs);
+
+    const promises = nodes.map(async (node, idx) => {
       if (_atCapacity(node)) {
         _log("info", "t1_skip_capacity", {
           node: node.id,
@@ -714,6 +733,12 @@ async function _distributedRender(
       }
 
       attemptsMade++;
+      // Capture this racer's own attempt number NOW. Both racers in a pair
+      // increment attemptsMade synchronously before either awaits, so
+      // reading the shared counter later (at log time) made both racers'
+      // logs report the same final value — this is why your logs show
+      // BOTH washington and ohio as "attempt: 2" in the same group.
+      const myAttemptNum = attemptsMade;
       const scoreAtSelection = Math.round(_nodeScore(node.id));
       const t0 = Date.now();
 
@@ -722,7 +747,7 @@ async function _distributedRender(
         embeddedSvg,
         svgUrl,
         format,
-        ac.signal,
+        nodeControllers[idx].signal,
       );
       const attemptMs = Date.now() - t0;
 
@@ -746,13 +771,13 @@ async function _distributedRender(
         _recordPerf(node.id, attemptMs);
         _log("info", "t1_success", {
           node: node.id,
-          attempt: attemptsMade,
+          attempt: myAttemptNum,
           attemptMs,
         });
       } else {
         _log("warn", "t1_failed", {
           node: node.id,
-          attempt: attemptsMade,
+          attempt: myAttemptNum,
           error: result.error,
           attemptMs,
         });
@@ -766,11 +791,14 @@ async function _distributedRender(
         let remaining = promises.length;
         if (remaining === 0) resolve({ ok: false });
 
-        promises.forEach((p) =>
+        promises.forEach((p, idx) =>
           p
             .then((r) => {
               if (r.ok) {
-                ac.abort(); // Cancel the other runner in the pair immediately
+                // Cancel every OTHER racer — never this one — so the
+                // winner's response body is never torn down mid-stream.
+                winnerIdx = idx;
+                abortLosers(idx);
                 resolve(r);
               } else {
                 remaining--;
