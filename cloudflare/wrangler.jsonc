@@ -16,6 +16,21 @@
   "kv_namespaces": [
     { "binding": "DASHBOARD_KV", "id": "c0547489012a48368146b53c1227f1f2" },
   ],
+
+  "analytics_engine_datasets": [
+    {
+      // Rasterizer node performance metrics (existing)
+      "binding": "RASTER_METRICS",
+      "dataset": "raster_metrics"
+    },
+    {
+      // Per-request analytics including edge cache hits (new in v2)
+      // Written by worker.js for every HTTP request, including cache hits.
+      // Enables queries like "top 50 most requested IMDb IDs this week".
+      "binding": "REQUEST_ANALYTICS",
+      "dataset": "request_analytics"
+    }
+  ],
   // AFTER
   // Cron: refresh fleet Discord embed hourly. Nodes never push status to this
   // worker — all health data is derived from live routing state / Analytics Engine.
