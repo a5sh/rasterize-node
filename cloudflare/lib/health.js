@@ -1,52 +1,29 @@
 // cloudflare/lib/health.js
 //
-// Per-isolate node health/error/perf/inflight tracking — the EMA-based
-// node score used for routing decisions — plus the FleetHealth Durable
-// Object bridge (the cross-isolate scoring signal from the architecture
-// notes).
-//
-// refreshScores/reportOutcome are exported for the DO-authoritative scoring
-// integration but are NOT yet called from the dispatch path in this file —
-// wiring routing to trust DO state over local per-isolate EMA is a real
-// behavioral change (making an isolate that's never personally seen a node
-// fail defer to global consensus), tracked separately from this pure
-// structural split so it can be reviewed on its own.
+// Local, per-isolate layer is now ONLY for values that must be instantaneous
+// within a single race (in-flight admission counting). Everything
+// cross-isolate — scores, failing/stressed flags, dynamic concurrency
+// ceilings — comes from the FleetHealth DO, cached for SCORE_CACHE_TTL_MS
+// per isolate so routing doesn't pay a DO round-trip on every request.
 
-export const EMA_ALPHA = 0.2; // smoothing factor — higher = more reactive
+import NODE_CONFIG from "../../assets/nodes.config.js";
 
-export function createHealthState({
-  errWindowMs,
-  stressThreshold,
-  failingThreshold,
-}) {
-  /** nodeId → { count, windowEnd } */
-  const errMap = new Map();
-  /** nodeId → current in-flight count */
-  const inflightMap = new Map();
-  /** nodeId → { emaMs, sampleCount } */
-  const perfMap = new Map();
+const DEFAULT_CONCURRENCY = 4;
+const SCORE_CACHE_TTL_MS = 5_000;
 
-  function recordErr(id) {
-    const now = Date.now();
-    let e = errMap.get(id) ?? { count: 0, windowEnd: now + errWindowMs };
-    if (now > e.windowEnd) e = { count: 0, windowEnd: now + errWindowMs };
-    e.count++;
-    errMap.set(id, e);
+function initialHint(id) {
+  const n = NODE_CONFIG.nodes.find((x) => x.id === id);
+  return n?.initialConcurrencyHint ?? null; // null = unlimited (serverless/CDN)
+}
+
+export function createHealthState({ stressThreshold, failingThreshold }) {
+  const inflightMap = new Map(); // real-time, local — must stay synchronous
+  let snapshot = {}; // last DO /scores snapshot
+
+  function mergeSnapshot(snap) {
+    snapshot = snap || {};
   }
-  function recordOk(id) {
-    const e = errMap.get(id);
-    if (e) e.count = Math.max(0, e.count - 1);
-  }
-  function errCount(id) {
-    const e = errMap.get(id);
-    return !e || Date.now() > e.windowEnd ? 0 : e.count;
-  }
-  function isStressed(id) {
-    return errCount(id) >= stressThreshold;
-  }
-  function isFailing(id) {
-    return errCount(id) >= failingThreshold;
-  }
+
   function acquireInflight(id) {
     inflightMap.set(id, (inflightMap.get(id) ?? 0) + 1);
   }
@@ -56,84 +33,98 @@ export function createHealthState({
   function inFlight(id) {
     return inflightMap.get(id) ?? 0;
   }
+
+  function limitFor(id) {
+    const s = snapshot[id];
+    if (s?.concurrencyLimit !== undefined && s.concurrencyLimit !== null)
+      return s.concurrencyLimit;
+    if (s?.concurrencyLimit === null) return null;
+    const hint = initialHint(id);
+    return hint === null ? null : (hint ?? DEFAULT_CONCURRENCY);
+  }
   function atCapacity(n) {
-    return n.concurrencyLimit !== null && inFlight(n.id) >= n.concurrencyLimit;
+    const limit = limitFor(n.id);
+    return limit !== null && inFlight(n.id) >= limit;
   }
 
-  function recordPerf(id, ms) {
-    const p = perfMap.get(id);
-    if (!p) {
-      perfMap.set(id, { emaMs: ms, sampleCount: 1 });
-    } else {
-      p.emaMs = EMA_ALPHA * ms + (1 - EMA_ALPHA) * p.emaMs;
-      p.sampleCount += 1;
-    }
-  }
   function emaMs(id) {
-    return perfMap.get(id)?.emaMs ?? 9_999;
+    return snapshot[id]?.emaMs ?? 9_999;
   }
-
-  /**
-   * Node score — lower is better. Combines EMA response time + error
-   * penalty + concurrency penalty. Useful for comparing node performance
-   * even without knowing their underlying CPU specs.
-   */
+  function errCount(id) {
+    return snapshot[id]?.errCount ?? 0;
+  }
+  function isStressed(id) {
+    return snapshot[id]?.stressed ?? errCount(id) >= stressThreshold;
+  }
+  function isFailing(id) {
+    return snapshot[id]?.failing ?? errCount(id) >= failingThreshold;
+  }
   function nodeScore(id) {
+    const s = snapshot[id];
+    if (s?.score != null) return s.score;
     return emaMs(id) + errCount(id) * 500 + inFlight(id) * 80;
+  }
+  function perfSamples(id) {
+    return snapshot[id]?.samples ?? 0;
   }
 
   return {
-    perfMap,
-    recordErr,
-    recordOk,
-    errCount,
-    isStressed,
-    isFailing,
+    mergeSnapshot,
     acquireInflight,
     releaseInflight,
     inFlight,
     atCapacity,
-    recordPerf,
     emaMs,
+    errCount,
+    isStressed,
+    isFailing,
     nodeScore,
+    perfMap: {
+      get: (id) =>
+        perfSamples(id)
+          ? { emaMs: emaMs(id), sampleCount: perfSamples(id) }
+          : undefined,
+    },
   };
 }
 
-// ── FleetHealth Durable Object bridge ────────────────────────────────────────
-
-const SCORE_CACHE_TTL_MS = 5_000;
-
+// ── FleetHealth DO bridge ────────────────────────────────────────────────
 export function createFleetHealthBridge() {
-  let scoreCache = { data: {}, fetchedAt: 0 };
+  let cache = { data: {}, fetchedAt: 0 };
 
   async function refreshScores(env) {
-    if (Date.now() - scoreCache.fetchedAt < SCORE_CACHE_TTL_MS)
-      return scoreCache.data;
+    if (Date.now() - cache.fetchedAt < SCORE_CACHE_TTL_MS) return cache.data;
     try {
       const id = env.FLEET_HEALTH.idFromName("global");
       const stub = env.FLEET_HEALTH.get(id);
       const res = await stub.fetch("https://fleet-health.internal/scores");
-      scoreCache = { data: await res.json(), fetchedAt: Date.now() };
+      cache = { data: await res.json(), fetchedAt: Date.now() };
     } catch (_) {
-      /* keep stale cache on error */
+      /* keep stale cache */
     }
-    return scoreCache.data;
+    return cache.data;
   }
 
-  function reportOutcome(env, ctx, nodeId, ok, ms) {
+  /**
+   * Fire-and-forget, batched ONCE per incoming request (never across
+   * requests — a cross-request setTimeout accumulator would risk the same
+   * "Promise will never complete" class of bug documented in batchLoader.js).
+   */
+  function reportBatch(env, ctx, outcomes) {
+    if (!outcomes || outcomes.length === 0) return;
     ctx.waitUntil(
       (async () => {
         try {
           const id = env.FLEET_HEALTH.idFromName("global");
           const stub = env.FLEET_HEALTH.get(id);
-          await stub.fetch("https://fleet-health.internal/report", {
+          await stub.fetch("https://fleet-health.internal/report-batch", {
             method: "POST",
-            body: JSON.stringify({ nodeId, ok, ms }),
+            body: JSON.stringify({ outcomes }),
           });
         } catch (_) {}
       })(),
     );
   }
 
-  return { refreshScores, reportOutcome };
+  return { refreshScores, reportBatch };
 }
