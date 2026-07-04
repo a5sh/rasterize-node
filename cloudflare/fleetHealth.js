@@ -1,39 +1,24 @@
 // cloudflare/fleetHealth.js
 //
-// Single source of truth for the entire raster fleet — replaces DASHBOARD_KV,
-// the per-isolate errMap/perfMap/inflightMap split, and per-attempt Analytics
-// Engine writes.
-//
-// STORAGE MODEL (SQLite-backed DO — see wrangler.jsonc new_sqlite_classes)
-// ────────────────────────────────────────────────────────────────────────
-//   nodes  — one row per node: EMA latency, error window, uptime/downtime,
-//            self-reported resource usage, dynamic concurrency ceiling,
-//            lifetime totals (requests/success/failure/wins).
-//   meta   — scalar state: dashboardMessageId (edited forever, no KV),
-//            lastDashboardUpdate, alert rate-limit bookkeeping.
-//
-// TWO CADENCES, ONE ALARM
-// ────────────────────────────────────────────────────────────────────────
-//   Every ALARM_INTERVAL_MS (5 min): poll health for any node that's gone
-//   quiet (no self-report / no outcome report within STALE_REPORT_MS),
-//   adjust dynamic concurrency, flush aggregated metrics.
-//   Every DASHBOARD_INTERVAL_MS (1 hour): additionally edit/post the Discord
-//   embed. Downtime/failure alerts are NOT gated by this — they fire the
-//   moment a transition is detected, independent of the hourly cadence.
-//
-// WHY NOT PER-ATTEMPT AE WRITES
-// ────────────────────────────────────────────────────────────────────────
-// Analytics Engine writes are cheap individually, but per-attempt volume
-// scales with (requests × fan-out), which is exactly what you're trying to
-// cap. This DO aggregates in memory (`_flush`) and writes ONE row per node
-// per alarm tick instead — ~8 nodes × 288 ticks/day ≈ 2,300 rows/day instead
-// of potentially hundreds of thousands.
-//
-// KNOWN TRADE-OFF: api/routes/analytics.js's per-attempt queries (latency
-// buckets, per-error breakdown, colo breakdown) assumed one row per attempt.
-// Those will go quiet under the new aggregated rows (blob7='agg'). The
-// global/node summary and win-rate queries still work since they're
-// sum()/avg()-based. Flag if you want those rewritten against the new shape.
+// v2 — fixes:
+//   • Removed _flush / _flushMetrics entirely. It was writing an aggregated
+//     row (blob5='') into RASTER_METRICS once per node per 5-min tick, into
+//     the SAME dataset routes/analytics.js's per-attempt queries read —
+//     those rows don't match blob5='success'/'failure' so every countIf()
+//     silently skipped them, but they still counted in count()/global
+//     averages, understating success rates. RASTER_METRICS is now written
+//     exclusively, per-attempt, by raceDispatch.js's logAttempt() calls.
+//     This DO owns routing state only: EMA score, failing/stressed,
+//     dynamic concurrency, uptime, and the Discord dashboard.
+//   • _pollHealthChecks now caps concurrent outgoing fetches at 5 instead
+//     of Promise.all-ing every health-check-capable node at once. Workers/
+//     DOs are limited to 6 simultaneous outgoing connections per request —
+//     with 7 health-check nodes and a cold cache (all stale at once) the
+//     old code could exceed that.
+//   • Added POST /report — accepts the legacy {type:'online'|'metrics', node,
+//     snapshot} beacon shape sent by core/serverlessReporter.js (Vercel/
+//     Netlify) and adapts it into _recordHeartbeat. Forwarded here from
+//     cloudflare/worker.js's new /report route.
 
 import NODE_CONFIG from "../assets/nodes.config.js";
 
@@ -42,10 +27,11 @@ const ERR_WINDOW_MS = 60_000;
 const FAILING_THRESHOLD = 8;
 const STRESSED_THRESHOLD = 3;
 
-const ALARM_INTERVAL_MS = 5 * 60_000; // health poll / failure detection cadence
-const DASHBOARD_INTERVAL_MS = 60 * 60_000; // Discord embed refresh — every hour
-const STALE_REPORT_MS = 90_000; // no report in this long → treat as needing an active poll
+const ALARM_INTERVAL_MS = 5 * 60_000;
+const DASHBOARD_INTERVAL_MS = 60 * 60_000;
+const STALE_REPORT_MS = 90_000;
 const HEALTH_FETCH_TIMEOUT_MS = 4_000;
+const MAX_CONCURRENT_HEALTH_FETCHES = 5; // DO/Workers limit is 6 simultaneous outgoing connections/request
 
 const CONCURRENCY_MIN = 1;
 const CONCURRENCY_MAX = 24;
@@ -53,11 +39,26 @@ const CONCURRENCY_MAX = 24;
 const ALL_NODES = NODE_CONFIG.nodes;
 const nodeMeta = (id) => ALL_NODES.find((n) => n.id === id) || null;
 
+// ── Bounded-concurrency map helper ───────────────────────────────────────
+async function mapWithConcurrency(items, limit, fn) {
+  const results = new Array(items.length);
+  let cursor = 0;
+  async function worker() {
+    while (cursor < items.length) {
+      const i = cursor++;
+      results[i] = await fn(items[i], i);
+    }
+  }
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, worker),
+  );
+  return results;
+}
+
 export class FleetHealth {
   constructor(state, env) {
     this.state = state;
     this.env = env;
-    this._flush = new Map(); // nodeId -> { req, ok, fail, msSum, msN, wins }
 
     this.state.blockConcurrencyWhile(async () => {
       this._ensureSchema();
@@ -150,6 +151,7 @@ export class FleetHealth {
   }
 
   // ── Outcome reporting (from raceDispatch, batched once per request) ────
+  // Routing-state only now — see file header. No AE writes here.
   _recordOutcome({ nodeId, ok, ms, isWinner }) {
     const row = this._ensureRow(nodeId);
     const now = Date.now();
@@ -193,23 +195,6 @@ export class FleetHealth {
       nodeId,
     );
 
-    const f = this._flush.get(nodeId) || {
-      req: 0,
-      ok: 0,
-      fail: 0,
-      msSum: 0,
-      msN: 0,
-      wins: 0,
-    };
-    f.req++;
-    ok ? f.ok++ : f.fail++;
-    if (ok && ms != null) {
-      f.msSum += ms;
-      f.msN++;
-    }
-    if (isWinner) f.wins++;
-    this._flush.set(nodeId, f);
-
     if (transitioned) {
       this._alert(nodeId, isFailingNow ? "failing" : "recovered_errors").catch(
         () => {},
@@ -217,7 +202,7 @@ export class FleetHealth {
     }
   }
 
-  // ── Resource heartbeat (from VPS/Render self-reports, or legacy serverless snapshot) ──
+  // ── Resource heartbeat (self-reports; legacy /report beacon adapts here too) ──
   _recordHeartbeat({
     nodeId,
     activeJobs = 0,
@@ -285,7 +270,7 @@ export class FleetHealth {
     return out;
   }
 
-  // ── Alerts (rate-limited: max 3 / 5 min, 10s min gap — same guard as vps/discord.js) ──
+  // ── Alerts (max 3 / 5 min, 10s min gap) ──────────────────────────────
   _canAlert() {
     const now = Date.now();
     let count = parseInt(this._getMeta("alertCount", "0"), 10);
@@ -364,6 +349,28 @@ export class FleetHealth {
         this._recordHeartbeat(body);
         return Response.json({ ok: true });
       }
+      // Legacy beacon from core/serverlessReporter.js (Vercel/Netlify):
+      // { type: 'online' | 'metrics', node, ts, snapshot? }
+      if (request.method === "POST" && url.pathname === "/report") {
+        const body = await request.json().catch(() => null);
+        if (!body?.node)
+          return Response.json(
+            { ok: false, error: "missing node" },
+            { status: 400 },
+          );
+        if (body.type === "metrics" && body.snapshot) {
+          this._recordHeartbeat({
+            nodeId: body.node,
+            avgMs: body.snapshot.jobDuration?.avg ?? null,
+            requests: body.snapshot.requests ?? 0,
+            errors: body.snapshot.errors ?? 0,
+          });
+        } else {
+          // 'online' (cold start ping) — just mark it alive
+          this._recordHeartbeat({ nodeId: body.node, requests: 0, errors: 0 });
+        }
+        return Response.json({ ok: true });
+      }
       if (url.pathname === "/scores") {
         return Response.json(this._scoresSnapshot());
       }
@@ -385,7 +392,7 @@ export class FleetHealth {
     return new Response("not found", { status: 404 });
   }
 
-  // ── Alarm: health polling (every tick) + dashboard (hourly) + metrics flush ──
+  // ── Alarm: health polling (every tick) + dashboard (hourly) ──────────
   async alarm() {
     const now = Date.now();
     await this._pollHealthChecks(now);
@@ -397,18 +404,25 @@ export class FleetHealth {
       this._setMeta("lastDashboardUpdate", now);
     }
 
-    await this._flushMetrics();
     await this.state.storage.setAlarm(now + ALARM_INTERVAL_MS);
   }
 
   async _pollHealthChecks(now) {
     const targets = ALL_NODES.filter((n) => n.features.supportsHealthCheck);
-    await Promise.all(
-      targets.map(async (n) => {
-        const row = this._ensureRow(n.id);
-        const stale = now - (row.last_seen_at || 0) > STALE_REPORT_MS;
-        if (!stale) return; // fresh self-report or fresh outcome — active poll not needed
+    const stale = targets.filter((n) => {
+      const row = this._ensureRow(n.id);
+      return now - (row.last_seen_at || 0) > STALE_REPORT_MS;
+    });
+    if (stale.length === 0) return;
 
+    // Capped at MAX_CONCURRENT_HEALTH_FETCHES (5) — DOs are limited to 6
+    // simultaneous outgoing connections per request; a cold cache with all
+    // 7 health-check nodes stale at once would otherwise exceed that.
+    await mapWithConcurrency(
+      stale,
+      MAX_CONCURRENT_HEALTH_FETCHES,
+      async (n) => {
+        const row = this._row(n.id);
         const ac = new AbortController();
         const t = setTimeout(() => ac.abort(), HEALTH_FETCH_TIMEOUT_MS);
         try {
@@ -422,8 +436,8 @@ export class FleetHealth {
           const wasDown = row.status === "offline";
           this.state.storage.sql.exec(
             `UPDATE nodes SET status='online', last_seen_at=?, down_since=0,
-               active_jobs=COALESCE(?, active_jobs), queued_jobs=COALESCE(?, queued_jobs)
-             WHERE id=?`,
+             active_jobs=COALESCE(?, active_jobs), queued_jobs=COALESCE(?, queued_jobs)
+           WHERE id=?`,
             now,
             h.activeJobs ?? null,
             h.queuedJobs ?? null,
@@ -440,14 +454,14 @@ export class FleetHealth {
           );
           if (wasOnline) await this._alert(n.id, "down");
         }
-      }),
+      },
     );
   }
 
   _adjustAllConcurrency() {
     const rows = this.state.storage.sql.exec(`SELECT * FROM nodes`).toArray();
     for (const r of rows) {
-      if (r.concurrency_limit == null) continue; // unlimited (serverless/CDN) — leave alone
+      if (r.concurrency_limit == null) continue;
       const healthy = this._liveErrCount(r) === 0;
       const next = this._adjustConcurrency(r.concurrency_limit, healthy);
       if (next !== r.concurrency_limit) {
@@ -522,7 +536,7 @@ export class FleetHealth {
     );
 
     const payload = {
-      username: "Posterium LB — v14",
+      username: "Posterium LB — v15",
       embeds: [
         {
           title: "🖼️ Raster Node Fleet",
@@ -560,28 +574,5 @@ export class FleetHealth {
       const data = await post.json();
       if (data.id) this._setMeta("dashboardMessageId", data.id);
     }
-  }
-
-  async _flushMetrics() {
-    if (this._flush.size === 0) return;
-    for (const [nodeId, f] of this._flush) {
-      try {
-        this.env?.RASTER_METRICS?.writeDataPoint({
-          // blob7='agg' marks this as an aggregated row, distinct from the
-          // old per-attempt schema (see file header for the trade-off note).
-          blobs: [nodeId, "", "", "", "", "", "agg", ""],
-          doubles: [
-            f.msN > 0 ? f.msSum / f.msN : 0,
-            f.req,
-            f.wins,
-            f.ok,
-            f.fail,
-            0,
-          ],
-          indexes: [nodeId],
-        });
-      } catch (_) {}
-    }
-    this._flush.clear();
   }
 }

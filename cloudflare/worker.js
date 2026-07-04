@@ -47,7 +47,7 @@
 // See cloudflare/lib/metricsWriter.js for the RASTER_METRICS analytics schema.
 
 import { T1_NODES, T2_NODES, SETTINGS } from "./lib/nodeRegistry.js";
-import { createHealthState } from "./lib/health.js";
+import { createHealthState, createFleetHealthBridge } from "./lib/health.js";
 import { distributedRender } from "./lib/raceDispatch.js";
 import {
   updateDashboard,
@@ -91,6 +91,7 @@ const health = createHealthState({
   stressThreshold: SETTINGS.stressThreshold,
   failingThreshold: SETTINGS.failingThreshold,
 });
+const fleetBridge = createFleetHealthBridge();
 
 // ── JSON helpers ──────────────────────────────────────────────────────────────
 
@@ -213,6 +214,33 @@ export default {
       });
     }
 
+    // ── /report — legacy Vercel/Netlify online/metrics beacon ──────────────
+    // core/serverlessReporter.js still POSTs here (CF_REPORT_URL). Nothing
+    // previously checked this pathname, so every POST fell through into the
+    // raster dispatch path below and got run as a garbage SVG render — the
+    // same timeout-flood class of bug vps/discord.js's header comment
+    // already documents for the VPS fleet. Forward it into the DO instead.
+    if (request.method === "POST" && url.pathname === "/report") {
+      try {
+        const id = env.FLEET_HEALTH.idFromName("global");
+        const stub = env.FLEET_HEALTH.get(id);
+        const doRes = await stub.fetch("https://fleet-health.internal/report", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: await request.text(),
+        });
+        return new Response(await doRes.text(), {
+          status: doRes.status,
+          headers: {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+          },
+        });
+      } catch (e) {
+        return _jsonError(502, e?.message || "fleet health unreachable");
+      }
+    }
+
     // ── Main rasterization ─────────────────────────────────────────────────
     if (request.method !== "POST" && request.method !== "GET")
       return _jsonError(405, "Method not allowed");
@@ -259,10 +287,12 @@ export default {
       posterUrl,
       inputType,
       env,
+      ctx,
       t1Nodes: T1_NODES,
       t2Nodes: T2_NODES,
       settings: SETTINGS,
       health,
+      fleetBridge,
       log: _log,
     });
   },

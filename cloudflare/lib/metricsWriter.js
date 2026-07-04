@@ -38,7 +38,9 @@
 //   WHERE timestamp > now() - INTERVAL '7' DAY
 //     AND blob5 = 'success' AND blob1 != 'req'
 //   GROUP BY node ORDER BY cpu_proxy_ms ASC
-
+// double7 = computeMs — node-self-reported render time (X-Render-Ms header).
+// 0 when the node doesn't report one (wsrv.nl). wall_ms - compute_ms is a
+// decent proxy for network/queue overhead per node.
 export function logAttempt(
   env,
   {
@@ -55,6 +57,7 @@ export function logAttempt(
     inflightCount,
     payloadKb,
     nodeScore = 0,
+    computeMs = 0,
   },
 ) {
   try {
@@ -76,12 +79,12 @@ export function logAttempt(
         inflightCount,
         payloadKb,
         nodeScore,
+        computeMs,
       ],
       indexes: [nodeId],
     });
   } catch (_) {}
 }
-
 export function logRequest(
   env,
   {

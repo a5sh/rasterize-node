@@ -67,8 +67,9 @@ async function renderAndRecord(svgText, format) {
   const t0 = Date.now();
   try {
     const result = await renderToBuffer(svgText, format);
-    recordJobDuration(Date.now() - t0);
-    return result;
+    const computeMs = Date.now() - t0;
+    recordJobDuration(computeMs);
+    return { ...result, computeMs };
   } catch (e) {
     recordResvgFail();
     throw e;
@@ -93,11 +94,12 @@ function sendJson(res, status, body) {
   res.end(JSON.stringify(body));
 }
 
-function sendImage(res, buffer, mimeType) {
+function sendImage(res, buffer, mimeType, computeMs = 0) {
   res.writeHead(200, {
     "Content-Type": mimeType,
     "Cache-Control": "public, max-age=86400",
     "X-Node": NODE_NAME,
+    "X-Render-Ms": String(computeMs),
     ...CORS,
   });
   res.end(Buffer.from(buffer));

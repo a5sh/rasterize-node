@@ -99,10 +99,22 @@ export async function tryNode(node, svgText, svgUrl, format, signal, health) {
         error: `http_${res.status}`,
         status: res.status,
         inflightAtStart,
+        computeMs: 0,
       };
     }
     health.recordOk(node.id);
-    return { ok: true, res, error: "", status: res.status, inflightAtStart };
+    // Self-reported node-side render time, if the node emits it (see
+    // vercel/api/rasterize.js, netlify/functions/rasterize.js,
+    // core/httpServer.js). 0 for wsrv.nl — no visibility into a third party.
+    const computeMs = parseInt(res.headers.get("X-Render-Ms") || "", 10);
+    return {
+      ok: true,
+      res,
+      error: "",
+      status: res.status,
+      inflightAtStart,
+      computeMs: Number.isFinite(computeMs) ? computeMs : 0,
+    };
   } catch (e) {
     // AbortError is expected/benign here — either our own budget timeout
     // fired, or this racer lost the pair and its own controller was
@@ -113,6 +125,7 @@ export async function tryNode(node, svgText, svgUrl, format, signal, health) {
       ok: false,
       res: null,
       inflightAtStart,
+      computeMs: 0,
       error:
         e?.name === "AbortError"
           ? "timeout"
