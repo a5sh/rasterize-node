@@ -15,13 +15,31 @@ function initialHint(id) {
   const n = NODE_CONFIG.nodes.find((x) => x.id === id);
   return n?.initialConcurrencyHint ?? null; // null = unlimited (serverless/CDN)
 }
-
 export function createHealthState({ stressThreshold, failingThreshold }) {
   const inflightMap = new Map(); // real-time, local — must stay synchronous
   let snapshot = {}; // last DO /scores snapshot
+  // Local, per-isolate error overlay — populated synchronously by
+  // recordErr()/recordOk() during a race so routing decisions within THIS
+  // isolate reflect the current request's outcomes immediately, without
+  // waiting for the next DO /scores refresh (SCORE_CACHE_TTL_MS-bounded).
+  // The DO remains the cross-isolate source of truth; this overlay is
+  // cleared whenever a fresh snapshot merge happens.
+  const localErrOverlay = new Map(); // id -> local err count (since last mergeSnapshot)
 
   function mergeSnapshot(snap) {
     snapshot = snap || {};
+    localErrOverlay.clear();
+  }
+
+  function recordErr(id) {
+    localErrOverlay.set(id, (localErrOverlay.get(id) ?? 0) + 1);
+  }
+  function recordOk(id) {
+    if (localErrOverlay.has(id)) {
+      const n = localErrOverlay.get(id) - 1;
+      if (n <= 0) localErrOverlay.delete(id);
+      else localErrOverlay.set(id, n);
+    }
   }
 
   function acquireInflight(id) {
@@ -50,26 +68,30 @@ export function createHealthState({ stressThreshold, failingThreshold }) {
   function emaMs(id) {
     return snapshot[id]?.emaMs ?? 9_999;
   }
-  function errCount(id) {
-    return snapshot[id]?.errCount ?? 0;
+function errCount(id) {
+    return (snapshot[id]?.errCount ?? 0) + (localErrOverlay.get(id) ?? 0);
   }
   function isStressed(id) {
+    if (localErrOverlay.has(id)) return errCount(id) >= stressThreshold;
     return snapshot[id]?.stressed ?? errCount(id) >= stressThreshold;
   }
   function isFailing(id) {
+    if (localErrOverlay.has(id)) return errCount(id) >= failingThreshold;
     return snapshot[id]?.failing ?? errCount(id) >= failingThreshold;
   }
   function nodeScore(id) {
     const s = snapshot[id];
-    if (s?.score != null) return s.score;
+    if (s?.score != null && !localErrOverlay.has(id)) return s.score;
     return emaMs(id) + errCount(id) * 500 + inFlight(id) * 80;
   }
   function perfSamples(id) {
     return snapshot[id]?.samples ?? 0;
   }
 
-  return {
+return {
     mergeSnapshot,
+    recordErr,
+    recordOk,
     acquireInflight,
     releaseInflight,
     inFlight,

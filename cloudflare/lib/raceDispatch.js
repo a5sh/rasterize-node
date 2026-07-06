@@ -127,10 +127,13 @@ export async function distributedRender({
     /* stale/local health state is fine — routing still works */
   }
 
-  const {
-    svg: embeddedSvg,
-    embedMs,
-  } = await embedPoster(svgText, posterUrl, env, posterEmbedTimeoutMs, log);
+  const { svg: embeddedSvg, embedMs } = await embedPoster(
+    svgText,
+    posterUrl,
+    env,
+    posterEmbedTimeoutMs,
+    log,
+  );
 
   const wallDeadline = Math.min(maxWallTimeMs, HARD_WALL_MS);
   const ordered = geoOrderNodes(colo, t1Nodes, health);
@@ -167,7 +170,11 @@ export async function distributedRender({
       const attemptMs = Date.now() - t0;
 
       if (!result.ok && result.error !== "timeout") {
-        log("warn", "t1_failed", { node: node.id, error: result.error, attemptMs });
+        log("warn", "t1_failed", {
+          node: node.id,
+          error: result.error,
+          attemptMs,
+        });
       }
       return { ...result, node, attemptMs, idx };
     });
@@ -191,7 +198,9 @@ export async function distributedRender({
             })
             .catch((err) => {
               remaining--;
-              log("warn", "race_promise_settle_error", { reason: err?.message || String(err) });
+              log("warn", "race_promise_settle_error", {
+                reason: err?.message || String(err),
+              });
               if (remaining === 0) resolve({ ok: false });
             }),
         );
@@ -234,7 +243,9 @@ export async function distributedRender({
     const winner = await raceGroup(group, remainingBudget, "t1");
     if (winner.ok) {
       logRequest(env, {
-        format, inputType, colo,
+        format,
+        inputType,
+        colo,
         totalWallMs: elapsed(),
         attemptsMade,
         posterEmbedMs: embedMs,
@@ -242,25 +253,44 @@ export async function distributedRender({
         outcome: "success",
       });
       flushHealthReport();
-      return buildImageResp(winner.res, winner.node.id, attemptsMade, elapsed(), embedMs, colo, health);
+      return buildImageResp(
+        winner.res,
+        winner.node.id,
+        attemptsMade,
+        elapsed(),
+        embedMs,
+        colo,
+        health,
+      );
     }
     cursor += group.length;
     groupSize = GROUP_SIZE_ESCALATED;
   }
 
   // ── Step: T2 extreme fallback ────────────────────────────────────────
+  // Bounded by the SAME wallDeadline as T1 (not the larger maxWallTimeMs),
+  // so the advertised "5s hard cap" actually caps the end-to-end request
+  // instead of T1 being capped at 5s while T2 gets its own separate
+  // window up to maxWallTimeMs (7-8s in nodes.config.js).
   for (const node of t2Nodes) {
-    if (timedOut()) {
+    if (Date.now() - tWall0 >= wallDeadline) {
       log("warn", "t2_wall_timeout_abort", { elapsed: elapsed() });
       break;
     }
     attemptsMade++;
-    const budget = Math.max(1_000, maxWallTimeMs - elapsed() - 150);
+    const budget = Math.max(500, wallDeadline - elapsed() - 150);
     const nodeTimeout = Math.min(t2TimeoutMs, budget);
     const ac = new AbortController();
     const tm = setTimeout(() => ac.abort(), nodeTimeout);
     const t0 = Date.now();
-    const result = await tryNode(node, embeddedSvg, svgUrl, format, ac.signal, health)
+    const result = await tryNode(
+      node,
+      embeddedSvg,
+      svgUrl,
+      format,
+      ac.signal,
+      health,
+    )
       .catch(() => ({ ok: false, res: null }))
       .finally(() => clearTimeout(tm));
     const attemptMs = Date.now() - t0;
@@ -275,7 +305,9 @@ export async function distributedRender({
 
     if (result.ok) {
       logRequest(env, {
-        format, inputType, colo,
+        format,
+        inputType,
+        colo,
         totalWallMs: elapsed(),
         attemptsMade,
         posterEmbedMs: embedMs,
@@ -283,16 +315,31 @@ export async function distributedRender({
         outcome: "success_t2",
       });
       flushHealthReport();
-      return buildImageResp(result.res, node.id, attemptsMade, elapsed(), embedMs, colo, health);
+      return buildImageResp(
+        result.res,
+        node.id,
+        attemptsMade,
+        elapsed(),
+        embedMs,
+        colo,
+        health,
+      );
     }
     log("error", "t2_failed", { node: node.id, attemptMs });
   }
 
   // ── Step: exhausted — 302 to original poster, never a blank image ──────
   const wallMs = elapsed();
-  log("error", "chain_exhausted", { colo, format, attempts: attemptsMade, wallMs });
+  log("error", "chain_exhausted", {
+    colo,
+    format,
+    attempts: attemptsMade,
+    wallMs,
+  });
   logRequest(env, {
-    format, inputType, colo,
+    format,
+    inputType,
+    colo,
     totalWallMs: wallMs,
     attemptsMade,
     posterEmbedMs: embedMs,
@@ -316,7 +363,16 @@ export async function distributedRender({
     });
   }
   return new Response(
-    JSON.stringify({ error: "All rasterizers exhausted", attempts: attemptsMade }),
-    { status: 502, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } },
+    JSON.stringify({
+      error: "All rasterizers exhausted",
+      attempts: attemptsMade,
+    }),
+    {
+      status: 502,
+      headers: {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*",
+      },
+    },
   );
 }
