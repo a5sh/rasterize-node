@@ -47,6 +47,7 @@ const SYNC_FILES = [
   ["core/b2p.js", "core/b2p.js"],
   ["core/embedImages.js", "core/embedImages.js"],
   ["core/httpServer.js", "core/httpServer.js"],
+  ["core/NotoSans-Subset.ttf", "core/NotoSans-Subset.ttf"],
   // Node registry
   ["assets/nodes.config.js", "assets/nodes.config.js"],
 ];
