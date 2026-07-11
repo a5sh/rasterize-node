@@ -83,7 +83,7 @@ export async function distributedRender({
   log,
 }) {
   const bridge = fleetBridge || NOOP_BRIDGE;
-  const { t2TimeoutMs, posterEmbedTimeoutMs, maxWallTimeMs } = settings;
+  const { posterEmbedTimeoutMs, maxWallTimeMs } = settings;
   const tWall0 = Date.now();
   const payloadKb = Math.round(new Blob([svgText]).size / 1024);
   let attemptsMade = 0;
@@ -138,10 +138,7 @@ export async function distributedRender({
   const wallDeadline = Math.min(maxWallTimeMs, HARD_WALL_MS);
   const ordered = geoOrderNodes(colo, t1Nodes, health);
   const racePool = [...ordered];
-  if (!racePool.some((n) => n.id === "wsrv")) {
-    const wsrvNode = t1Nodes.find((n) => n.id === "wsrv");
-    if (wsrvNode) racePool.push(wsrvNode);
-  }
+  const wsrvNode = t1Nodes.find((n) => n.id === "wsrv");
 
   async function raceGroup(nodes, budgetMs, lane) {
     const nodeControllers = nodes.map(() => new AbortController());
@@ -240,6 +237,11 @@ export async function distributedRender({
     if (remainingBudget <= 200) break;
 
     const group = racePool.slice(cursor, cursor + groupSize);
+    // Every fallback group (after the initial single-node attempt) must
+    // include wsrv — it's the always-reliable CDN safety net.
+    if (groupSize > 1 && wsrvNode && !group.some((n) => n.id === "wsrv")) {
+      group.push(wsrvNode);
+    }
     const winner = await raceGroup(group, remainingBudget, "t1");
     if (winner.ok) {
       logRequest(env, {
@@ -268,42 +270,18 @@ export async function distributedRender({
   }
 
   // ── Step: T2 extreme fallback ────────────────────────────────────────
-  // Bounded by the SAME wallDeadline as T1 (not the larger maxWallTimeMs),
-  // so the advertised "5s hard cap" actually caps the end-to-end request
-  // instead of T1 being capped at 5s while T2 gets its own separate
-  // window up to maxWallTimeMs (7-8s in nodes.config.js).
+  // Each T2 node is raced alongside wsrv — wsrv is the always-reliable
+  // CDN safety net on every fallback step.
   for (const node of t2Nodes) {
     if (Date.now() - tWall0 >= wallDeadline) {
       log("warn", "t2_wall_timeout_abort", { elapsed: elapsed() });
       break;
     }
-    attemptsMade++;
-    const budget = Math.max(500, wallDeadline - elapsed() - 150);
-    const nodeTimeout = Math.min(t2TimeoutMs, budget);
-    const ac = new AbortController();
-    const tm = setTimeout(() => ac.abort(), nodeTimeout);
-    const t0 = Date.now();
-    const result = await tryNode(
-      node,
-      embeddedSvg,
-      svgUrl,
-      format,
-      ac.signal,
-      health,
-    )
-      .catch(() => ({ ok: false, res: null }))
-      .finally(() => clearTimeout(tm));
-    const attemptMs = Date.now() - t0;
-    reportAttempt(node.id, result.ok, attemptMs, result.ok, {
-      error: result.error,
-      status: result.status,
-      inflightAtStart: result.inflightAtStart,
-      nodeScore: health.nodeScore(node.id),
-      computeMs: result.computeMs,
-      lane: "t2",
-    });
-
-    if (result.ok) {
+    const remainingBudget = wallDeadline - elapsed();
+    if (remainingBudget <= 200) break;
+    const t2Group = wsrvNode ? [node, wsrvNode] : [node];
+    const winner = await raceGroup(t2Group, remainingBudget, "t2");
+    if (winner.ok) {
       logRequest(env, {
         format,
         inputType,
@@ -316,8 +294,8 @@ export async function distributedRender({
       });
       flushHealthReport();
       return buildImageResp(
-        result.res,
-        node.id,
+        winner.res,
+        winner.node.id,
         attemptsMade,
         elapsed(),
         embedMs,
@@ -325,7 +303,7 @@ export async function distributedRender({
         health,
       );
     }
-    log("error", "t2_failed", { node: node.id, attemptMs });
+    log("error", "t2_failed", { node: node.id, attemptMs: elapsed() });
   }
 
   // ── Step: exhausted — 302 to original poster, never a blank image ──────
