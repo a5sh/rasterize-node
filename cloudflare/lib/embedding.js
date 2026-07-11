@@ -1,9 +1,10 @@
 // cloudflare/lib/embedding.js
 //
 // Single-poster embedding for Worker B, CF-cache-backed for 5 minutes
-// (keyed by poster URL + a hash of the SVG's first 512 chars, which
-// captures layout but not the base64 poster itself, so burst traffic for
-// the same title reuses the embedded SVG).
+// (keyed by poster URL + a hash of the SVG's first 4096 chars + last 64
+// chars, which captures layout including badge positions and title content
+// — not just the <defs> prefix — so requests that only differ in
+// title/badge params get distinct cache entries).
 //
 // Embed-outcome analytics datapoint (RASTER_METRICS, blob1 = 'embed'):
 //   blob5 = outcome  'success' | 'failure'
@@ -12,9 +13,16 @@
 
 function hashStr(str) {
   let h = 0x811c9dc5;
-  const len = Math.min(str.length, 512);
+  const len = Math.min(str.length, 4096);
   for (let i = 0; i < len; i++) {
     h ^= str.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  // Mix in the last 64 chars so SVGs with shared <defs> prefixes but different
+  // badge/title content downstream produce distinct keys.
+  const tail = str.length > 4096 ? str.slice(-64) : "";
+  for (let i = 0; i < tail.length; i++) {
+    h ^= tail.charCodeAt(i);
     h = Math.imul(h, 0x01000193) >>> 0;
   }
   return h.toString(36);
@@ -69,7 +77,7 @@ export async function embedPoster(
 ) {
   if (!posterUrl) return { svg: svgText, embedMs: 0, embedded: false };
 
-  const cacheKey = `poster-embed:${hashStr(posterUrl)}:${hashStr(svgText.slice(0, 512))}`;
+  const cacheKey = `poster-embed:${hashStr(posterUrl)}:${hashStr(svgText)}`;
   const cacheReq = new Request(`https://embed-cache.internal/${cacheKey}`);
   const cache = caches.default;
 
