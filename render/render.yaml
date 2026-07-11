@@ -3,6 +3,6 @@ services:
     name: rasterize-render
     env: node
     rootDir: render
-    # No font packages needed — NotoSans-Subset.ttf is bundled via build step.
+    # No font packages needed — JakartaSans-Regular.ttf is bundled via build step.
     buildCommand: "npm install && node ../scripts/build.mjs render"
     startCommand: npm start

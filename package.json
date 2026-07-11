@@ -1,0 +1,10 @@
+{
+  "name": "posterium-rasterise",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@resvg/resvg-js": "^2.6.2",
+    "sharp": "^0.33.2",
+    "dotenv": "^16.4.7"
+  }
+}

@@ -9,6 +9,7 @@
 //   SKIP_UPDATE    optional  — set to "1" to skip update check (debug)
 //   FORCE_SYNC     optional  — set to "1" to re-sync all files even if SHA matches
 
+import "dotenv/config";
 import { writeFile, readFile, mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -47,9 +48,13 @@ const SYNC_FILES = [
   ["core/b2p.js", "core/b2p.js"],
   ["core/embedImages.js", "core/embedImages.js"],
   ["core/httpServer.js", "core/httpServer.js"],
-  ["core/NotoSans-Subset.ttf", "core/NotoSans-Subset.ttf"],
+  ["core/serverlessReporter.js", "core/serverlessReporter.js"],
+  ["core/JakartaSans-Regular.ttf", "core/JakartaSans-Regular.ttf"],
   // Node registry
   ["assets/nodes.config.js", "assets/nodes.config.js"],
+  // Root config
+  ["package.json", "package.json"],
+  [".env.example", ".env.example"],
 ];
 
 // ── GitHub helpers ────────────────────────────────────────────────────────────

@@ -42,7 +42,7 @@ const WARMUP_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="500" height="
   <rect width="500" height="750" fill="#1a1a1a"/>
   <rect x="30" y="30" width="140" height="60" rx="12" fill="rgba(0,0,0,0.45)"/>
   <text x="100" y="30" dy="0.35em" text-anchor="middle"
-        font-family="Noto Sans,Arial,sans-serif" font-size="28"
+        font-family="Plus Jakarta Sans,Arial,sans-serif" font-size="28"
         font-weight="bold" fill="#ffffff">8.5</text>
 </svg>`;
 

@@ -7,7 +7,7 @@
   directory    = "functions"
   node_bundler = "nft"
   # Tell NFT to include the TTF so sharedRender.js can read it at lambda runtime.
-  included_files = ["lib/NotoSans-Subset.ttf"]
+  included_files = ["lib/JakartaSans-Regular.ttf"]
 
 [[redirects]]
   from   = "/*"

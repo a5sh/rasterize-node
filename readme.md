@@ -9,7 +9,7 @@ repo-root/
 │   ├── sharedRender.js
 │   ├── renderPool.js
 │   ├── renderWorker.js
-│   └── NotoSans-Subset.ttf
+│   └── JakartaSans-Regular.ttf
 ├── scripts/
 │   └── build.mjs               ← copies core/ → {platform}/lib/
 ├── cloudflare/                  ← wrangler deploy root
@@ -193,7 +193,7 @@ scripts/build.mjs
   ├── reads: core/sharedRender.js
   ├── reads: core/renderPool.js
   ├── reads: core/renderWorker.js
-  └── reads: core/NotoSans-Subset.ttf
+  └── reads: core/JakartaSans-Regular.ttf
   │
   └── writes to: {platform}/lib/
 ```
@@ -205,7 +205,7 @@ scripts/build.mjs
 ## Font + bold consistency
 
 Every node in the fleet:
-1. Loads **only** `NotoSans-Subset.ttf` (Regular) — `loadSystemFonts: false`, no `fontDirs`
+1. Loads **only** `JakartaSans-Regular.ttf` (Plus Jakarta Sans Regular) — `loadSystemFonts: false`, no `fontDirs`
 2. Calls `applyFauxBold()` before every render — adds `stroke-width: 0.035em` to bold elements
 3. Covers `font-weight="bold"`, `style="font-weight: bold"`, `font-weight="600–900"`, and `<tspan>` children
 

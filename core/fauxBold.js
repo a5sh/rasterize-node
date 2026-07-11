@@ -1,6 +1,6 @@
 // core/fauxBold.js
 //
-// Faux-bold synthesis for rasterizers that ship NotoSans-Regular only.
+// Faux-bold synthesis for rasterizers that ship JakartaSans-Regular only.
 // Applied on ALL nodes so output is identical regardless of hosting platform.
 //
 // WHAT WAS BROKEN

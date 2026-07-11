@@ -59,8 +59,8 @@ export default {
         inTest: true,
         apiPath: "/api/rasterize",
         supportsHealthCheck: true,
-        useUrlPayload: true, // GET ?url= — no body, no poster embed needed
-        acceptsCompression: false,
+        useUrlPayload: false,
+        acceptsCompression: "gzip",
       },
       zones: { NA_EAST: 1, NA_WEST: 2, NA_CENTRAL: 1, SA: 3, UNKNOWN: 2 },
     },

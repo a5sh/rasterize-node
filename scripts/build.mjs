@@ -32,7 +32,7 @@ const CORE_FILES = [
   "serverlessReporter.js",
   "embedImages.js",
   "httpServer.js", // ← shared HTTP server factory (vps + render)
-  "NotoSans-Subset.ttf",
+  "JakartaSans-Regular.ttf",
   "b2p.js",
   "cache.js",
 ];
