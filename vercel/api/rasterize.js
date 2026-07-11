@@ -4,8 +4,6 @@
 //       icon placeholder expansion removed (main API worker pre-expands icons)
 //       embedExternalImages moved to shared lib/embedImages.js
 
-import "dotenv/config";
-
 // AFTER
 import { gunzipSync } from "node:zlib";
 import { Resvg } from "@resvg/resvg-js";

@@ -3,7 +3,6 @@
 // v7.2 — icon placeholder expansion removed (main API worker pre-expands)
 //       embedExternalImages moved to shared lib/embedImages.js
 
-import "dotenv/config";
 import { gunzipSync } from "node:zlib";
 import { Resvg } from "@resvg/resvg-js";
 import { applyFauxBold } from "../lib/fauxBold.js";
