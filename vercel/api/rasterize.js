@@ -233,7 +233,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // Raw SVG POST (no gzip: vercel has acceptsCompression: false)
+    // Raw SVG POST (gzip decompression via X-SVG-Encoding header)
     // AFTER
     if (!bodyBuf.length) return sendJson(res, 400, { error: "Empty SVG body" });
     recordRequest();
