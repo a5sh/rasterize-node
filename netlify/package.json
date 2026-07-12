@@ -6,7 +6,6 @@
     "build": "node ../scripts/build.mjs netlify"
   },
   "dependencies": {
-    "@resvg/resvg-js": "^2.6.2",
-    "lru-cache": "^11.5.2"
+    "@resvg/resvg-js": "^2.6.2"
   }
 }
