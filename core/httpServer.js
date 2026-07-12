@@ -214,11 +214,13 @@ export function createRasterServer({
       const t0 = Date.now();
       try {
         const { buffer, mimeType } = await renderSvg(payload.svgText, fmt);
-        recordJobDuration(Date.now() - t0);
+        const computeMs = Date.now() - t0;
+        recordJobDuration(computeMs);
         syncStats();
         res.writeHead(200, {
           "Content-Type": mimeType,
           "Cache-Control": "public, max-age=86400",
+          "X-Render-Ms": String(computeMs),
         });
         return res.end(buffer);
       } catch (resvgErr) {

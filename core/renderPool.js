@@ -13,6 +13,7 @@
 // Crash-restart uses exponential backoff (200 ms → 30 s) to prevent spawn storms.
 
 import { Worker } from "node:worker_threads";
+import { makeCacheKey, createRenderCache } from "./renderCache.js";
 
 const HEALTHY_UPTIME_MS = 5_000;
 const BASE_BACKOFF_MS = 200;
@@ -34,6 +35,7 @@ export class RenderPool {
     this._seq = 0;
     this._failureCounts = new Map();
     this._pendingRespawns = 0;
+    this._renderCache = createRenderCache();
 
     for (let i = 0; i < size; i++) this._spawn(i);
   }
@@ -135,12 +137,26 @@ export class RenderPool {
   }
 
   render(svgText, format = "png") {
+    const cacheKey = makeCacheKey(svgText, format);
+    const cached = this._renderCache.get(cacheKey);
+    if (cached) {
+      return Promise.resolve({ buffer: cached.buffer, mimeType: cached.mimeType });
+    }
+
     return new Promise((resolve, reject) => {
       const jobId = ++this._seq;
+      const wrappedResolve = (result) => {
+        this._renderCache.set(cacheKey, {
+          buffer: result.buffer,
+          mimeType: result.mimeType,
+          key: cacheKey,
+        });
+        resolve(result);
+      };
       const free = this._workers.find((w) => !w._busy);
       if (free)
-        this._dispatch(free, { jobId, svgText, format, resolve, reject });
-      else this._queue.push({ jobId, svgText, format, resolve, reject });
+        this._dispatch(free, { jobId, svgText, format, resolve: wrappedResolve, reject });
+      else this._queue.push({ jobId, svgText, format, resolve: wrappedResolve, reject });
     });
   }
 

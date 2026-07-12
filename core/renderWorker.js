@@ -8,28 +8,6 @@ import { getCachedPoster, setCachedPoster } from "./cache.js";
 const _require = createRequire(workerData.serverDir + "/_.js");
 const { Resvg } = _require("@resvg/resvg-js");
 
-// ── CRYPTO-FREE cache key ─────────────────────────────────────────────────────
-// Do NOT import createHash from node:crypto here.  On Render.com (and NFT-
-// bundled envs) it can resolve to the Web Crypto API which has no createHash().
-// A simple inline FNV-1a hash is entirely sufficient for a render-cache key.
-function simpleHash(str) {
-  let h = 0x811c9dc5;
-  // Only hash the first 4 KB — SVGs are large but the meaningful variance is
-  // in the first few hundred bytes (dimensions, viewBox, first elements).
-  const len = Math.min(str.length, 4096);
-  for (let i = 0; i < len; i++) {
-    h ^= str.charCodeAt(i);
-    h = Math.imul(h, 0x01000193);
-  }
-  // Also mix the tail (last 64 chars) to distinguish SVGs with shared prefixes
-  const tail = str.length > 4096 ? str.slice(-64) : "";
-  for (let i = 0; i < tail.length; i++) {
-    h ^= tail.charCodeAt(i);
-    h = Math.imul(h, 0x01000193);
-  }
-  return (h >>> 0).toString(36);
-}
-
 const OPTS = workerData.resvgOpts;
 
 // ── Pre-warm ──────────────────────────────────────────────────────────────────
@@ -101,26 +79,8 @@ async function embedExternalImages(svgText) {
 
 // ── Message handler ───────────────────────────────────────────────────────────
 
-const _renderCache = new Map();
-const RENDER_CACHE_TTL = 3 * 60_000;
-const MAX_RENDER_CACHE = 50;
-
 parentPort.on("message", async ({ jobId, svgText, format }) => {
   try {
-    const cacheKey = simpleHash(svgText) + ":" + format;
-    const cached = _renderCache.get(cacheKey);
-
-    if (cached && Date.now() < cached.expiry) {
-      const ab = cached.png.buffer.slice(
-        cached.png.byteOffset,
-        cached.png.byteOffset + cached.png.byteLength,
-      );
-      parentPort.postMessage({ jobId, buffer: ab, mimeType: cached.mime }, [
-        ab,
-      ]);
-      return;
-    }
-
     // AFTER — faux-bold runs on the small pre-embed SVG; embedding (which
     // inflates the string with base64 image data) happens last.
     const boldApplied = applyFauxBold(svgText);
@@ -142,15 +102,6 @@ parentPort.on("message", async ({ jobId, svgText, format }) => {
       buf = rendered.asPng();
       mime = "image/png";
     }
-
-    if (_renderCache.size >= MAX_RENDER_CACHE) {
-      _renderCache.delete(_renderCache.keys().next().value);
-    }
-    _renderCache.set(cacheKey, {
-      png: buf,
-      mime,
-      expiry: Date.now() + RENDER_CACHE_TTL,
-    });
 
     const ab = buf.buffer.slice(
       buf.byteOffset,

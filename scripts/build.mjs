@@ -35,6 +35,8 @@ const CORE_FILES = [
   "JakartaSans-Regular.ttf",
   "b2p.js",
   "cache.js",
+  "renderCache.js",
+  "serverlessHandler.js",
 ];
 
 const platform = process.argv[2];
@@ -67,7 +69,7 @@ console.log(
   `[build] Done. ${copied} file(s) copied to ${platform}/lib/${skipped > 0 ? ` (${skipped} skipped)` : ""}`,
 );
 
-const REQUIRED = ["fauxBold.js", "sharedRender.js", "httpServer.js"];
+const REQUIRED = ["fauxBold.js", "sharedRender.js", "httpServer.js", "serverlessHandler.js"];
 for (const f of REQUIRED) {
   if (!fs.existsSync(path.join(DEST_DIR, f))) {
     console.error(
