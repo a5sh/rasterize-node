@@ -237,6 +237,7 @@ export function createRasterServer({
               "Content-Type":
                 wsrvRes.headers.get("content-type") || "image/png",
               "Cache-Control": "public, max-age=86400",
+              "X-Render-Fallback": "wsrv",
             });
             return res.end(buf);
           } catch (wsrvErr) {
@@ -287,6 +288,7 @@ export function createRasterServer({
               return {
                 id: job.id,
                 status: "success",
+                fallback: "wsrv",
                 mimeType: wsrvRes.headers.get("content-type") || "image/png",
                 data: buf.toString("base64"),
               };
@@ -366,6 +368,7 @@ export function createRasterServer({
           res.writeHead(200, {
             "Content-Type": wsrvRes.headers.get("content-type") || "image/png",
             "Cache-Control": "public, max-age=86400",
+            "X-Render-Fallback": "wsrv",
           });
           res.end(buf);
         } catch (wsrvErr) {

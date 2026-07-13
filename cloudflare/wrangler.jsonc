@@ -21,15 +21,15 @@
     {
       // Rasterizer node performance metrics (existing)
       "binding": "RASTER_METRICS",
-      "dataset": "raster_metrics"
+      "dataset": "raster_metrics",
     },
     {
       // Per-request analytics including edge cache hits (new in v2)
       // Written by worker.js for every HTTP request, including cache hits.
       // Enables queries like "top 50 most requested IMDb IDs this week".
       "binding": "REQUEST_ANALYTICS",
-      "dataset": "request_analytics"
-    }
+      "dataset": "request_analytics",
+    },
   ],
   // AFTER
   // Cron: refresh fleet Discord embed hourly. Nodes never push status to this
@@ -60,7 +60,7 @@
     "VPS2_NODE_URL": "http://de20.spaceify.eu:26100",
     "VPS3_NODE_URL": "http://fr1.spaceify.eu:25980/",
     "DISCORD_WEBHOOK_URL": "https://discord.com/api/webhooks/1522125036109037703/ruJNatLHEuArZNkFxAY5oF2pupds5JALnqhwn18yUdzexyFtZxARQnAmyYAe77YThfw3",
-    "ALERTS_WEBHOOK_URL": "https://discord.com/api/webhooks/1522125036109037703/ruJNatLHEuArZNkFxAY5oF2pupds5JALnqhwn18yUdzexyFtZxARQnAmyYAe77YThfw3",
+    "ALERTS_WEBHOOK_URL": "https://discord.com/api/webhooks/1485865094695878800/a6_LaS5R6J6mbZXWvsMG6PTz9N0He5oG2yqsPWqs-olF5jmHMq0yuDYJ69n5zIdqnpGB",
   },
   "rules": [
     {
