@@ -1,22 +1,18 @@
-// vps/discord.js — local metrics + rate-limited Discord error alerts
+// vps/discord.js — local metrics + rate-limited error reports to the CF hub
 //
-// CF HUB REPORTING DELIBERATELY REMOVED.
-//
-// Previously, notifyOnline() / setInterval metrics posted to
-// https://r-cf.spicydevs.xyz/report — a route that doesn't exist on the CF
-// worker. Every POST fell through to the rasterize handler, which attempted
-// a full node-pool raster run, burning 5 s per attempt × N nodes × M restarts.
-// This caused the timeout flood visible in the Pterodactyl logs and put
-// significant load on the render pool.
-//
-// Node health is now observable via:
-//   GET /health          — live per-process metrics (pool, queue, uptime)
-//   CF worker /health    — fleet-wide EMA scores, in-flight counts
-//   Discord webhook      — critical errors only, rate-limited (see below)
+// ARCHITECTURE: nodes NEVER contact Discord webhooks directly. All alerting
+// flows through the central CF worker (r-cf.spicydevs.xyz/report), which
+// relays errors into the fleet webhooks. Reports are rate-limited here to
+// keep a crash loop (or hostile traffic) from spraying the hub.
 //
 // ENV VARS:
 //   CF_NODE_ID           optional — display name (must match CF registry id if used)
-//   DISCORD_WEBHOOK_URL  optional — if set, critical errors POST here (rate-limited)
+//   CF_REPORT_URL        optional — central worker /report endpoint
+//   NODE_NAME            optional — fallback display name
+//
+// Node health is also observable via:
+//   GET /health          — live per-process metrics (pool, queue, uptime)
+//   CF worker /health    — fleet-wide EMA scores, in-flight counts
 
 import os from "node:os";
 
@@ -26,22 +22,23 @@ const NODE_NAME =
   process.env.SERVER_NAME ||
   os.hostname();
 
-const DISCORD_WEBHOOK = process.env.DISCORD_WEBHOOK_URL || null;
+const CF_REPORT_URL =
+  process.env.CF_REPORT_URL || "https://r-cf.spicydevs.xyz/report";
 
-// ── Error-post rate limiter ───────────────────────────────────────────────────
+// ── Report rate limiter ───────────────────────────────────────────────────────
 // Hard cap: at most ERR_BURST_MAX posts per ERR_WINDOW_MS, with a minimum
 // gap of ERR_MIN_GAP_MS between consecutive posts.
-// Prevents a crash loop from spamming the webhook.
+// Prevents a crash loop from hammering the central worker.
 
 const ERR_WINDOW_MS = 5 * 60_000; // 5-minute window
-const ERR_BURST_MAX = 3; // max Discord posts per window
+const ERR_BURST_MAX = 3; // max hub posts per window
 const ERR_MIN_GAP_MS = 10_000; // minimum 10 s between posts
 
 let _errCount = 0;
 let _errWindowEnd = 0;
 let _lastPost = 0;
 
-function _canPostDiscord() {
+function _canReport() {
   const now = Date.now();
   if (now > _errWindowEnd) {
     _errCount = 0;
@@ -80,28 +77,17 @@ export function recordError(msg) {
   stats.lastError = { message: msg, ts: Date.now() };
 }
 
-// ── Discord webhook (fire-and-forget, rate-limited) ───────────────────────────
+// ── Central-worker report (fire-and-forget, rate-limited) ─────────────────────
 
-async function _postDiscord(title, description) {
-  if (!DISCORD_WEBHOOK || !_canPostDiscord()) return;
+async function _postReport(type, extra = {}) {
+  if (!_canReport()) return;
   _errCount++;
   _lastPost = Date.now();
   try {
-    await fetch(DISCORD_WEBHOOK, {
+    await fetch(CF_REPORT_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        username: `Posterium VPS — ${NODE_NAME}`,
-        embeds: [
-          {
-            title,
-            description: description?.slice(0, 2000),
-            color: 0xf87171,
-            timestamp: new Date().toISOString(),
-            footer: { text: NODE_NAME },
-          },
-        ],
-      }),
+      body: JSON.stringify({ type, node: NODE_NAME, ts: Date.now(), ...extra }),
       signal: AbortSignal.timeout(5_000),
     });
   } catch {
@@ -114,20 +100,17 @@ async function _postDiscord(title, description) {
 export async function logError(title, description) {
   recordError(description);
   console.error(`[error] ${title}: ${description}`);
-  _postDiscord(title, description).catch(() => {}); // non-blocking
+  _postReport("error", { title: title.slice(0, 200), message: description?.slice(0, 1000) }); // non-blocking
 }
 
 export async function notifyOnline() {
   stats.status = "online";
   console.log(`[reporter] Node "${NODE_NAME}" online — health at /health`);
-  // No CF hub call. Fleet status is read by the CF worker polling /health directly.
+  _postReport("online", { reason: "boot" });
 }
 
 export async function notifyOffline(reason = "SIGTERM") {
   stats.status = "offline";
   console.log(`[reporter] Node "${NODE_NAME}" shutting down (${reason})`);
-  await _postDiscord(
-    "Node Offline",
-    `**${NODE_NAME}** shutting down: \`${reason}\``,
-  );
+  await _postReport("offline", { reason });
 }

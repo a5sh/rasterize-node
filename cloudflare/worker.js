@@ -55,6 +55,61 @@ import {
   getLastDashboardUpdate,
 } from "./lib/dashboard.js";
 import { runFleetSync } from "./lib/fleetSync.js";
+import { BRAND } from "./lib/embedBrand.js";
+
+// ── Node-error relay rate limiter ─────────────────────────────────────────────
+// Mirrors the nodes' own report limiter: at most MAX posts per window with a
+// minimum gap — a node crash loop (or junk traffic) can't spray the webhook.
+
+const NODE_ERR_WINDOW_MS = 5 * 60_000;
+const NODE_ERR_BURST_MAX = 3;
+const NODE_ERR_MIN_GAP_MS = 10_000;
+
+let _relayCount = 0;
+let _relayWindowEnd = 0;
+let _relayLastPost = 0;
+
+function _canRelayError() {
+  const now = Date.now();
+  if (now > _relayWindowEnd) {
+    _relayCount = 0;
+    _relayWindowEnd = now + NODE_ERR_WINDOW_MS;
+  }
+  if (_relayCount >= NODE_ERR_BURST_MAX) return false;
+  if (now - _relayLastPost < NODE_ERR_MIN_GAP_MS) return false;
+  return true;
+}
+
+async function relayNodeError(env, log, { node, title, message, ts }) {
+  if (!env.DISCORD_WEBHOOK_URL || !_canRelayError()) return;
+  _relayCount++;
+  _relayLastPost = Date.now();
+  log("info", "fleet_error_relay", { node, title });
+  try {
+    await fetch(env.DISCORD_WEBHOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        username: "Posterium Alerts",
+        avatar_url: BRAND.appIcon,
+        embeds: [
+          {
+            title: `🚨 ${title}`,
+            description: message?.slice(0, 2000) || "No details",
+            color: 0xf87171,
+            thumbnail: { url: BRAND.appIcon },
+            fields: [{ name: "Node", value: node, inline: true }],
+            footer: { text: `node report · ${node}` },
+            timestamp: new Date(ts || Date.now()).toISOString(),
+          },
+        ],
+      }),
+      signal: AbortSignal.timeout(5_000),
+    });
+  } catch {
+    // fire-and-forget — never propagate
+  }
+}
 
 // ── Structured logger ──────────────────────────────────────────────────────────
 
@@ -213,21 +268,44 @@ export default {
       });
     }
 
-    // ── /report — legacy Vercel/Netlify online/metrics beacon ──────────────
-    // core/serverlessReporter.js still POSTs here (CF_REPORT_URL). The
-    // beacon is buffered to DASHBOARD_KV ("fleet:heartbeat:<node>") and
-    // merged into the fleet snapshot by the 15-minute cron in fleetSync.js.
+    // ── /report — node status/error beacon ────────────────────────────────────
+    // core/serverlessReporter.js and vps|render discord.js POST here
+    // (CF_REPORT_URL). 'online'/'metrics' reports are buffered to DASHBOARD_KV
+    // ("fleet:heartbeat:<node>") and merged into the fleet snapshot by the
+    // 15-minute cron in fleetSync.js; 'error'/'offline' reports are relayed
+    // into the fleet Discord webhook right away (rate-limited below) and are
+    // NOT written to the heartbeat buffer.
     if (request.method === "POST" && url.pathname === "/report") {
       try {
         const body = await request.json().catch(() => null);
         if (!body?.node) return _jsonError(400, "missing node");
+        if (body.type === "error") {
+          await relayNodeError(env, _log, {
+            node: body.node,
+            title: body.title || "Node reported an error",
+            message: body.message || "",
+            ts: body.ts || Date.now(),
+          });
+          return _jsonOk({ ok: true, relayed: true });
+        }
+        if (body.type === "offline") {
+          await relayNodeError(env, _log, {
+            node: body.node,
+            title: body.reason ? `Node offline — ${body.reason}` : "Node offline",
+            message: body.message || "",
+            ts: body.ts || Date.now(),
+          });
+          return _jsonOk({ ok: true, relayed: true });
+        }
+        if (body.type !== "metrics" && body.type !== "online")
+          return _jsonError(400, "unknown report type");
         await env.DASHBOARD_KV.put(
           `fleet:heartbeat:${body.node}`,
           JSON.stringify({ at: Date.now(), ...body }),
         );
         return _jsonOk({ ok: true });
       } catch (e) {
-        return _jsonError(502, e?.message || "kv write failed");
+        return _jsonError(502, e?.message || "report failed");
       }
     }
 
