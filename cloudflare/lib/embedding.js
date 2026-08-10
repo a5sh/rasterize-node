@@ -1,31 +1,34 @@
 // cloudflare/lib/embedding.js
 //
-// Single-poster embedding for Worker B, CF-cache-backed for 5 minutes
-// (keyed by poster URL + a hash of the SVG's first 4096 chars + last 64
-// chars, which captures layout including badge positions and title content
-// — not just the <defs> prefix — so requests that only differ in
-// title/badge params get distinct cache entries).
+// Single-poster embedding for Worker B, CF-cache-backed for 5 minutes.
+//
+// The cache key hashes the ENTIRE posterUrl and the ENTIRE svgText with
+// SHA-256 (previously the SVG hash only covered the first 4096 chars + last
+// 64, which collapsed towards a single value once icon <symbol> defs pushed
+// the poster href / title / badge values past the 4096-char window — that
+// made concurrent requests for different movies share cache entries).
+//
+// Cache hits are additionally verified: every entry is written with an
+// X-Embed-Url-Hash header, and a hit is only served when that header matches
+// the current posterUrl's hash. Entries without the header (old format) are
+// treated as misses and re-embedded once.
 //
 // Embed-outcome analytics datapoint (RASTER_METRICS, blob1 = 'embed'):
 //   blob5 = outcome  'success' | 'failure'
 //   blob6 = errorReason  '' on success, 'http_NNN' | 'throw:...' on failure
 //   double1 = embedMs
 
-function hashStr(str) {
-  let h = 0x811c9dc5;
-  const len = Math.min(str.length, 4096);
-  for (let i = 0; i < len; i++) {
-    h ^= str.charCodeAt(i);
-    h = Math.imul(h, 0x01000193) >>> 0;
+async function sha256Hex(str) {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(str),
+  );
+  const bytes = new Uint8Array(digest);
+  let hex = "";
+  for (let i = 0; i < bytes.length; i++) {
+    hex += bytes[i].toString(16).padStart(2, "0");
   }
-  // Mix in the last 64 chars so SVGs with shared <defs> prefixes but different
-  // badge/title content downstream produce distinct keys.
-  const tail = str.length > 4096 ? str.slice(-64) : "";
-  for (let i = 0; i < tail.length; i++) {
-    h ^= tail.charCodeAt(i);
-    h = Math.imul(h, 0x01000193) >>> 0;
-  }
-  return h.toString(36);
+  return hex;
 }
 
 function bufToB64(buffer) {
@@ -77,13 +80,22 @@ export async function embedPoster(
 ) {
   if (!posterUrl) return { svg: svgText, embedMs: 0, embedded: false };
 
-  const cacheKey = `poster-embed:${hashStr(posterUrl)}:${hashStr(svgText)}`;
+  // Full-string SHA-256 of BOTH inputs — no truncation windows, so posters
+  // that differ anywhere (href, title, badge values, layout) get distinct
+  // keys even when their shared <defs>/icon boilerplate dwarfs the rest.
+  const [urlHash, svgHash] = await Promise.all([
+    sha256Hex(posterUrl),
+    sha256Hex(svgText),
+  ]);
+  const cacheKey = `poster-embed:${urlHash}:${svgHash}`;
   const cacheReq = new Request(`https://embed-cache.internal/${cacheKey}`);
   const cache = caches.default;
 
   try {
     const hit = await cache.match(cacheReq);
-    if (hit) {
+    // Sanity guard on top of the key: only serve the hit when it was written
+    // for THIS poster URL. Old entries (no header) are re-embedded once.
+    if (hit && hit.headers.get("x-embed-url-hash") === urlHash) {
       const svg = await hit.text();
       log("debug", "embed_cache_hit", { key: cacheKey.slice(0, 40) });
       return { svg, embedMs: 0, embedded: true, fromCache: true };
@@ -123,6 +135,7 @@ export async function embedPoster(
           headers: {
             "Content-Type": "image/svg+xml",
             "Cache-Control": "public, max-age=300",
+            "X-Embed-Url-Hash": urlHash,
           },
         }),
       );
