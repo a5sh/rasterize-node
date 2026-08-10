@@ -26,6 +26,7 @@
 // status, concurrencyLimit, activeJobs, samples. Extra keys are fine.
 
 import NODE_CONFIG from "../../assets/nodes.config.js";
+import { BRAND, actionRowLinkButtons } from "./embedBrand.js";
 
 const EMA_ALPHA = 0.2;
 const FAILING_THRESHOLD = 8;
@@ -361,20 +362,32 @@ async function tryAlert(env, log, meta, nodeId, kind, now) {
     },
   }[kind];
   if (!copy) return;
+  const node = nodeMeta(nodeId);
+  const tier = node?.specs?.tier === 2 ? "T2 Fallback" : "T1 Primary";
+  const poolStr = `${tier}${node?.region ? ` · ${node.region}` : ""}`;
   try {
-    const res = await fetch(url, {
+    const res = await fetch(`${url}?with_components=true`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         username: "Posterium Alerts",
+        avatar_url: BRAND.appIcon,
         embeds: [
           {
             title: copy.title,
             description: copy.desc,
             color: copy.color,
+            thumbnail: { url: BRAND.appIcon },
+            fields: [
+              { name: "Node", value: label, inline: true },
+              { name: "Pool", value: poolStr, inline: true },
+            ],
+            footer: { text: nodeId },
             timestamp: new Date(now).toISOString(),
           },
         ],
+        // Link-button Action Row — non-interactive components, webhook-compatible.
+        components: actionRowLinkButtons(),
       }),
       signal: AbortSignal.timeout(5_000),
     });

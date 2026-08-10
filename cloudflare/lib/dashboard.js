@@ -15,6 +15,18 @@
 // calls updateDashboard() with it. Nothing here talks to Durable Objects
 // or queries Analytics Engine. Per-node /health details refresh every
 // 15 minutes; the short analytics window (row.window) refreshes hourly.
+//
+// Embed presentation is shared with fleetSync.js alerts via embedBrand.js
+// (frontend public/ assets served from posterium.xyz + link-button Action
+// Row — webhooks only support non-interactive components).
+
+import { BRAND, actionRowLinkButtons } from "./embedBrand.js";
+import NODE_CONFIG from "../../assets/nodes.config.js";
+
+// Node views passed in from fleetSync (T1_NODES/T2_NODES) are the FLAT
+// registry shape — no label/region/specs. Resolve display metadata from the
+// full NODE_CONFIG so labels aren't lost (they were "undefined" before).
+const nodeMeta = (id) => NODE_CONFIG.nodes.find((n) => n.id === id) || null;
 
 export async function getLastDashboardUpdate(env) {
   try {
@@ -72,10 +84,19 @@ export async function updateDashboard(env, snapshot, log, { t1Nodes, t2Nodes } =
       ? `${Math.floor(ms / 3600000)}h${Math.floor((ms % 3600000) / 60000)}m`
       : "—";
 
-  const fields = allNodes.map((n) => {
+  const fields = [];
+  const sectionHeader = (text) =>
+    fields.push({ name: text, value: "\u200B", inline: false });
+  const nodeField = (n) => {
+    const meta = nodeMeta(n.id);
     const r = snapshot?.[n.id] || null;
     if (!r) {
-      return { name: "\u200B", value: `**${n.label}**\nNo data yet`, inline: true };
+      fields.push({
+        name: `⚪ ${meta?.label || n.id}`,
+        value: "No data yet",
+        inline: true,
+      });
+      return;
     }
 
     const limitStr =
@@ -106,7 +127,6 @@ export async function updateDashboard(env, snapshot, log, { t1Nodes, t2Nodes } =
       : null;
 
     const lines = [
-      `${emoji(n, r)} **${n.label}**`,
       r.status === "offline"
         ? `❌ Offline${r.down_since ? ` (${Math.floor((Date.now() - r.down_since) / 60000)}m)` : ""}`
         : n.supportsHealthCheck
@@ -120,24 +140,62 @@ export async function updateDashboard(env, snapshot, log, { t1Nodes, t2Nodes } =
         : `No samples yet  Limit${limitStr}`,
     ].filter(Boolean);
 
-    return { name: "\u200B", value: lines.join("\n"), inline: true };
-  });
+    fields.push({
+      name: `${emoji(n, r)} ${meta?.label || n.id}`,
+      value: lines.join("\n"),
+      inline: true,
+    });
+  };
+
+  // T1 primary pool first, then T2 fallback — each under its own header field.
+  if (t1Nodes?.length) {
+    sectionHeader("🥇 Tier 1 — Primary pool");
+    for (const n of t1Nodes) nodeField(n);
+  }
+  if (t2Nodes?.length) {
+    sectionHeader("🥈 Tier 2 — Fallback pool");
+    for (const n of t2Nodes) nodeField(n);
+  }
 
   const rows = Object.entries(snapshot || {}).filter(([id]) => allIds.has(id));
   const anyDown = rows.some(([, r]) => r.status === "offline");
   const anyFailing = rows.some(([, r]) => r.failing);
   const anyStressed = rows.some(([, r]) => r.stressed);
 
+  // One-line fleet summary under the title.
+  const counts = { online: 0, offline: 0, failing: 0, stressed: 0 };
+  for (const [, r] of rows) {
+    if (r.status === "offline") counts.offline++;
+    else counts.online++;
+    if (r.failing) counts.failing++;
+    else if (r.stressed) counts.stressed++;
+  }
+  const totalReq = rows.reduce((s, [, r]) => s + (r.total_requests ?? 0), 0);
+  const summaryBits = [
+    `**${counts.online}/${rows.length} nodes online**`,
+    `${fmt(totalReq)} requests served`,
+  ];
+  if (counts.failing) summaryBits.push(`🚨 ${counts.failing} failing`);
+  else if (counts.stressed) summaryBits.push(`🟡 ${counts.stressed} stressed`);
+  if (counts.offline) summaryBits.push(`🔴 ${counts.offline} down`);
+
   const payload = {
-    username: "Posterium LB — v14",
+    username: "Posterium Fleet",
+    avatar_url: BRAND.appIcon,
     embeds: [
       {
         title: "🖼️ Raster Node Fleet",
-        color: anyDown || anyFailing ? 0xf87171 : anyStressed ? 0xfacc15 : 0x4ade80,
+        description: summaryBits.join(" · "),
+        color:
+          anyDown || anyFailing ? 0xf87171 : anyStressed ? 0xfacc15 : 0x4ade80,
+        thumbnail: { url: BRAND.appIcon },
         fields,
-        footer: { text: `Health 15-min · Analytics hourly · ${new Date().toISOString()}` },
+        footer: { text: "Health every 15m · analytics hourly" },
+        timestamp: new Date().toISOString(),
       },
     ],
+    // Link-button Action Row — non-interactive components, webhook-compatible.
+    components: actionRowLinkButtons(),
   };
 
   let messageId = null;
@@ -148,7 +206,7 @@ export async function updateDashboard(env, snapshot, log, { t1Nodes, t2Nodes } =
   if (messageId) {
     try {
       const editRes = await fetch(
-        `${env.DISCORD_WEBHOOK_URL}/messages/${messageId}`,
+        `${env.DISCORD_WEBHOOK_URL}/messages/${messageId}?with_components=true`,
         {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
@@ -169,7 +227,7 @@ export async function updateDashboard(env, snapshot, log, { t1Nodes, t2Nodes } =
   }
 
   try {
-    const postRes = await fetch(`${env.DISCORD_WEBHOOK_URL}?wait=true`, {
+    const postRes = await fetch(`${env.DISCORD_WEBHOOK_URL}?wait=true&with_components=true`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
