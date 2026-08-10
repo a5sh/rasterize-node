@@ -21,13 +21,6 @@
 //   double5 = payloadKb        SVG payload size in KB
 //   double6 = nodeScore        EMA score at moment of selection (lower = better)
 //
-// Per-request summary datapoint (written by logRequest, blob1 = 'req'):
-//   double1 = totalWallMs
-//   double2 = attemptsMade
-//   double3 = 1                for count queries
-//   double4 = posterEmbedMs
-//   double5 = payloadKb
-//
 // ── CPU performance proxy (useful AE query) ───────────────────────────────────
 //   Serial-equivalent CPU time ≈ double1 * (1 + double4)
 //   SELECT blob1 AS node,
@@ -85,24 +78,8 @@ export function logAttempt(
     });
   } catch (_) {}
 }
-export function logRequest(
-  env,
-  {
-    format,
-    inputType,
-    colo,
-    totalWallMs,
-    attemptsMade,
-    posterEmbedMs,
-    payloadKb,
-    outcome,
-  },
-) {
-  try {
-    env?.RASTER_METRICS?.writeDataPoint({
-      blobs: ["req", format, inputType, colo, outcome, "", "wall", ""],
-      doubles: [totalWallMs, attemptsMade, 1, posterEmbedMs, payloadKb],
-      indexes: ["req"],
-    });
-  } catch (_) {}
-}
+// NOTE: the per-request summary row (blob1 = 'req') is written exactly ONCE
+// per request by Worker A (handlers/posterAnalytics.js writeWallTime) — it
+// covers every path, including binding-unavailable and SVG-generation
+// failures that never reach Worker B. logRequest() was removed here to
+// avoid a duplicate datapoint per raster request.

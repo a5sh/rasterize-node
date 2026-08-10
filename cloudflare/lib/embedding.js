@@ -41,26 +41,13 @@ function bufToB64(buffer) {
   return btoa(bin);
 }
 
-function logEmbedOutcome(env, { ok, embedMs, reason }) {
-  try {
-    env?.RASTER_METRICS?.writeDataPoint({
-      blobs: [
-        "embed",
-        "",
-        "",
-        "",
-        ok ? "success" : "failure",
-        reason,
-        "embed",
-        "",
-      ],
-      doubles: [embedMs, ok ? 200 : 0, 0, 0, 0],
-      indexes: ["embed"],
-    });
-  } catch (_) {}
-}
-
 /**
+ * Embed outcome no longer writes a RASTER_METRICS row — that was ~1
+ * datapoint per request ("embed"-tagged), redundant with the per-attempt
+ * rows and Worker A's per-request wall-time row. Errors still surface via
+ * the warn-level logs below; cache-readiness is visible from the serverless
+ * /health iconCache fields.
+ *
  * Fetch the poster image ONCE and embed it as a base64 data URI, replacing
  * every href="posterUrl" occurrence in the SVG.
  *
@@ -97,7 +84,6 @@ export async function embedPoster(
     // for THIS poster URL. Old entries (no header) are re-embedded once.
     if (hit && hit.headers.get("x-embed-url-hash") === urlHash) {
       const svg = await hit.text();
-      log("debug", "embed_cache_hit", { key: cacheKey.slice(0, 40) });
       return { svg, embedMs: 0, embedded: true, fromCache: true };
     }
   } catch (_) {
@@ -115,11 +101,6 @@ export async function embedPoster(
       log("warn", "poster_embed_http_err", {
         status: res.status,
         url: posterUrl.slice(0, 100),
-      });
-      logEmbedOutcome(env, {
-        ok: false,
-        embedMs: Date.now() - t0,
-        reason: `http_${res.status}`,
       });
       return { svg: svgText, embedMs: Date.now() - t0, embedded: false };
     }
@@ -143,17 +124,11 @@ export async function embedPoster(
       /* non-fatal */
     }
 
-    logEmbedOutcome(env, { ok: true, embedMs: Date.now() - t0, reason: "" });
     return { svg, embedMs: Date.now() - t0, embedded: true };
   } catch (e) {
     log("warn", "poster_embed_failed", {
       reason: e?.message,
       url: posterUrl.slice(0, 100),
-    });
-    logEmbedOutcome(env, {
-      ok: false,
-      embedMs: Date.now() - t0,
-      reason: `throw:${e?.message?.slice(0, 60) || "unknown"}`,
     });
     return { svg: svgText, embedMs: Date.now() - t0, embedded: false };
   }

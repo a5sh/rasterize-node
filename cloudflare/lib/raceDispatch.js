@@ -19,6 +19,9 @@
 //     whichever attempt happened to resolve successfully inside its own
 //     promise body (previously `isWinner: result.ok` could tag every
 //     successful racer as a winner, not just the one actually returned).
+//   • logRequest() removed — the per-request 'req' summary row is written
+//     exactly once by Worker A (writeWallTime), so Worker B no longer emits
+//     a duplicate datapoint per poster request.
 //
 // fleetBridge.refreshScores feeds the KV fleet snapshot (written every
 // 15 minutes by fleetSync.js from Analytics Engine stats + health polls)
@@ -30,7 +33,7 @@
 import { geoOrderNodes, COLO_REGION } from "./geoRouting.js";
 import { tryNode } from "./nodeAttempt.js";
 import { embedPoster } from "./embedding.js";
-import { logRequest, logAttempt } from "./metricsWriter.js";
+import { logAttempt } from "./metricsWriter.js";
 
 const GROUP_SIZE_ESCALATED = 2;
 const HARD_WALL_MS = 5_000;
@@ -247,16 +250,6 @@ export async function distributedRender({
     }
     const winner = await raceGroup(group, remainingBudget, "t1");
     if (winner.ok) {
-      logRequest(env, {
-        format,
-        inputType,
-        colo,
-        totalWallMs: elapsed(),
-        attemptsMade,
-        posterEmbedMs: embedMs,
-        payloadKb,
-        outcome: "success",
-      });
       flushHealthReport();
       return buildImageResp(
         winner.res,
@@ -285,16 +278,6 @@ export async function distributedRender({
     const t2Group = wsrvNode ? [node, wsrvNode] : [node];
     const winner = await raceGroup(t2Group, remainingBudget, "t2");
     if (winner.ok) {
-      logRequest(env, {
-        format,
-        inputType,
-        colo,
-        totalWallMs: elapsed(),
-        attemptsMade,
-        posterEmbedMs: embedMs,
-        payloadKb,
-        outcome: "success_t2",
-      });
       flushHealthReport();
       return buildImageResp(
         winner.res,
@@ -316,16 +299,6 @@ export async function distributedRender({
     format,
     attempts: attemptsMade,
     wallMs,
-  });
-  logRequest(env, {
-    format,
-    inputType,
-    colo,
-    totalWallMs: wallMs,
-    attemptsMade,
-    posterEmbedMs: embedMs,
-    payloadKb,
-    outcome: "failure",
   });
   flushHealthReport();
 
