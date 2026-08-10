@@ -38,7 +38,7 @@ const SYNC_FILES = [
   ["vps/server.js", "vps/server.js"],
   ["vps/discord.js", "vps/discord.js"],
   ["vps/lib.js", "vps/lib.js"],
-  // Core shared modules
+  ["core/renderCache.js", "core/renderCache.js"],
   ["core/renderPool.js", "core/renderPool.js"],
   ["core/renderWorker.js", "core/renderWorker.js"],
   ["core/sharedRender.js", "core/sharedRender.js"],
