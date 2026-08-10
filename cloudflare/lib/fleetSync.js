@@ -491,10 +491,11 @@ export async function runFleetSync(
   // Dashboard refresh every 15 minutes (reads the fresh snapshot only);
   // with force=true /manual always refreshes the embed.
   const lastDash = Number(meta.lastDashboardUpdate || 0) || 0;
-  if (
-    (force || now - lastDash >= DASHBOARD_INTERVAL_MS) &&
-    env.DISCORD_WEBHOOK_URL
-  ) {
+  if (!env.DISCORD_WEBHOOK_URL) {
+    log("warn", "fleet_dashboard_skipped", {
+      reason: "DISCORD_WEBHOOK_URL not set in deployed env",
+    });
+  } else if (force || now - lastDash >= DASHBOARD_INTERVAL_MS) {
     const { updateDashboard } = await import("./dashboard.js");
     try {
       await updateDashboard(env, rows, log, { t1Nodes, t2Nodes });
