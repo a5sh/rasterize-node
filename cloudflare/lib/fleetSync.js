@@ -398,7 +398,11 @@ async function tryAlert(env, log, meta, nodeId, kind, now) {
 }
 
 // ── Main cron entry ────────────────────────────────────────────────────────
-export async function runFleetSync(env, log, { t1Nodes, t2Nodes } = {}) {
+export async function runFleetSync(
+  env,
+  log,
+  { t1Nodes, t2Nodes, force = false } = {},
+) {
   const allNodes = [...(t1Nodes || []), ...(t2Nodes || [])];
   const kv = env?.DASHBOARD_KV;
   if (!kv) {
@@ -413,8 +417,10 @@ export async function runFleetSync(env, log, { t1Nodes, t2Nodes } = {}) {
   // AE query is HOURLY — health polls + heartbeat collection stay on the
   // 15-min cadence. The dashboard embed reflects both: fresh /health
   // details every tick, analytics window frozen between hourly queries.
+  // force=true (the /manual debug endpoint) skips the cooldowns so every
+  // stage runs regardless of how long ago it last ran.
   const lastAnalyticsAt = Number(meta.lastAnalyticsAt || 0) || 0;
-  const analyticsDue = now - lastAnalyticsAt >= ANALYTICS_INTERVAL_MS;
+  const analyticsDue = force || now - lastAnalyticsAt >= ANALYTICS_INTERVAL_MS;
   let aeStats = null;
   if (analyticsDue) {
     aeStats = await queryAeWindow(env, log);
@@ -482,9 +488,13 @@ export async function runFleetSync(env, log, { t1Nodes, t2Nodes } = {}) {
     for (const kind of kinds) await tryAlert(env, log, meta, n.id, kind, now);
   }
 
-  // Dashboard refresh every 15 minutes (reads the fresh snapshot only)
+  // Dashboard refresh every 15 minutes (reads the fresh snapshot only);
+  // with force=true /manual always refreshes the embed.
   const lastDash = Number(meta.lastDashboardUpdate || 0) || 0;
-  if (now - lastDash >= DASHBOARD_INTERVAL_MS && env.DISCORD_WEBHOOK_URL) {
+  if (
+    (force || now - lastDash >= DASHBOARD_INTERVAL_MS) &&
+    env.DISCORD_WEBHOOK_URL
+  ) {
     const { updateDashboard } = await import("./dashboard.js");
     try {
       await updateDashboard(env, rows, log, { t1Nodes, t2Nodes });

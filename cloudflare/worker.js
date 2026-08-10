@@ -231,6 +231,28 @@ export default {
       }
     }
 
+    // ── /manual — debug: force a full fleet sync (AE analytics + health
+    //    polls + heartbeat collection + Discord dashboard update) outside the
+    //    15-min cron, ignoring the hourly/dashboard cooldowns. Same code path
+    //    as scheduled(), via runFleetSync(force:true).
+    if (url.pathname === "/manual") {
+      if (request.method !== "GET" && request.method !== "POST")
+        return _jsonError(405, "Method not allowed");
+      try {
+        await runFleetSync(env, _log, {
+          t1Nodes: T1_NODES,
+          t2Nodes: T2_NODES,
+          force: true,
+        });
+        return _jsonOk({ ok: true, at: new Date().toISOString() });
+      } catch (e) {
+        return _jsonError(
+          502,
+          e?.message?.slice(0, 200) || "fleet sync failed",
+        );
+      }
+    }
+
     // ── Main rasterization ─────────────────────────────────────────────────
     if (request.method !== "POST" && request.method !== "GET")
       return _jsonError(405, "Method not allowed");
