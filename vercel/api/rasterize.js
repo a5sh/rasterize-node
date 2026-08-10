@@ -21,7 +21,17 @@ function readBody(req) {
     const chunks = [];
     req.on("data", (c) => chunks.push(c));
     req.on("end", () => resolve(Buffer.concat(chunks)));
-    req.on("error", reject);
+    req.on("error", (err) => {
+      err._clientAbort = true;
+      reject(err);
+    });
+    req.on("close", () => {
+      if (!req.complete) {
+        const err = new Error("Client aborted mid-upload");
+        err._clientAbort = true;
+        reject(err);
+      }
+    });
   });
 }
 
@@ -98,7 +108,16 @@ export default async function handler(req, res) {
 
   if (req.method === "POST") {
     const ct = req.headers["content-type"] || "";
-    const bodyBuf = await readBody(req);
+    let bodyBuf;
+    try {
+      bodyBuf = await readBody(req);
+    } catch (e) {
+      // Aborted/truncated upload (e.g. LB race loser closed the connection
+      // mid-body). Never render a partial body — reject instead.
+      if (e?._clientAbort)
+        return sendJson(res, 400, { error: "Client aborted mid-upload" });
+      throw e;
+    }
 
     if (ct.includes("application/json")) {
       if (!bodyBuf.length)
@@ -174,7 +193,12 @@ export default async function handler(req, res) {
     const encoding = (
       req.headers["x-svg-encoding"] || ""
     ).toLowerCase();
-    const svgText = decompressBody(bodyBuf, encoding);
+    let svgText;
+    try {
+      svgText = decompressBody(bodyBuf, encoding);
+    } catch (e) {
+      return sendJson(res, 400, { error: e.message });
+    }
     try {
       const { buffer, mimeType, computeMs } = await renderWithCache(
         svgText,

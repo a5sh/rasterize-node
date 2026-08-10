@@ -28,7 +28,11 @@ export function createServerlessHandler(nodeName) {
       try {
         return gunzipSync(buf).toString("utf8");
       } catch {
-        /* fall through */
+        // No valid fallback: an encoding header means the body IS compressed
+        // (or corrupt). Falling through to raw bytes would hand gzip magic
+        // bytes to resvg and guarantee a "unknown token at 1:1" failure, so
+        // throw instead — callers return a clean 400 without rendering.
+        throw new Error("SVG body decompression failed (gzip)");
       }
     }
     return buf.toString("utf8");

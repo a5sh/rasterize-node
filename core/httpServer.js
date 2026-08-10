@@ -28,9 +28,12 @@ export function decompressSvgBody(buf, req) {
     if (encoding === "br" || encoding === "brotli")
       return brotliDecompressSync(buf);
   } catch (e) {
-    console.warn(
-      `[decompress] Failed (${encoding}): ${e.message} — using raw body`,
-    );
+    // No valid "raw" fallback exists: an encoding header means the body IS
+    // compressed (or corrupt). Feeding the raw bytes to resvg guarantees a
+    // parse failure at 1:1, so signal failure instead — the caller rejects
+    // the request without touching the render pipeline.
+    console.warn(`[decompress] Failed (${encoding}): ${e.message}`);
+    return null;
   }
   return buf;
 }
@@ -416,6 +419,10 @@ export function createRasterServer({
       recordRequest();
       const rawBodyBuf = req.method === "POST" ? await readBody(req) : null;
       const bodyBuf = rawBodyBuf ? decompressSvgBody(rawBodyBuf, req) : null;
+      if (rawBodyBuf && bodyBuf === null) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ error: "SVG body decompression failed" }));
+      }
       syncStats();
 
       if (pathname === "/b2p") return handleB2p(req, res, params, bodyBuf);

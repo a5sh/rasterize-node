@@ -170,7 +170,12 @@ export const handler = async (event) => {
       return jsonResp(400, { error: "Empty SVG body" });
     recordRequest();
     const encoding = headers["x-svg-encoding"] || "";
-    const svgText = decompressBody(bodyBuf, encoding);
+    let svgText;
+    try {
+      svgText = decompressBody(bodyBuf, encoding);
+    } catch (e) {
+      return jsonResp(400, { error: e.message });
+    }
     try {
       const { buffer, mimeType, computeMs } = await renderWithCache(
         svgText,
