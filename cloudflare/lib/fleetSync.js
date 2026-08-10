@@ -6,7 +6,9 @@
 //   1. Queries RASTER_METRICS (Analytics Engine HTTP SQL API — the only
 //      in-Worker path; there is no binding-level query API) for per-node
 //      stats over the last 15 minutes: samples, avg attempt ms, wins,
-//      failures. Rolled into each node's EMA score.
+//      failures. Rolled into each node's EMA score. The query runs
+//      HOURLY (ANALYTICS_INTERVAL_MS); on cooldown ticks the last known
+//      window stats and errCount are carried forward so flags don't flap.
 //   2. Health-polls every /health-capable node that hasn't reported in
 //      STALE_REPORT_MS (capped at MAX_CONCURRENT_HEALTH_FETCHES fetches).
 //   3. Ingests `fleet:heartbeat:*` KV keys written by POST /report
@@ -16,7 +18,8 @@
 //      failing/recovered/down/back-online transitions.
 //   5. Persists the snapshot to DASHBOARD_KV under "fleet:snapshot"
 //      (meta under "fleet:meta") and refreshes the Discord dashboard
-//      every 15 minutes.
+//      every 15 minutes with the latest /health details plus the
+//      (hourly-refreshed) analytics window summary.
 //
 // The snapshot row shape MUST keep the keys consumeHealthState()'s
 // mergeSnapshot() relies on: emaMs, errCount, score, stressed, failing,
@@ -28,8 +31,9 @@ const EMA_ALPHA = 0.2;
 const FAILING_THRESHOLD = 8;
 const STRESSED_THRESHOLD = 3;
 
-const WINDOW_MINUTES = 15; // AE query window — matches the cron cadence
-const DASHBOARD_INTERVAL_MS = 15 * 60_000;
+const WINDOW_MINUTES = 15; // AE query window (analytics rows shown on the dashboard)
+const DASHBOARD_INTERVAL_MS = 15 * 60_000; // health/status embed refresh
+const ANALYTICS_INTERVAL_MS = 60 * 60_000; // Analytics Engine query cadence
 const STALE_REPORT_MS = 90_000;
 const HEALTH_FETCH_TIMEOUT_MS = 4_000;
 const MAX_CONCURRENT_HEALTH_FETCHES = 5; // Workers cap: 6 outgoing connections/request
@@ -228,12 +232,27 @@ function buildRow(n, prevRow, ae, poll, hb, now) {
     total_failure: prev.total_failure ?? 0,
     total_wins: prev.total_wins ?? 0,
     self_reports: prev.self_reports ?? 0,
+    health: prev.health ?? null,
     lastSyncMs: now,
   };
 
-  // AE window: errCount is "failures in the last 15 min" — a quiet node
-  // resets to 0, which is also what a healthy fleet looks like.
-  row.errCount = ae?.errors ?? 0;
+  // AE window: errCount is "failures in the last 15 min". The AE query
+  // only runs hourly (ANALYTICS_INTERVAL_MS); on cooldown ticks (ae ===
+  // null) carry the last known errCount/window forward so stressed and
+  // failing flags don't flap between queries.
+  if (ae) {
+    row.errCount = ae.errors ?? 0;
+    row.window = {
+      samples: ae.samples ?? 0,
+      errors: ae.errors ?? 0,
+      wins: ae.wins ?? 0,
+      avgMs: Math.round(ae.avgMs ?? 0),
+      at: now,
+    };
+  } else {
+    row.errCount = prev.errCount ?? 0;
+    row.window = prev.window ?? null;
+  }
   if (ae && ae.samples > 0) {
     if (prev.samples > 0 && prev.emaMs != null && prev.emaMs !== 9_999) {
       row.emaMs = EMA_ALPHA * ae.avgMs + (1 - EMA_ALPHA) * prev.emaMs;
@@ -273,8 +292,22 @@ function buildRow(n, prevRow, ae, poll, hb, now) {
       row.down_since = 0;
       if (poll.h) {
         row.activeJobs = poll.h.activeJobs ?? row.activeJobs;
-        row.queuedJobs = poll.h.queuedJobs ?? row.queuedJobs;
-      }
+      row.queuedJobs = poll.h.queuedJobs ?? row.queuedJobs;
+      // Curated /health payload for the dashboard — covers both shapes:
+      // VPS nodes (workerCount/pendingRespawns/maxConcurrent/uptime) and
+      // serverless nodes (fontReady/iconCache).
+      row.health = {
+        version: poll.h.version ?? null,
+        workerCount: poll.h.workerCount ?? null,
+        pendingRespawns: poll.h.pendingRespawns ?? null,
+        maxConcurrent: poll.h.maxConcurrent ?? null,
+        uptime: poll.h.uptime ?? null,
+        fontReady: poll.h.fontReady ?? null,
+        iconCount: poll.h.iconCache?.iconCount ?? null,
+        iconAgeMs: poll.h.iconCache?.ageMs ?? null,
+        at: now,
+      };
+    }
     } else if (row.status !== "offline") {
       row.status = "offline";
       row.down_since = prev.down_since || now;
@@ -364,7 +397,17 @@ export async function runFleetSync(env, log, { t1Nodes, t2Nodes } = {}) {
   const prev = (await kv.get("fleet:snapshot", "json").catch(() => null)) || {};
   const meta = (await kv.get("fleet:meta", "json").catch(() => null)) || {};
 
-  const aeStats = await queryAeWindow(env, log);
+  // AE query is HOURLY — health polls + heartbeat collection stay on the
+  // 15-min cadence. The dashboard embed reflects both: fresh /health
+  // details every tick, analytics window frozen between hourly queries.
+  const lastAnalyticsAt = Number(meta.lastAnalyticsAt || 0) || 0;
+  const analyticsDue = now - lastAnalyticsAt >= ANALYTICS_INTERVAL_MS;
+  let aeStats = null;
+  if (analyticsDue) {
+    aeStats = await queryAeWindow(env, log);
+    if (aeStats) meta.lastAnalyticsAt = now; // only advance on success
+  }
+
   const heartbeats = await collectHeartbeats(kv, log);
   const polls = await pollNodesHealth(allNodes, prev, now, log);
 
@@ -444,6 +487,7 @@ export async function runFleetSync(env, log, { t1Nodes, t2Nodes } = {}) {
   log("info", "fleet_sync_done", {
     nodes: Object.keys(rows).length,
     aeWindows: Object.keys(aeStats || {}).length,
+    analytics: analyticsDue ? "queried" : "cooldown",
     polled: Object.keys(polls).length,
     heartbeats: Object.keys(heartbeats).length,
     at: new Date(now).toISOString(),

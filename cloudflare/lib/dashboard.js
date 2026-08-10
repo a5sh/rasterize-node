@@ -13,7 +13,8 @@
 // The dashboard is PURELY snapshot-driven: lib/fleetSync.js's 15-minute
 // cron computes the fleet snapshot into DASHBOARD_KV ("fleet:snapshot") and
 // calls updateDashboard() with it. Nothing here talks to Durable Objects
-// or queries Analytics Engine.
+// or queries Analytics Engine. Per-node /health details refresh every
+// 15 minutes; the short analytics window (row.window) refreshes hourly.
 
 export async function getLastDashboardUpdate(env) {
   try {
@@ -58,6 +59,19 @@ export async function updateDashboard(env, snapshot, log, { t1Nodes, t2Nodes } =
     return "🟢";
   };
 
+  const fmt = (n) =>
+    n == null
+      ? "—"
+      : n >= 1_000_000
+        ? `${(n / 1_000_000).toFixed(1)}M`
+        : n >= 1_000
+          ? `${(n / 1_000).toFixed(1)}k`
+          : String(n);
+  const dur = (ms) =>
+    ms !== null && ms > 0
+      ? `${Math.floor(ms / 3600000)}h${Math.floor((ms % 3600000) / 60000)}m`
+      : "—";
+
   const fields = allNodes.map((n) => {
     const r = snapshot?.[n.id] || null;
     if (!r) {
@@ -66,18 +80,30 @@ export async function updateDashboard(env, snapshot, log, { t1Nodes, t2Nodes } =
 
     const limitStr =
       r.concurrencyLimit != null ? `/${r.concurrencyLimit}` : "/∞";
-    const uptimeMs =
-      r.status === "online" && r.first_seen_at
-        ? Date.now() - r.first_seen_at
-        : 0;
     const uptimeStr =
-      uptimeMs > 0
-        ? `${Math.floor(uptimeMs / 3600000)}h${Math.floor((uptimeMs % 3600000) / 60000)}m`
+      r.status === "online" && r.first_seen_at
+        ? dur(Date.now() - r.first_seen_at)
         : "—";
     const successRate =
       r.total_requests > 0
         ? Math.round((100 * r.total_success) / r.total_requests)
         : null;
+
+    // ── /health details captured by the last poll (15-min cadence) ──
+    const h = r.health || null;
+    const healthLine = h
+      ? h.iconCount != null
+        ? `v${h.version ?? "?"} · icons ${fmt(h.iconCount)} (${h.iconAgeMs != null ? Math.max(1, Math.round(h.iconAgeMs / 60000)) : "?"}m)${h.fontReady != null ? ` · font ${h.fontReady ? "✓" : "✗"}` : ""}`
+        : `v${h.version ?? "?"} · ${h.workerCount ?? "?"} workers · respawn ${h.pendingRespawns ?? 0} · proc ${h.uptime != null ? dur(h.uptime * 1000) : "—"}`
+      : null;
+
+    // ── Short analytics window (hourly refresh) ──
+    const w = r.window || null;
+    const windowLine = w
+      ? w.samples > 0
+        ? `15m · ${fmt(w.samples)} req · ${w.errors} err · ${Math.round(w.avgMs)}ms avg`
+        : "15m · no traffic"
+      : null;
 
     const lines = [
       `${emoji(n, r)} **${n.label}**`,
@@ -86,7 +112,9 @@ export async function updateDashboard(env, snapshot, log, { t1Nodes, t2Nodes } =
         : n.supportsHealthCheck
           ? `Active: ${r.activeJobs ?? "?"}  Queue: ${r.queuedJobs ?? "?"}  Up: ${uptimeStr}`
           : "CDN / No health endpoint",
-      `Requests: ${r.total_requests ?? 0}  Wins: ${r.total_wins ?? 0}  Success: ${successRate != null ? successRate + "%" : "—"}`,
+      healthLine,
+      windowLine,
+      `Requests: ${fmt(r.total_requests ?? 0)}  Wins: ${fmt(r.total_wins ?? 0)}  Success: ${successRate != null ? successRate + "%" : "—"}`,
       r.samples > 0
         ? `EMA: ${Math.round(r.emaMs ?? 9999)}ms  n=${r.samples}  Limit${limitStr}`
         : `No samples yet  Limit${limitStr}`,
@@ -107,7 +135,7 @@ export async function updateDashboard(env, snapshot, log, { t1Nodes, t2Nodes } =
         title: "🖼️ Raster Node Fleet",
         color: anyDown || anyFailing ? 0xf87171 : anyStressed ? 0xfacc15 : 0x4ade80,
         fields,
-        footer: { text: `15-min poll · ${new Date().toISOString()}` },
+        footer: { text: `Health 15-min · Analytics hourly · ${new Date().toISOString()}` },
       },
     ],
   };
