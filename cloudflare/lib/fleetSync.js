@@ -101,7 +101,7 @@ async function queryAeWindow(env, log) {
     "  count() AS samples,",
     "  avg(double1) AS avg_ms,",
     "  sum(double3) AS wins,",
-    "  sum(CASE WHEN blob5 = 'failure' THEN 1 ELSE 0 END) AS errors",
+    "  countIf(blob5 = 'failure') AS errors",
     `FROM raster_metrics`,
     `WHERE blob1 != 'req' AND timestamp >= NOW() - INTERVAL '${WINDOW_MINUTES}' MINUTE`,
     "GROUP BY index1",

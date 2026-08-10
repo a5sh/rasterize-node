@@ -254,6 +254,16 @@ export default {
     if (request.method === "POST") {
       svgText = await request.text();
       if (!svgText?.trim()) return _jsonError(400, "Empty SVG body");
+      // Reject non-SVG bodies up front: garbage input used to burn the whole
+      // T1/T2 chain (every node fails on an invalid document → 502 after
+      // up to 10 outbound attempts per request). Cheap shape check only —
+      // full validation is the nodes' job.
+      if (
+        svgText.length < 50 ||
+        !/<\s*svg[\s>]/i.test(svgText) ||
+        !/<\/svg\s*>/i.test(svgText)
+      )
+        return _jsonError(400, "Body does not look like an SVG");
     } else {
       const targetUrl = url.searchParams.get("url");
       if (!targetUrl) return _jsonError(400, "Missing ?url= parameter");
