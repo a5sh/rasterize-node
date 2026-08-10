@@ -98,12 +98,12 @@ export async function logError(title, description) {
 
 export async function notifyOnline() {
   stats.status = "online";
+  // Suppressed — Worker B polls /health; errors are the only node→worker report.
   console.log(`[reporter] Node "${NODE_NAME}" online — health at /health`);
-  _postReport("online", { reason: "boot" });
 }
 
 export async function notifyOffline(reason = "SIGTERM") {
   stats.status = "offline";
+  // Suppressed, same reason as notifyOnline.
   console.log(`[reporter] Node "${NODE_NAME}" shutting down (${reason})`);
-  await _postReport("offline", { reason });
 }

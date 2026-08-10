@@ -143,20 +143,11 @@ async function sendReport(type, nodeName, extra = {}) {
  *                           Must match the id used in CF worker's getNodes()
  *                           e.g. 'vercel-usw' or 'netlify'
  */
-export async function maybeReport(nodeName) {
-  const now = Date.now();
-
-  if (_isColdStart) {
-    _isColdStart = false;
-    _lastReport = now;
-    // Send online signal — no snapshot yet, no metrics accumulated yet
-    await sendReport("online", nodeName).catch(() => {});
-    return;
-  }
-
-  if (now - _lastReport < REPORT_INTERVAL_MS) return;
-  _lastReport = now;
-
-  const snapshot = flushWindow();
-  await sendReport("metrics", nodeName, { snapshot }).catch(() => {});
+export async function maybeReport(_nodeName) {
+  // Reporting is error-only now. Worker B polls each node's /health directly
+  // every 15 min, render failures surface to it as non-200 responses, and the
+  // old cold-start 'online' + 5-minute 'metrics' flushes only burned one
+  // Cloudflare request event each — free-tier log quota is better spent
+  // elsewhere. Counters above are kept for local introspection only.
+  return;
 }

@@ -83,6 +83,10 @@ export async function updateDashboard(env, snapshot, log, { t1Nodes, t2Nodes } =
     ms !== null && ms > 0
       ? `${Math.floor(ms / 3600000)}h${Math.floor((ms % 3600000) / 60000)}m`
       : "—";
+  // Discord-rendered relative timestamp ("37 days ago") — use wherever an
+  // epoch instant is available instead of hand-formatting a duration.
+  const ts = (ms) =>
+    ms != null && ms > 0 ? `<t:${Math.floor(ms / 1000)}:R>` : "—";
 
   const fields = [];
   const sectionHeader = (text) =>
@@ -103,7 +107,7 @@ export async function updateDashboard(env, snapshot, log, { t1Nodes, t2Nodes } =
       r.concurrencyLimit != null ? `/${r.concurrencyLimit}` : "/∞";
     const uptimeStr =
       r.status === "online" && r.first_seen_at
-        ? dur(Date.now() - r.first_seen_at)
+        ? `Up since ${ts(r.first_seen_at)}`
         : "—";
     const successRate =
       r.total_requests > 0
@@ -128,7 +132,7 @@ export async function updateDashboard(env, snapshot, log, { t1Nodes, t2Nodes } =
 
     const lines = [
       r.status === "offline"
-        ? `❌ Offline${r.down_since ? ` (${Math.floor((Date.now() - r.down_since) / 60000)}m)` : ""}`
+        ? `❌ Offline${r.down_since ? ` since ${ts(r.down_since)}` : ""}`
         : n.supportsHealthCheck
           ? `Active: ${r.activeJobs ?? "?"}  Queue: ${r.queuedJobs ?? "?"}  Up: ${uptimeStr}`
           : "CDN / No health endpoint",

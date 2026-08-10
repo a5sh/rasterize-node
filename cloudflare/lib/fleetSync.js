@@ -447,18 +447,22 @@ export async function runFleetSync(
     if (!rows[id]) rows[id] = r;
   }
 
-  // Dynamic concurrency ceilings (healthy → +1, erroring → halve)
+  // Dynamic concurrency ceilings (healthy → +1, erroring → halve).
+  // Increases are silent — only halving (a health event) gets a warn line,
+  // so a 15-min cron doesn't burn one log event per node per tick.
   for (const n of allNodes) {
     const r = rows[n.id];
     if (r.concurrencyLimit == null) continue;
     const healthy = r.errCount === 0;
     const next = adjustConcurrency(r.concurrencyLimit, healthy);
     if (next !== r.concurrencyLimit) {
-      log("info", "fleet_concurrency", {
-        nodeId: n.id,
-        from: r.concurrencyLimit,
-        to: next,
-      });
+      if (next < r.concurrencyLimit) {
+        log("warn", "fleet_concurrency_halved", {
+          nodeId: n.id,
+          from: r.concurrencyLimit,
+          to: next,
+        });
+      }
       r.concurrencyLimit = next;
     }
   }
