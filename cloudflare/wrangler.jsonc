@@ -10,7 +10,11 @@
       "custom_domain": true,
     },
   ],
-  // KV namespace for fleet dashboard state (message ID, node metrics, rate-limit timestamps).
+  // KV namespace for ALL fleet state: Discord dashboard message ID, the fleet
+  // snapshot (fleet:snapshot), alert rate-limit meta (fleet:meta), legacy
+  // serverless self-report beacons (fleet:heartbeat:<node>). Populated by
+  // lib/fleetSync.js on the 15-minute cron; read by lib/health.js's bridge
+  // per request (5s per-isolate cache) and by lib/dashboard.js.
   // Create with: wrangler kv:namespace create DASHBOARD_KV
   // Then replace the id below with the output ID.
   "kv_namespaces": [
@@ -31,17 +35,20 @@
       "dataset": "request_analytics",
     },
   ],
-  // AFTER
-  // Cron: refresh fleet Discord embed hourly. Nodes never push status to this
-  // worker — all health data is derived from live routing state / Analytics Engine.
+  // Cron: every 15 minutes. fleetSync.js queries RASTER_METRICS (Analytics
+  // Engine SQL API), health-polls stale nodes, computes the fleet snapshot
+  // into DASHBOARD_KV, fires alerts and refreshes the Discord dashboard.
   "triggers": {
-    "crons": ["0 * * * *"],
+    "crons": ["*/15 * * * *"],
   },
 
+  // FleetHealth Durable Object removed — all fleet state lives in
+  // DASHBOARD_KV (see lib/fleetSync.js). The deletion migration below
+  // permanently drops the DO's SQLite data on deploy.
   "durable_objects": {
-    "bindings": [{ "name": "FLEET_HEALTH", "class_name": "FleetHealth" }],
+    "bindings": [],
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["FleetHealth"] }],
+  "migrations": [{ "tag": "v2", "deleted_classes": ["FleetHealth"] }],
   // Node URLs — set real values with: wrangler vars set KEY value
   // Or set in the Cloudflare dashboard under Workers > Settings > Variables.
   // DISCORD_WEBHOOK_URL must be set as a secret:
@@ -62,6 +69,21 @@
     "DISCORD_WEBHOOK_URL": "https://discord.com/api/webhooks/1522125036109037703/ruJNatLHEuArZNkFxAY5oF2pupds5JALnqhwn18yUdzexyFtZxARQnAmyYAe77YThfw3",
     "ALERTS_WEBHOOK_URL": "https://discord.com/api/webhooks/1485865094695878800/a6_LaS5R6J6mbZXWvsMG6PTz9N0He5oG2yqsPWqs-olF5jmHMq0yuDYJ69n5zIdqnpGB",
   },
+  // Fleet sync queries the Analytics Engine SQL API from inside the Worker
+  // (the only in-Worker path — there is no binding-level query API), so the
+  // same Secrets Store bindings as backend require those credentials:
+  "secrets_store_secrets": [
+    {
+      "binding": "CF_ACCOUNT_ID",
+      "store_id": "9b4aa7fc14e74938a057ff9e3fbf4d4d",
+      "secret_name": "CF_ACCOUNT_ID",
+    },
+    {
+      "binding": "CF_API_TOKEN",
+      "store_id": "9b4aa7fc14e74938a057ff9e3fbf4d4d",
+      "secret_name": "CF_API_TOKEN",
+    },
+  ],
   "rules": [
     {
       "type": "CompiledWasm",

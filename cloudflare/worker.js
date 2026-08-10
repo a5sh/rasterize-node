@@ -1,16 +1,17 @@
-// cloudflare/worker.js — v13
+// cloudflare/worker.js — v14
 //
 // PURE LOAD BALANCER — No WASM, No Puppeteer
 //
 // Thin entry point wiring together cloudflare/lib/*:
 //   nodeRegistry.js  — T1/T2 node views + settings, derived from assets/nodes.config.js
-//   health.js        — per-isolate node health/error/perf state + FleetHealth DO bridge
+//   health.js        — per-isolate node health/error/perf state + KV fleet-snapshot bridge
 //   geoRouting.js     — CF colo → region mapping, geo+score node ordering
 //   nodeAttempt.js    — single-node raster attempt (URL-payload / POST, gzip)
 //   embedding.js      — single-poster embed (CF-cache-backed) + outcome analytics
 //   metricsWriter.js  — RASTER_METRICS Analytics Engine write helpers
 //   raceDispatch.js   — the full distributed-render orchestration
-//   dashboard.js      — hourly Discord fleet dashboard + health-check CORS proxy
+//   fleetSync.js      — 15-min cron: AE stats → KV fleet snapshot + Discord dashboard + alerts
+//   dashboard.js      — snapshot-driven Discord fleet dashboard + health-check CORS proxy
 //
 // Worker A builds SVG (icons expanded, poster as href URL) and sends to Worker B.
 // Worker B fetches the poster image ONCE, embeds it, then distributes to nodes.
@@ -47,13 +48,13 @@
 // See cloudflare/lib/metricsWriter.js for the RASTER_METRICS analytics schema.
 
 import { T1_NODES, T2_NODES, SETTINGS } from "./lib/nodeRegistry.js";
-import { createHealthState, createFleetHealthBridge } from "./lib/health.js";
+import { createHealthState, createKvFleetBridge } from "./lib/health.js";
 import { distributedRender } from "./lib/raceDispatch.js";
 import {
-  updateDashboard,
   fetchNodeHealth,
   getLastDashboardUpdate,
 } from "./lib/dashboard.js";
+import { runFleetSync } from "./lib/fleetSync.js";
 
 // ── Structured logger ──────────────────────────────────────────────────────────
 
@@ -62,7 +63,7 @@ function _log(level, event, meta = {}) {
     ts: new Date().toISOString(),
     level,
     event,
-    lb: "cf-v13",
+    lb: "cf-v14",
     ...meta,
   };
   (level === "error" ? console.error : console.log)(JSON.stringify(entry));
@@ -91,7 +92,7 @@ const health = createHealthState({
   stressThreshold: SETTINGS.stressThreshold,
   failingThreshold: SETTINGS.failingThreshold,
 });
-const fleetBridge = createFleetHealthBridge();
+const fleetBridge = createKvFleetBridge();
 
 // ── JSON helpers ──────────────────────────────────────────────────────────────
 
@@ -116,8 +117,6 @@ function _jsonError(status, msg) {
 }
 
 // ── Main export ────────────────────────────────────────────────────────────────
-export { FleetHealth } from "./fleetHealth.js";
-
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -147,7 +146,7 @@ export default {
     if (url.pathname === "/health") {
       return _jsonOk({
         status: "ok",
-        version: "13.0",
+        version: "14.0",
         node: "cf-lb",
         t1Pool: T1_NODES.map((n) => ({
           id: n.id,
@@ -192,7 +191,7 @@ export default {
           samples: health.perfMap.get(n.id)?.sampleCount ?? 0,
         })),
       );
-      const lastUpdate = getLastDashboardUpdate();
+      const lastUpdate = await getLastDashboardUpdate(env);
       return _jsonOk({
         discordConfigured: !!env.DISCORD_WEBHOOK_URL,
         lastDiscordUpdate: lastUpdate
@@ -215,29 +214,20 @@ export default {
     }
 
     // ── /report — legacy Vercel/Netlify online/metrics beacon ──────────────
-    // core/serverlessReporter.js still POSTs here (CF_REPORT_URL). Nothing
-    // previously checked this pathname, so every POST fell through into the
-    // raster dispatch path below and got run as a garbage SVG render — the
-    // same timeout-flood class of bug vps/discord.js's header comment
-    // already documents for the VPS fleet. Forward it into the DO instead.
+    // core/serverlessReporter.js still POSTs here (CF_REPORT_URL). The
+    // beacon is buffered to DASHBOARD_KV ("fleet:heartbeat:<node>") and
+    // merged into the fleet snapshot by the 15-minute cron in fleetSync.js.
     if (request.method === "POST" && url.pathname === "/report") {
       try {
-        const id = env.FLEET_HEALTH.idFromName("global");
-        const stub = env.FLEET_HEALTH.get(id);
-        const doRes = await stub.fetch("https://fleet-health.internal/report", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: await request.text(),
-        });
-        return new Response(await doRes.text(), {
-          status: doRes.status,
-          headers: {
-            "Content-Type": "application/json",
-            "Access-Control-Allow-Origin": "*",
-          },
-        });
+        const body = await request.json().catch(() => null);
+        if (!body?.node) return _jsonError(400, "missing node");
+        await env.DASHBOARD_KV.put(
+          `fleet:heartbeat:${body.node}`,
+          JSON.stringify({ at: Date.now(), ...body }),
+        );
+        return _jsonOk({ ok: true });
       } catch (e) {
-        return _jsonError(502, e?.message || "fleet health unreachable");
+        return _jsonError(502, e?.message || "kv write failed");
       }
     }
 
@@ -298,6 +288,8 @@ export default {
   },
 
   async scheduled(_event, env, ctx) {
-    ctx.waitUntil(updateDashboard(env, T1_NODES, T2_NODES, health, _log));
+    ctx.waitUntil(
+      runFleetSync(env, _log, { t1Nodes: T1_NODES, t2Nodes: T2_NODES }),
+    );
   },
 };

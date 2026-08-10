@@ -20,9 +20,12 @@
 //     promise body (previously `isWinner: result.ok` could tag every
 //     successful racer as a winner, not just the one actually returned).
 //
-// fleetBridge.reportBatch is still the DO feed for routing decisions (EMA
-// score, failing/stressed, dynamic concurrency). It is NOT the analytics
-// source anymore — RASTER_METRICS direct writes are.
+// fleetBridge.refreshScores feeds the KV fleet snapshot (written every
+// 15 minutes by fleetSync.js from Analytics Engine stats + health polls)
+// into the per-isolate health state, cached 5s per isolate. reportBatch is
+// a no-op — per-attempt routing analytics go straight to RASTER_METRICS by
+// logAttempt(); the snapshot's score/failing/concurrency are derived from
+// that same data at cron time.
 
 import { geoOrderNodes, COLO_REGION } from "./geoRouting.js";
 import { tryNode } from "./nodeAttempt.js";
@@ -87,7 +90,7 @@ export async function distributedRender({
   const tWall0 = Date.now();
   const payloadKb = Math.round(new Blob([svgText]).size / 1024);
   let attemptsMade = 0;
-  const attemptLog = []; // flushed once at the end, to the FleetHealth DO only
+  const attemptLog = []; // per-attempt rows already written to RASTER_METRICS by reportAttempt
 
   const elapsed = () => Date.now() - tWall0;
   const timedOut = () => elapsed() >= maxWallTimeMs;

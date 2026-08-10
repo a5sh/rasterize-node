@@ -1,10 +1,12 @@
 // cloudflare/lib/health.js
 //
 // Local, per-isolate layer is now ONLY for values that must be instantaneous
-// within a single race (in-flight admission counting). Everything
-// cross-isolate — scores, failing/stressed flags, dynamic concurrency
-// ceilings — comes from the FleetHealth DO, cached for SCORE_CACHE_TTL_MS
-// per isolate so routing doesn't pay a DO round-trip on every request.
+// within a single race (in-flight admission counting + a per-isolate error
+// overlay). Everything cross-isolate — scores, failing/stressed flags,
+// dynamic concurrency ceilings — comes from the fleet snapshot in
+// DASHBOARD_KV ("fleet:snapshot"), written every 15 minutes by
+// lib/fleetSync.js, cached for SCORE_CACHE_TTL_MS per isolate so routing
+// doesn't pay a KV round-trip on every request.
 
 import NODE_CONFIG from "../../assets/nodes.config.js";
 
@@ -17,7 +19,7 @@ function initialHint(id) {
 }
 export function createHealthState({ stressThreshold, failingThreshold }) {
   const inflightMap = new Map(); // real-time, local — must stay synchronous
-  let snapshot = {}; // last DO /scores snapshot
+  let snapshot = {}; // last fleet snapshot (KV, via createKvFleetBridge)
   // Local, per-isolate error overlay — populated synchronously by
   // recordErr()/recordOk() during a race so routing decisions within THIS
   // isolate reflect the current request's outcomes immediately, without
@@ -110,42 +112,29 @@ return {
   };
 }
 
-// ── FleetHealth DO bridge ────────────────────────────────────────────────
-export function createFleetHealthBridge() {
+// ── Fleet snapshot bridge (KV-backed; FleetHealth DO removed) ────────────
+// Reads the 15-minute cron snapshot from DASHBOARD_KV and serves it to
+// raceDispatch once per request (5s per-isolate cache). Routing stats are
+// written to Analytics Engine per-attempt by metricsWriter.js, so there is
+// nothing to report back — reportBatch is a no-op.
+export function createKvFleetBridge() {
   let cache = { data: {}, fetchedAt: 0 };
 
   async function refreshScores(env) {
     if (Date.now() - cache.fetchedAt < SCORE_CACHE_TTL_MS) return cache.data;
     try {
-      const id = env.FLEET_HEALTH.idFromName("global");
-      const stub = env.FLEET_HEALTH.get(id);
-      const res = await stub.fetch("https://fleet-health.internal/scores");
-      cache = { data: await res.json(), fetchedAt: Date.now() };
+      const kv = env?.DASHBOARD_KV;
+      if (!kv || typeof kv.get !== "function") return cache.data || {};
+      const json = await kv.get("fleet:snapshot", "json");
+      cache = { data: json || {}, fetchedAt: Date.now() };
     } catch (_) {
       /* keep stale cache */
     }
     return cache.data;
   }
 
-  /**
-   * Fire-and-forget, batched ONCE per incoming request (never across
-   * requests — a cross-request setTimeout accumulator would risk the same
-   * "Promise will never complete" class of bug documented in batchLoader.js).
-   */
-  function reportBatch(env, ctx, outcomes) {
-    if (!outcomes || outcomes.length === 0) return;
-    ctx.waitUntil(
-      (async () => {
-        try {
-          const id = env.FLEET_HEALTH.idFromName("global");
-          const stub = env.FLEET_HEALTH.get(id);
-          await stub.fetch("https://fleet-health.internal/report-batch", {
-            method: "POST",
-            body: JSON.stringify({ outcomes }),
-          });
-        } catch (_) {}
-      })(),
-    );
+  function reportBatch() {
+    /* no-op — per-attempt routing analytics already go to Analytics Engine */
   }
 
   return { refreshScores, reportBatch };

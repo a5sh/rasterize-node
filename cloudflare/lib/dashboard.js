@@ -1,19 +1,27 @@
 // cloudflare/lib/dashboard.js
 //
-// Hourly Discord fleet-health dashboard (edit-in-place via KV-stored
-// message ID), plus a CORS proxy helper for fetching a node's /health JSON
-// through Worker B (avoids mixed-content issues for a browser dashboard
-// hitting http:// VPS nodes). The proxy helper is preserved from the
-// original file exactly as it existed there — it is not currently wired to
-// a route in worker.js's fetch handler (no pathname check dispatches to
-// it), so it remains unreachable in production until a route is added.
-// Not fabricating that route here since that would be a behavior change,
-// not a structural one.
+// Discord fleet-health dashboard (edit-in-place via KV-stored message ID),
+// plus a CORS proxy helper for fetching a node's /health JSON through
+// Worker B (avoids mixed-content issues for a browser dashboard hitting
+// http:// VPS nodes). The proxy helper is preserved from the original file
+// exactly as it existed there — it is not currently wired to a route in
+// worker.js's fetch handler (no pathname check dispatches to it), so it
+// remains unreachable in production until a route is added. Not fabricating
+// that route here since that would be a behavior change, not a structural
+// one.
+//
+// The dashboard is PURELY snapshot-driven: lib/fleetSync.js's 15-minute
+// cron computes the fleet snapshot into DASHBOARD_KV ("fleet:snapshot") and
+// calls updateDashboard() with it. Nothing here talks to Durable Objects
+// or queries Analytics Engine.
 
-let lastDashboardUpdate = 0;
-
-export function getLastDashboardUpdate() {
-  return lastDashboardUpdate;
+export async function getLastDashboardUpdate(env) {
+  try {
+    const v = await env?.DASHBOARD_KV?.get("dashboards:last_update");
+    return v ? Number(v) : 0;
+  } catch {
+    return 0;
+  }
 }
 
 export async function fetchNodeHealth(baseUrl) {
@@ -30,76 +38,76 @@ export async function fetchNodeHealth(baseUrl) {
 
 /**
  * @param {object} env
- * @param {Array} t1Nodes
- * @param {Array} t2Nodes
- * @param {object} health - createHealthState() instance
+ * @param {object} snapshot - fleet snapshot rows from DASHBOARD_KV
+ *        ("fleet:snapshot"), keyed by node id. See lib/fleetSync.js.
  * @param {function} log
+ * @param {{t1Nodes: Array, t2Nodes: Array}} pool
  */
-export async function updateDashboard(env, t1Nodes, t2Nodes, health, log) {
+export async function updateDashboard(env, snapshot, log, { t1Nodes, t2Nodes } = {}) {
   if (!env.DISCORD_WEBHOOK_URL) return;
-  lastDashboardUpdate = Date.now();
 
-  const allNodes = [...t1Nodes, ...t2Nodes];
+  const allNodes = [...(t1Nodes || []), ...(t2Nodes || [])];
+  const allIds = new Set(allNodes.map((n) => n.id));
 
-  // Only health-check nodes that expose /health; skip CDN/wsrv nodes
-  const healths = await Promise.all(
-    allNodes.map(async (n) => {
-      if (!n.supportsHealthCheck) return { ...n, h: null };
-      const h = await fetchNodeHealth(n.baseUrl);
-      return { ...n, h };
-    }),
-  );
-
-  // 🟢 online  🟡 stressed  🟠 failing  🔴 VPS down  💤 serverless cold  ⚪ CDN/no-healthcheck
-  const emoji = (n, h) => {
+  const emoji = (n, r) => {
     if (!n.supportsHealthCheck) return "⚪";
-    if (!h) return n.type === "vercel" || n.type === "netlify" ? "💤" : "🔴";
-    if (health.isFailing(n.id)) return "🟠";
-    if (health.isStressed(n.id)) return "🟡";
+    if (!r || r.status === "unknown") return "💤";
+    if (r.status === "offline") return "🔴";
+    if (r.failing) return "🟠";
+    if (r.stressed) return "🟡";
     return "🟢";
   };
 
-  const fields = healths.map(({ id, type, h, supportsHealthCheck }) => {
-    const perf = health.perfMap.get(id);
-    const limit =
-      t1Nodes.find((n) => n.id === id)?.concurrencyLimit ??
-      t2Nodes.find((n) => n.id === id)?.concurrencyLimit ??
-      null;
-    const limitStr = limit != null ? `/${limit}` : "/∞";
+  const fields = allNodes.map((n) => {
+    const r = snapshot?.[n.id] || null;
+    if (!r) {
+      return { name: "\u200B", value: `**${n.label}**\nNo data yet`, inline: true };
+    }
 
-    const healthLine = !supportsHealthCheck
-      ? "CDN / No health endpoint"
-      : !h
-        ? type === "vercel" || type === "netlify"
-          ? "Serverless — may be cold"
-          : "❌ Offline"
-        : `Active: ${h.activeJobs ?? "?"}  Queue: ${h.queuedJobs ?? "?"}  Up: ${h.uptime != null ? `${Math.floor(h.uptime / 3600)}h${Math.floor((h.uptime % 3600) / 60)}m` : "?"}`;
+    const limitStr =
+      r.concurrencyLimit != null ? `/${r.concurrencyLimit}` : "/∞";
+    const uptimeMs =
+      r.status === "online" && r.first_seen_at
+        ? Date.now() - r.first_seen_at
+        : 0;
+    const uptimeStr =
+      uptimeMs > 0
+        ? `${Math.floor(uptimeMs / 3600000)}h${Math.floor((uptimeMs % 3600000) / 60000)}m`
+        : "—";
+    const successRate =
+      r.total_requests > 0
+        ? Math.round((100 * r.total_success) / r.total_requests)
+        : null;
 
     const lines = [
-      `${emoji({ id, type, supportsHealthCheck }, h)} **${id}**`,
-      healthLine,
-      `Errors: ${health.errCount(id)}  In-flight: ${health.inFlight(id)}${limitStr}`,
-      perf
-        ? `EMA: ${Math.round(perf.emaMs)}ms  Score: ${Math.round(health.nodeScore(id))}  n=${perf.sampleCount}`
-        : "No samples yet",
-    ]
-      .filter(Boolean)
-      .join("\n");
+      `${emoji(n, r)} **${n.label}**`,
+      r.status === "offline"
+        ? `❌ Offline${r.down_since ? ` (${Math.floor((Date.now() - r.down_since) / 60000)}m)` : ""}`
+        : n.supportsHealthCheck
+          ? `Active: ${r.activeJobs ?? "?"}  Queue: ${r.queuedJobs ?? "?"}  Up: ${uptimeStr}`
+          : "CDN / No health endpoint",
+      `Requests: ${r.total_requests ?? 0}  Wins: ${r.total_wins ?? 0}  Success: ${successRate != null ? successRate + "%" : "—"}`,
+      r.samples > 0
+        ? `EMA: ${Math.round(r.emaMs ?? 9999)}ms  n=${r.samples}  Limit${limitStr}`
+        : `No samples yet  Limit${limitStr}`,
+    ].filter(Boolean);
 
-    return { name: "\u200B", value: lines, inline: true };
+    return { name: "\u200B", value: lines.join("\n"), inline: true };
   });
 
-  const anyFailing = allNodes.some((n) => health.isFailing(n.id));
-  const anyStressed = allNodes.some((n) => health.isStressed(n.id));
+  const rows = Object.entries(snapshot || {}).filter(([id]) => allIds.has(id));
+  const anyDown = rows.some(([, r]) => r.status === "offline");
+  const anyFailing = rows.some(([, r]) => r.failing);
+  const anyStressed = rows.some(([, r]) => r.stressed);
 
   const payload = {
-    username: "Posterium LB — v13",
+    username: "Posterium LB — v14",
     embeds: [
       {
         title: "🖼️ Raster Node Fleet",
-        color: anyFailing ? 0xf87171 : anyStressed ? 0xfacc15 : 0x4ade80,
+        color: anyDown || anyFailing ? 0xf87171 : anyStressed ? 0xfacc15 : 0x4ade80,
         fields,
-        footer: { text: `Hourly poll · ${new Date().toISOString()}` },
+        footer: { text: `15-min poll · ${new Date().toISOString()}` },
       },
     ],
   };
