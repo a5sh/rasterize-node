@@ -96,6 +96,7 @@ export default async function handler(req, res) {
       const { buffer, mimeType, computeMs } = await renderWithCache(
         svgText,
         format,
+        { url: targetUrl, format },
       );
       maybeReport(NODE_NAME).catch(() => {});
       return sendImage(res, buffer, mimeType, computeMs);

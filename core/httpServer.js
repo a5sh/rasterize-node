@@ -125,10 +125,11 @@ export function createRasterServer({
   // worker thread does, inside renderWorker.js, which is already fixed
   // above). No change needed here — noting for completeness since this was
   // the other candidate call site checked.
-  async function renderSvg(svgText, format) {
+  async function renderSvg(svgText, format, queryParts = null) {
     return pool.render(
       await embedImages(svgText, "SpicyDevs-Rasterizer/3.2"),
       format,
+      queryParts,
     );
   }
 
@@ -349,7 +350,13 @@ export function createRasterServer({
 
     const t0 = Date.now();
     try {
-      const { buffer, mimeType } = await renderSvg(svgText, format);
+      // GET requests carry real query params (?url=&format=) — key the render
+      // cache on those instead of hashing the SVG (which embeds base64 blobs
+      // and makes digest-based keys expensive and unstable). POST bodies have
+      // no queries, so they keep the svg-hash key.
+      const queryParts =
+        req.method === "GET" ? { url: params.get("url"), format } : null;
+      const { buffer, mimeType } = await renderSvg(svgText, format, queryParts);
       const computeMs = Date.now() - t0;
       recordJobDuration(computeMs);
       syncStats();

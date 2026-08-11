@@ -70,8 +70,8 @@ export function createServerlessHandler(nodeName) {
     }
   }
 
-  function renderWithCache(svgText, format) {
-    const cacheKey = makeCacheKey(svgText, format);
+  function renderWithCache(svgText, format, queryParts = null) {
+    const cacheKey = makeCacheKey(svgText, format, queryParts);
     const cached = _renderCache.get(cacheKey);
     if (cached)
       return { buffer: cached.buffer, mimeType: cached.mimeType, computeMs: 0 };

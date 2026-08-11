@@ -100,4 +100,14 @@
     "enabled": true,
     "head_sampling_rate": 0.1,
   },
+  // Smart Placement: this Worker is the back-end of an HTTP service-binding
+  // chain (Worker A → r-cf). Placement analyzes where requests run fastest
+  // and executes closer to the nodes' backend infra (Vercel/Netlify/VPS/Render
+  // are all multi-region — auto mode is the right fit, not a regional hint).
+  // Edge Worker A stays unplaced. Monitored via the workers/services status
+  // API (placement: SUCCESS / INSUFFICIENT_INVOCATIONS / UNSUPPORTED_APPLICATION)
+  // and the cf-placement header (local-* = ran at default colo, remote-* = placed).
+  "placement": {
+    "mode": "smart",
+  },
 }

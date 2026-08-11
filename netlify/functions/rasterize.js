@@ -82,6 +82,7 @@ export const handler = async (event) => {
       const { buffer, mimeType, computeMs } = await renderWithCache(
         svgText,
         format,
+        { url: targetUrl, format },
       );
       maybeReport(NODE_NAME).catch(() => {});
       return imageResp(buffer, mimeType, computeMs);

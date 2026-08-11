@@ -136,8 +136,8 @@ export class RenderPool {
     if (this._queue.length > 0) this._dispatch(worker, this._queue.shift());
   }
 
-  render(svgText, format = "png") {
-    const cacheKey = makeCacheKey(svgText, format);
+  render(svgText, format = "png", queryParts = null) {
+    const cacheKey = makeCacheKey(svgText, format, queryParts);
     const cached = this._renderCache.get(cacheKey);
     if (cached) {
       return Promise.resolve({ buffer: cached.buffer, mimeType: cached.mimeType });

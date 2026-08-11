@@ -13,8 +13,14 @@ export function simpleHash(str) {
   return (h >>> 0).toString(36);
 }
 
-export function makeCacheKey(svgText, format) {
-  return simpleHash(svgText) + ":" + format;
+export function makeCacheKey(svgText, format, queryParts = null) {
+  // When the request carried query params (GET ?url=&format=), hash a JSON of
+  // those instead of the raw SVG. Hashing the SVG is expensive and unstable
+  // once it embeds large base64 images (poster + logo): any byte drift in the
+  // b64 blobs produces a new key for a logically identical render. Same
+  // url + format ⇒ same render ⇒ same key, at a fraction of the cost.
+  const seed = queryParts ? JSON.stringify(queryParts) : svgText;
+  return simpleHash(seed) + ":" + format;
 }
 
 export function createRenderCache(options = {}) {

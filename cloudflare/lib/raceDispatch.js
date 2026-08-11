@@ -35,8 +35,12 @@ import { tryNode } from "./nodeAttempt.js";
 import { embedPoster } from "./embedding.js";
 import { logAttempt } from "./metricsWriter.js";
 
-const GROUP_SIZE_ESCALATED = 2;
 const HARD_WALL_MS = 5_000;
+// Per-attempt ceiling across the fallback ladder: a single hanging node must
+// not be allowed to consume the entire wall budget — otherwise one timeout
+// would make every later node unreachable. Healthy nodes finish in ~100-500ms,
+// so 1.5s is generous while still guaranteeing the chain can walk all nodes.
+const SEQUENTIAL_ATTEMPT_MS = 1_500;
 
 const NOOP_BRIDGE = {
   refreshScores: async () => ({}),
@@ -144,7 +148,6 @@ export async function distributedRender({
   const wallDeadline = Math.min(maxWallTimeMs, HARD_WALL_MS);
   const ordered = geoOrderNodes(colo, t1Nodes, health);
   const racePool = [...ordered];
-  const wsrvNode = t1Nodes.find((n) => n.id === "wsrv");
 
   async function raceGroup(nodes, budgetMs, lane) {
     const nodeControllers = nodes.map(() => new AbortController());
@@ -231,29 +234,25 @@ export async function distributedRender({
     return winner;
   }
 
-  // ── Step: single-node-first, escalate to pairs on failure ──────────────
+  // ── Fallback ladder: 1 best node → parallel pair → sequential tail ──────
+  // Phase 1: the single best pick (geo+score order) carries the main load.
+  // Phase 2: if it fails, race the next two T1 nodes in parallel — the
+  // reliability hedge (a pair wins even if one of the two hangs).
+  // Phase 3: if the pair fails too, walk every remaining T1 node then all T2
+  // nodes one at a time. wsrv is a normal T1 pool member — no injection.
   let cursor = 0;
-  let groupSize = 1;
-  while (cursor < racePool.length) {
+
+  const budgetOk = () => {
     if (Date.now() - tWall0 >= wallDeadline) {
       log("warn", "t1_race_wall_timeout_abort", { elapsed: elapsed() });
-      break;
+      return false;
     }
-    const remainingBudget = wallDeadline - elapsed();
-    if (remainingBudget <= 200) break;
-
-    const group = racePool.slice(cursor, cursor + groupSize);
-    // cursor must advance by the ORIGINAL slice width — wsrv injection
-    // inflates group.length and a post-injection advance skips the next
-    // real node (e.g. index 3 in [.., midas, germany, ..] after 1+2+wsrv),
-    // permanently orphaning it from every escalation chain.
-    const sliceLen = group.length;
-    // Every fallback group (after the initial single-node attempt) must
-    // include wsrv — it's the always-reliable CDN safety net.
-    if (groupSize > 1 && wsrvNode && !group.some((n) => n.id === "wsrv")) {
-      group.push(wsrvNode);
-    }
-    const winner = await raceGroup(group, remainingBudget, "t1");
+    return wallDeadline - elapsed() > 200;
+  };
+  const attemptBudget = () =>
+    Math.min(wallDeadline - elapsed(), SEQUENTIAL_ATTEMPT_MS);
+  const arm = (nodes, lane) => raceGroup(nodes, attemptBudget(), lane);
+  const respond = (winner) => {
     if (winner.ok) {
       flushHealthReport();
       return buildImageResp(
@@ -266,34 +265,40 @@ export async function distributedRender({
         health,
       );
     }
-    cursor += sliceLen;
-    groupSize = GROUP_SIZE_ESCALATED;
+    return null;
+  };
+
+  // Phase 1 — single best node
+  if (cursor < racePool.length && budgetOk()) {
+    const winner = await arm([racePool[cursor]], "t1");
+    cursor += 1;
+    const resp = respond(winner);
+    if (resp) return resp;
   }
 
-  // ── Step: T2 extreme fallback ────────────────────────────────────────
-  // Each T2 node is raced alongside wsrv — wsrv is the always-reliable
-  // CDN safety net on every fallback step.
+  // Phase 2 — parallel pair of the next two T1 nodes
+  if (cursor + 1 < racePool.length && budgetOk()) {
+    const winner = await arm([racePool[cursor], racePool[cursor + 1]], "t1");
+    cursor += 2;
+    const resp = respond(winner);
+    if (resp) return resp;
+  }
+
+  // Phase 3 — remaining T1, one node at a time
+  while (cursor < racePool.length) {
+    if (!budgetOk()) break;
+    const winner = await arm([racePool[cursor]], "t1");
+    cursor += 1;
+    const resp = respond(winner);
+    if (resp) return resp;
+  }
+
+  // Phase 3b — T2 pool, one node at a time
   for (const node of t2Nodes) {
-    if (Date.now() - tWall0 >= wallDeadline) {
-      log("warn", "t2_wall_timeout_abort", { elapsed: elapsed() });
-      break;
-    }
-    const remainingBudget = wallDeadline - elapsed();
-    if (remainingBudget <= 200) break;
-    const t2Group = wsrvNode ? [node, wsrvNode] : [node];
-    const winner = await raceGroup(t2Group, remainingBudget, "t2");
-    if (winner.ok) {
-      flushHealthReport();
-      return buildImageResp(
-        winner.res,
-        winner.node.id,
-        attemptsMade,
-        elapsed(),
-        embedMs,
-        colo,
-        health,
-      );
-    }
+    if (!budgetOk()) break;
+    const winner = await arm([node], "t2");
+    const resp = respond(winner);
+    if (resp) return resp;
     log("error", "t2_failed", { node: node.id, attemptMs: elapsed() });
   }
 
@@ -307,11 +312,11 @@ export async function distributedRender({
   });
   flushHealthReport();
 
-  if (fallbackImageUrl) {
+  if (fallbackImageUrl || posterUrl) {
     return new Response(null, {
       status: 302,
       headers: {
-        Location: fallbackImageUrl,
+        Location: fallbackImageUrl || posterUrl,
         "Access-Control-Allow-Origin": "*",
         "X-Raster-Source": "fallback-redirect",
         "X-Failure-Reason": "all_nodes_exhausted",

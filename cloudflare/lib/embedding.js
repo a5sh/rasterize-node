@@ -70,9 +70,17 @@ export async function embedPoster(
   // Full-string SHA-256 of BOTH inputs — no truncation windows, so posters
   // that differ anywhere (href, title, badge values, layout) get distinct
   // keys even when their shared <defs>/icon boilerplate dwarfs the rest.
+  // Base64 data-URI payloads (icon blobs / embedded images) are stripped
+  // before hashing the SVG: their bytes are determined by posterUrl (hashed
+  // separately above) plus SVG structure, so they only make the digest
+  // expensive without adding discrimination.
+  const svgFingerprint = svgText.replace(
+    /data:[^,]+;base64,[A-Za-z0-9+/=]+/g,
+    "#B64",
+  );
   const [urlHash, svgHash] = await Promise.all([
     sha256Hex(posterUrl),
-    sha256Hex(svgText),
+    sha256Hex(svgFingerprint),
   ]);
   const cacheKey = `poster-embed:${urlHash}:${svgHash}`;
   const cacheReq = new Request(`https://embed-cache.internal/${cacheKey}`);
