@@ -75,7 +75,7 @@ let _relayCount = 0;
 let _relayWindowEnd = 0;
 let _relayLastPost = 0;
 
-function _canRelayError() {
+function _canRelay() {
   const now = Date.now();
   if (now > _relayWindowEnd) {
     _relayCount = 0;
@@ -87,7 +87,7 @@ function _canRelayError() {
 }
 
 async function relayNodeError(env, log, { node, title, message, ts }) {
-  if (!env.DISCORD_WEBHOOK_URL || !_canRelayError()) return;
+  if (!env.DISCORD_WEBHOOK_URL || !_canRelay()) return;
   _relayCount++;
   _relayLastPost = Date.now();
   log("info", "fleet_error_relay", { node, title });
@@ -117,6 +117,51 @@ async function relayNodeError(env, log, { node, title, message, ts }) {
   }
 }
 
+// ── Generic log relay (Worker A → Discord) ────────────────────────────────────
+// Worker A posts warn/error events here via its RASTERIZER service binding
+// (/report-log). The Discord webhook secret lives in Worker B's environment
+// only; the rate limiter is shared with the node-error relay so a log flood
+// can't spray the channel. `embeds` (optional) is passed through verbatim
+// for prebuilt payloads (e.g. the /test benchmark report).
+async function relayLogEvent(
+  env,
+  log,
+  { level, message, meta = {}, embeds = null },
+) {
+  if (!env.DISCORD_WEBHOOK_URL || !_canRelay()) return false;
+  _relayCount++;
+  _relayLastPost = Date.now();
+  log("info", "log_relay", { level, message });
+  try {
+    const payload = Array.isArray(embeds)
+      ? { username: "Posterium Alerts", avatar_url: BRAND.appIcon, embeds }
+      : {
+          username: "Posterium Alerts",
+          avatar_url: BRAND.appIcon,
+          embeds: [
+            {
+              title: `${level === "error" ? "🚨" : "⚠️"} ${String(message).slice(0, 256)}`,
+              description:
+                JSON.stringify(meta)?.slice(0, 2000) || "No details",
+              color: level === "error" ? 0xf87171 : 0xfbbf24,
+              thumbnail: { url: BRAND.appIcon },
+              footer: { text: `worker A · ${level}` },
+              timestamp: new Date().toISOString(),
+            },
+          ],
+        };
+    await fetch(env.DISCORD_WEBHOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(5_000),
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // ── Structured logger ──────────────────────────────────────────────────────────
 
 function _log(level, event, meta = {}) {
@@ -128,22 +173,6 @@ function _log(level, event, meta = {}) {
     ...meta,
   };
   (level === "error" ? console.error : console.log)(JSON.stringify(entry));
-}
-
-// Reserved for secrets_store_secrets-style bindings (see the other
-// wrangler.jsonc's CF_ACCOUNT_ID/CF_API_TOKEN pattern). Not currently
-// called — DISCORD_WEBHOOK_URL is read as a plain var — preserved as-is.
-async function resolveSecret(binding) {
-  if (!binding) return null;
-  if (typeof binding === "string") return binding;
-  if (typeof binding.get === "function") {
-    try {
-      return await binding.get();
-    } catch {
-      return null;
-    }
-  }
-  return null;
 }
 
 // ── Shared per-isolate health state ──────────────────────────────────────────
@@ -323,6 +352,26 @@ export default {
         return _jsonOk({ ok: true });
       } catch (e) {
         return _jsonError(502, e?.message || "report failed");
+      }
+    }
+
+    // ── /report-log — Worker A log relay ────────────────────────────────────
+    // Worker A's logEvent() POSTs warn/error events here through its
+    // RASTERIZER service binding; this worker owns the Discord webhook
+    // (secret + rate limiting). Optional prebuilt embeds pass through.
+    if (request.method === "POST" && url.pathname === "/report-log") {
+      try {
+        const body = await request.json().catch(() => null);
+        if (!body?.message) return _jsonError(400, "missing message");
+        const relayed = await relayLogEvent(env, _log, {
+          level: body.level || "warn",
+          message: body.message,
+          meta: body.meta || {},
+          embeds: Array.isArray(body.embeds) ? body.embeds : null,
+        });
+        return _jsonOk({ ok: true, relayed });
+      } catch (e) {
+        return _jsonError(502, e?.message || "log relay failed");
       }
     }
 

@@ -30,7 +30,7 @@
 // logAttempt(); the snapshot's score/failing/concurrency are derived from
 // that same data at cron time.
 
-import { geoOrderNodes } from "./geoRouting.js";
+import { geoOrderNodes, getRegion } from "./geoRouting.js";
 import { tryNode, gzip } from "./nodeAttempt.js";
 import { embedPoster } from "./embedding.js";
 import { logAttempt } from "./metricsWriter.js";
@@ -54,10 +54,11 @@ function buildImageResp(
   wallMs,
   embedMs,
   colo,
+  continent,
   health,
 ) {
   const h = new Headers(upstream.headers);
-  const geoRegion = (colo && COLO_REGION[colo.toUpperCase()]) || "UNKNOWN";
+  const geoRegion = getRegion(colo, continent);
   h.set("Access-Control-Allow-Origin", "*");
   h.set("X-Raster-Source", nodeId);
   h.set("X-Attempt-Count", String(attemptCount));
@@ -266,6 +267,7 @@ export async function distributedRender({
         elapsed(),
         embedMs,
         colo,
+        continent,
         health,
       );
     }
