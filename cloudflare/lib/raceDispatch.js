@@ -1,16 +1,26 @@
 // cloudflare/lib/raceDispatch.js
 //
-// v16 — fixes:
-//   • In-flight attempts are NO LONGER aborted when a phase budget expires.
-//     Previous behavior: the budget timer (SEQUENTIAL_ATTEMPT_MS = 1.5s)
-//     aborted every in-flight node, including the original phase-1 pick,
-//     even when that node was about to succeed (e.g. a healthy node that
-//     needs 1.8s was killed at 1.5s, then the fallback chain re-burned
+// v17 — fixes:
+//   • v16: In-flight attempts are NO LONGER aborted when a phase budget
+//     expires. Previous behavior: the budget timer (SEQUENTIAL_ATTEMPT_MS =
+//     1.5s) aborted every in-flight node, including the original phase-1
+//     pick, even when that node was about to succeed (e.g. a healthy node
+//     that needs 1.8s was killed at 1.5s, then the fallback chain re-burned
 //     budget on fresh nodes that are no more likely to finish sooner).
 //     Now attempts keep running in a background pool: the next phase races
 //     the new node(s) AGAINST the still-pending attempts, so whichever
 //     resolves successfully first wins the request. A winner (or chain
 //     exhaustion) aborts everything else, so no dangling subrequests leak.
+//   • v17: Poster embedding + gzip are now LAZY. The poster is fetched and
+//     base64-embedded (and the SVG gzipped) only when a POST-body node is
+//     actually about to be attempted. URL-payload nodes (wsrv, Vercel GET)
+//     fetch the SVG themselves via svgUrl and never touch the embedded
+//     body, so when Phase 1's single best node is a URL-payload node the
+//     request pays zero embed/gzip cost. Both are memoized per request:
+//     the first POST attempt pays them once, every later POST attempt
+//     reuses the same embedded SVG + gzipped payload. If the embed fails,
+//     the raw (unembedded) SVG is sent and the node fetches the poster
+//     href itself.
 //   • Every node attempt still writes a full-fidelity row straight to
 //     RASTER_METRICS via logAttempt() — node, format, type, colo, outcome,
 //     error, lane, wasWinner, wall ms, node-reported compute ms, in-flight
@@ -70,7 +80,7 @@ function buildImageResp(
   h.set("X-Node-Score", String(Math.round(health.nodeScore(nodeId))));
   h.set("X-Geo-Preferred", geoRegion);
   h.set("X-CF-Colo", colo || "");
-  h.set("X-LB-Version", "cf-v16");
+  h.set("X-LB-Version", "cf-v17");
   h.set("Cache-Control", "public, max-age=172800");
   h.set(
     "Access-Control-Expose-Headers",
@@ -131,45 +141,72 @@ export async function distributedRender({
     /* stale/local health state is fine — routing still works */
   }
 
-  const { svg: embeddedSvg, embedMs, embedded, fromCache } = await embedPoster(
-    svgText,
-    posterUrl,
-    env,
-    posterEmbedTimeoutMs,
-    log,
-  );
-
   const wallDeadline = Math.min(maxWallTimeMs, HARD_WALL_MS);
   const ordered = geoOrderNodes(colo, t1Nodes, health, continent);
   const racePool = [...ordered];
 
-  // Compression: build the gzipped payload ONCE per request and reuse it for
-  // every POST-body node — the old path re-ran CompressionStream("gzip") on
-  // the same ~200-400KB SVG inside every single tryNode() call (4-6 gzips per
-  // request). URL-payload nodes (wsrv/Vercel GET) never need it. gzip() is
-  // null-safe: on failure each node falls back to a plain-text POST.
-  const tGzip0 = Date.now();
-  const gzPayload = racePool.some(
-    (n) =>
-      !n.useUrlPayload &&
-      (n.acceptsCompression === "gzip" || n.acceptsCompression === true),
-  )
-    ? await gzip(embeddedSvg)
-    : null;
-  const gzipMs = Date.now() - tGzip0;
+  // ── Lazy poster embed + gzip (v17) ─────────────────────────────────────────
+  // Both are computed only when a POST-body node is about to be attempted,
+  // and memoized per request. URL-payload nodes (wsrv/Vercel GET) fetch the
+  // SVG themselves via svgUrl and never use the embedded body, so a request
+  // won by a URL-payload node never pays fetch+base64+gzip at all.
+  let embedPromise = null;
+  let embeddedSvg = null;
+  let embedMs = 0;
+  let embedRan = false;
+  let embedded = false;
+  let fromCache = false;
+  let gzPromise = null;
+  let gzPayload = null;
+  let gzipMs = 0;
 
-  try {
-    logEmbed(env, {
-      format,
-      inputType,
-      colo,
-      outcome: embedded ? "success" : "failure",
-      cache: fromCache ? "hit" : posterUrl ? "miss" : "none",
-      embedMs,
-      gzipMs,
-      payloadBytes: new Blob([embeddedSvg]).size,
-    });
-  } catch (_) {}
+  function ensureEmbeddedSvg() {
+    if (!embedPromise) {
+      embedPromise = (async () => {
+        const r = await embedPoster(
+          svgText,
+          posterUrl,
+          env,
+          posterEmbedTimeoutMs,
+          log,
+        );
+        embedded = r.embedded;
+        fromCache = !!r.fromCache;
+        embeddedSvg = r.svg;
+        embedMs = r.embedMs;
+        return r.svg;
+      })();
+    }
+    return embedPromise;
+  }
+
+  function ensureGzPayload(svg) {
+    if (!gzPromise) {
+      gzPromise = (async () => {
+        const t0 = Date.now();
+        const gz = await gzip(svg);
+        gzipMs = Date.now() - t0;
+        gzPayload = gz;
+        return gz;
+      })();
+    }
+    return gzPromise;
+  }
+
+  function reportEmbed() {
+    try {
+      logEmbed(env, {
+        format,
+        inputType,
+        colo,
+        outcome: embedRan ? (embedded ? "success" : "failure") : "skipped",
+        cache: fromCache ? "hit" : embedRan && posterUrl ? "miss" : "none",
+        embedMs,
+        gzipMs,
+        payloadBytes: new Blob([embeddedSvg || svgText]).size,
+      });
+    } catch (_) {}
+  }
 
   // ── Background attempt pool ───────────────────────────────────────────────
   // Attempts survive their phase: when a phase budget expires we move on
@@ -224,42 +261,60 @@ export async function distributedRender({
       logged: false,
       result: null,
     };
-    rec.promise = tryNode(
-      node,
-      embeddedSvg,
-      svgUrl,
-      format,
-      controller.signal,
-      health,
-      gzPayload,
-    )
-      .then((result) => {
-        const attemptMs = Date.now() - t0;
-        if (!result.ok && result.error !== "timeout") {
-          log("warn", "t1_failed", {
-            node: node.id,
-            error: result.error,
-            attemptMs,
-          });
+    let tNode = t0;
+    rec.promise = (async () => {
+      // Build the payload ONLY for nodes that actually consume it. POST-body
+      // nodes get the embedded SVG + gzipped payload (lazily, once per
+      // request); URL-payload nodes take the raw path via svgUrl.
+      // Embed/gzip time is excluded from attemptMs — it is tracked
+      // separately (embedMs / gzipMs) so node timing stays comparable.
+      let body = svgText;
+      let gz = null;
+      if (!node.useUrlPayload) {
+        embedRan = true;
+        body = await ensureEmbeddedSvg();
+        if (
+          node.acceptsCompression === "gzip" ||
+          node.acceptsCompression === true
+        ) {
+          gz = await ensureGzPayload(body);
         }
-        settleRecord(rec, { ...result, ms: attemptMs });
-        return rec;
-      })
-      .catch((err) => {
-        log("warn", "race_promise_settle_error", {
-          reason: err?.message || String(err),
+      }
+      tNode = Date.now();
+      const result = await tryNode(
+        node,
+        body,
+        svgUrl,
+        format,
+        controller.signal,
+        health,
+        gz,
+      );
+      const attemptMs = Date.now() - tNode;
+      if (!result.ok && result.error !== "timeout") {
+        log("warn", "t1_failed", {
+          node: node.id,
+          error: result.error,
+          attemptMs,
         });
-        settleRecord(rec, {
-          ok: false,
-          res: null,
-          error: `throw:${err?.message?.slice(0, 60) || "unknown"}`,
-          status: 0,
-          ms: Date.now() - t0,
-          inflightAtStart: 0,
-          computeMs: 0,
-        });
-        return rec;
+      }
+      settleRecord(rec, { ...result, ms: attemptMs });
+      return rec;
+    })().catch((err) => {
+      log("warn", "race_promise_settle_error", {
+        reason: err?.message || String(err),
       });
+      settleRecord(rec, {
+        ok: false,
+        res: null,
+        error: `throw:${err?.message?.slice(0, 60) || "unknown"}`,
+        status: 0,
+        ms: Date.now() - tNode || 0,
+        inflightAtStart: 0,
+        computeMs: 0,
+      });
+      return rec;
+    });
     pool.set(key, rec);
     return rec;
   }
@@ -275,6 +330,7 @@ export async function distributedRender({
     abortPool(winner.key);
     await Promise.allSettled([...pool.values()].map((r) => r.promise));
     pool.forEach((rec) => logAttemptRecord(rec));
+    reportEmbed();
   }
 
   async function raceGroup(nodes, budgetMs, lane) {
@@ -423,6 +479,7 @@ export async function distributedRender({
   abortPool(null);
   await Promise.allSettled([...pool.values()].map((r) => r.promise));
   pool.forEach((rec) => logAttemptRecord(rec));
+  reportEmbed();
 
   if (fallbackImageUrl || posterUrl) {
     return new Response(null, {
