@@ -75,7 +75,13 @@
   ],
   "observability": {
     "enabled": true,
-    "head_sampling_rate": 0.1,
+    "logs": {
+      "head_sampling_rate": 0.1,
+    },
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 0.05,
+    },
   },
   // Smart Placement: this Worker is the back-end of an HTTP service-binding
   // chain (Worker A → r-cf). Placement analyzes where requests run fastest
