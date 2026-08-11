@@ -30,7 +30,7 @@
 // logAttempt(); the snapshot's score/failing/concurrency are derived from
 // that same data at cron time.
 
-import { geoOrderNodes, COLO_REGION } from "./geoRouting.js";
+import { geoOrderNodes } from "./geoRouting.js";
 import { tryNode, gzip } from "./nodeAttempt.js";
 import { embedPoster } from "./embedding.js";
 import { logAttempt } from "./metricsWriter.js";
