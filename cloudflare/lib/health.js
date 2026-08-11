@@ -133,9 +133,5 @@ export function createKvFleetBridge() {
     return cache.data;
   }
 
-  function reportBatch() {
-    /* no-op — per-attempt routing analytics already go to Analytics Engine */
-  }
-
-  return { refreshScores, reportBatch };
+  return { refreshScores };
 }

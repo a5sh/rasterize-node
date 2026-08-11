@@ -97,15 +97,10 @@ export async function distributedRender({
   const tWall0 = Date.now();
   const payloadKb = Math.round(new Blob([svgText]).size / 1024);
   let attemptsMade = 0;
-  const attemptLog = []; // per-attempt rows already written to RASTER_METRICS by reportAttempt
-
   const elapsed = () => Date.now() - tWall0;
   const timedOut = () => elapsed() >= maxWallTimeMs;
 
-  // Analytics + DO health reporting must never be able to break the actual
-  // image response — both are wrapped so a thrown error here is swallowed.
   function reportAttempt(nodeId, ok, ms, isWinner, extra) {
-    attemptLog.push({ nodeId, ok, ms, isWinner });
     try {
       logAttempt(env, {
         nodeId,
@@ -123,11 +118,6 @@ export async function distributedRender({
         nodeScore: extra.nodeScore ?? 0,
         computeMs: extra.computeMs ?? 0,
       });
-    } catch (_) {}
-  }
-  function flushHealthReport() {
-    try {
-      bridge.reportBatch(env, ctx, attemptLog);
     } catch (_) {}
   }
 
@@ -268,7 +258,6 @@ export async function distributedRender({
   const arm = (nodes, lane) => raceGroup(nodes, attemptBudget(), lane);
   const respond = (winner) => {
     if (winner.ok) {
-      flushHealthReport();
       return buildImageResp(
         winner.res,
         winner.node.id,
@@ -324,7 +313,6 @@ export async function distributedRender({
     attempts: attemptsMade,
     wallMs,
   });
-  flushHealthReport();
 
   if (fallbackImageUrl || posterUrl) {
     return new Response(null, {

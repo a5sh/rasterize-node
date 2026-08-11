@@ -261,33 +261,4 @@ function jsonError(status, msg) {
   });
 }
 
-/**
- * CORS proxy for fetching an allow-listed node's /health JSON. Allowlist is
- * derived from NODE_CONFIG.nodes so an operator can't be tricked into
- * proxying to an arbitrary host.
- */
-export async function handleProxy(request, nodeConfig) {
-  const url = new URL(request.url);
-  const target = url.searchParams.get("url");
-  if (!target) return jsonError(400, "Missing ?url=");
-  const allowed = nodeConfig.nodes.map((n) => new URL(n.url).host);
-  const tHost = (() => {
-    try {
-      return new URL(target).host;
-    } catch {
-      return "";
-    }
-  })();
-  if (!allowed.includes(tHost)) return jsonError(403, "URL not in allowlist");
-  try {
-    const res = await fetch(target, {
-      headers: { "User-Agent": "SpicyDevs-LB/12.0" },
-      signal: AbortSignal.timeout(8_000),
-    });
-    const h = new Headers(res.headers);
-    h.set("Access-Control-Allow-Origin", "*");
-    return new Response(res.body, { status: res.status, headers: h });
-  } catch (e) {
-    return jsonError(502, e?.message);
-  }
-}
+
