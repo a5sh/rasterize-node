@@ -48,16 +48,17 @@ const ALERT_MIN_GAP_MS = 10_000;
 
 const nodeMeta = (id) => NODE_CONFIG.nodes.find((n) => n.id === id) || null;
 
-// secrets_store_secrets bindings (CF_ACCOUNT_ID/CF_API_TOKEN) arrive as
-// plain strings; tolerate a .get()-style binding defensively.
 async function resolveSecret(binding) {
   if (!binding) return null;
-  if (typeof binding === "string") return binding;
-  if (typeof binding.get === "function") {
+  if (typeof binding === "string" && binding.trim().length > 0) return binding;
+  if (typeof binding === "object" && typeof binding.get === "function") {
     try {
-      return await binding.get();
+      const val = await binding.get("value");
+      if (typeof val === "string" && val.trim().length > 0) return val;
+      const direct = await binding.get();
+      if (typeof direct === "string" && direct.trim().length > 0) return direct;
     } catch {
-      return null;
+      // fall through
     }
   }
   return null;
@@ -85,6 +86,24 @@ function adjustConcurrency(current, healthy) {
     : Math.max(CONCURRENCY_MIN, Math.floor(cur / 2));
 }
 
+async function runAeSql(accountId, apiToken, sql) {
+  const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/analytics_engine/sql`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiToken}`,
+      "Content-Type": "text/plain",
+    },
+    body: sql.trim().replace(/\s+/g, " "),
+    signal: AbortSignal.timeout(AE_QUERY_TIMEOUT_MS),
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => `HTTP ${res.status}`);
+    throw new Error(`AE SQL ${res.status}: ${body}`);
+  }
+  return res.json();
+}
+
 // ── Step 2: per-node stats for the last 15 min from Analytics Engine ──────
 async function queryAeWindow(env, log) {
   const accountId = await resolveSecret(env?.CF_ACCOUNT_ID);
@@ -107,24 +126,7 @@ async function queryAeWindow(env, log) {
     "GROUP BY index1",
   ].join("\n");
   try {
-    const res = await fetch(
-      `https://api.cloudflare.com/client/v4/accounts/${accountId}/analytics_engine/sql`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${apiToken}`,
-          "Content-Type": "text/plain",
-        },
-        body: sql,
-        signal: AbortSignal.timeout(AE_QUERY_TIMEOUT_MS),
-      },
-    );
-    if (!res.ok) {
-      const body = await res.text().catch(() => "");
-      log("warn", "fleet_sync_ae_http", { status: res.status, body: body.slice(0, 200) });
-      return null;
-    }
-    const json = await res.json().catch(() => null);
+    const json = await runAeSql(accountId, apiToken, sql);
     if (!json || !Array.isArray(json.data)) {
       log("warn", "fleet_sync_ae_bad_payload", { rows: json?.rows });
       return null;
