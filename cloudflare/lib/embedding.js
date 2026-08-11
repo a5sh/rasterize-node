@@ -1,22 +1,34 @@
 // cloudflare/lib/embedding.js
 //
-// Single-poster embedding for Worker B, CF-cache-backed for 5 minutes.
+// Single-poster embedding for Worker B, CF-cache-backed.
 //
-// The cache key hashes the ENTIRE posterUrl and the ENTIRE svgText with
-// SHA-256 (previously the SVG hash only covered the first 4096 chars + last
-// 64, which collapsed towards a single value once icon <symbol> defs pushed
-// the poster href / title / badge values past the 4096-char window — that
-// made concurrent requests for different movies share cache entries).
+// CACHE MODEL: the cache stores ONLY the encoded poster asset (a base64 data
+// URI), keyed 1:1 on the poster URL's SHA-256. The composed SVG is NEVER
+// cached here: the expensive work (fetching the poster bytes + base64-encoding
+// them) depends only on posterUrl, so every badge-config variant of the same
+// movie must share one cache entry. The old scheme hashed posterUrl + the full
+// SVG string, so every distinct ?r=/layout/scale variant busted the cache and
+// re-fetched + re-encoded the same poster — that duplicated the poster fetch
+// and base64 work per request, which was the dominant CPU cost on Worker B.
 //
-// Cache hits are additionally verified: every entry is written with an
-// X-Embed-Url-Hash header, and a hit is only served when that header matches
-// the current posterUrl's hash. Entries without the header (old format) are
-// treated as misses and re-embedded once.
+// DO NOT key this cache on SVG content again. If a future refactor needs a
+// per-SVG cache, layer it on top of this asset cache, never replace it.
 //
-// Embed-outcome analytics datapoint (RASTER_METRICS, blob1 = 'embed'):
-//   blob5 = outcome  'success' | 'failure'
-//   blob6 = errorReason  '' on success, 'http_NNN' | 'throw:...' on failure
-//   double1 = embedMs
+// Splice step runs fresh on every request: href="posterUrl" → href="dataUri".
+// This is a cheap string replace relative to fetch+encode+hash, and it means
+// per-request SVG content is always current without any cache invalidation.
+//
+// Cache entries carry an X-Embed-Url-Hash header; a hit is only served when
+// it matches the current posterUrl's hash (sanity guard on top of the 1:1 key,
+// and old-format entries are re-embedded once).
+//
+// Embed analytics datapoint (RASTER_METRICS, blob1 = 'embed'):
+//   blob5 = outcome     'success' | 'failure'
+//   blob6 = errorReason '' on success, 'http_NNN' | 'throw:...' on failure
+//   blob7 = cache       'hit' | 'miss'
+//   double1 = embedMs   wall time for fetch + base64 + splice (0 on cache hit)
+//   double2 = gzipMs    wall time spent gzipping the embedded SVG
+//   double3 = payloadBytes  embedded SVG length in bytes
 
 async function sha256Hex(str) {
   const digest = await crypto.subtle.digest(
@@ -44,14 +56,9 @@ function bufToB64(buffer) {
 }
 
 /**
- * Embed outcome no longer writes a RASTER_METRICS row — that was ~1
- * datapoint per request ("embed"-tagged), redundant with the per-attempt
- * rows and Worker A's per-request wall-time row. Errors still surface via
- * the warn-level logs below; cache-readiness is visible from the serverless
- * /health iconCache fields.
- *
- * Fetch the poster image ONCE and embed it as a base64 data URI, replacing
- * every href="posterUrl" occurrence in the SVG.
+ * Fetch the poster image ONCE (per URL) and embed it as a base64 data URI,
+ * replacing every href="posterUrl" occurrence in the SVG. The cache holds
+ * only the encoded poster asset, keyed on posterUrl — never the composed SVG.
  *
  * @param {string} svgText
  * @param {string|null} posterUrl
@@ -69,35 +76,44 @@ export async function embedPoster(
 ) {
   if (!posterUrl) return { svg: svgText, embedMs: 0, embedded: false };
 
-  // Full-string SHA-256 of BOTH inputs — no truncation windows, so posters
-  // that differ anywhere (href, title, badge values, layout) get distinct
-  // keys even when their shared <defs>/icon boilerplate dwarfs the rest.
-  // Base64 data-URI payloads (icon blobs / embedded images) are stripped
-  // before hashing the SVG: their bytes are determined by posterUrl (hashed
-  // separately above) plus SVG structure, so they only make the digest
-  // expensive without adding discrimination.
-  const svgFingerprint = svgText.replace(
-    /data:[^,]+;base64,[A-Za-z0-9+/=]+/g,
-    "#B64",
-  );
-  const [urlHash, svgHash] = await Promise.all([
-    sha256Hex(posterUrl),
-    sha256Hex(svgFingerprint),
-  ]);
-  const cacheKey = `poster-embed:${urlHash}:${svgHash}`;
+  const urlHash = await sha256Hex(posterUrl);
+  const cacheKey = `poster-asset:${urlHash}`;
   const cacheReq = new Request(`https://embed-cache.internal/${cacheKey}`);
   const cache = caches.default;
 
+  const asset = await fetchPosterAsset(cache, cacheReq, urlHash, posterUrl, posterEmbedTimeoutMs, log);
+
+  if (!asset) {
+    return { svg: svgText, embedMs: asset?.embedMs ?? 0, embedded: false };
+  }
+
+  const svg = svgText.split(`href="${posterUrl}"`).join(`href="${asset.dataUri}"`);
+  return {
+    svg,
+    embedMs: asset.embedMs,
+    embedded: true,
+    fromCache: asset.fromCache,
+  };
+}
+
+/**
+ * Get-or-fetch the base64 data URI for a poster URL.
+ *
+ * @returns {Promise<{dataUri: string, embedMs: number, fromCache: boolean} | null>}
+ */
+async function fetchPosterAsset(cache, cacheReq, urlHash, posterUrl, posterEmbedTimeoutMs, log) {
   try {
     const hit = await cache.match(cacheReq);
     // Sanity guard on top of the key: only serve the hit when it was written
-    // for THIS poster URL. Old entries (no header) are re-embedded once.
+    // for THIS poster URL. Old-format entries are re-embedded once.
     if (hit && hit.headers.get("x-embed-url-hash") === urlHash) {
-      const svg = await hit.text();
-      return { svg, embedMs: 0, embedded: true, fromCache: true };
+      const dataUri = await hit.text();
+      if (dataUri) {
+        return { dataUri, embedMs: 0, fromCache: true };
+      }
     }
   } catch (_) {
-    /* cache miss on error is fine */
+    /* cache read failure — proceed to fetch */
   }
 
   const t0 = Date.now();
@@ -112,20 +128,20 @@ export async function embedPoster(
         status: res.status,
         url: posterUrl.slice(0, 100),
       });
-      return { svg: svgText, embedMs: Date.now() - t0, embedded: false };
+      return null;
     }
     const buf = await res.arrayBuffer();
     const ct = res.headers.get("content-type") || "image/jpeg";
-    const uri = `data:${ct};base64,${bufToB64(buf)}`;
-    const svg = svgText.split(`href="${posterUrl}"`).join(`href="${uri}"`);
+    const dataUri = `data:${ct};base64,${bufToB64(buf)}`;
+    const embedMs = Date.now() - t0;
 
     try {
       await cache.put(
         cacheReq,
-        new Response(svg, {
+        new Response(dataUri, {
           headers: {
-            "Content-Type": "image/svg+xml",
-            "Cache-Control": "public, max-age=300",
+            "Content-Type": "text/plain",
+            "Cache-Control": "public, max-age=1800",
             "X-Embed-Url-Hash": urlHash,
           },
         }),
@@ -134,12 +150,12 @@ export async function embedPoster(
       /* non-fatal */
     }
 
-    return { svg, embedMs: Date.now() - t0, embedded: true };
+    return { dataUri, embedMs, fromCache: false };
   } catch (e) {
     log("warn", "poster_embed_failed", {
       reason: e?.message,
       url: posterUrl.slice(0, 100),
     });
-    return { svg: svgText, embedMs: Date.now() - t0, embedded: false };
+    return null;
   }
 }

@@ -1,27 +1,27 @@
 // cloudflare/lib/raceDispatch.js
 //
-// v15 — fixes:
-//   • ctx/fleetBridge are now real parameters. Previously referenced via
-//     `arguments[0].ctx` / `this?.ctx`, both always undefined because
-//     worker.js never passed either — every call into fleetBridge threw
-//     synchronously before any node was even contacted. Fixed at the call
-//     site in worker.js; also defended here with a no-op fallback bridge
-//     and try/catch around every analytics/health call so a future wiring
-//     mistake degrades to "no health reporting" instead of "no images."
-//   • Every node attempt now writes a full-fidelity row straight to
+// v16 — fixes:
+//   • In-flight attempts are NO LONGER aborted when a phase budget expires.
+//     Previous behavior: the budget timer (SEQUENTIAL_ATTEMPT_MS = 1.5s)
+//     aborted every in-flight node, including the original phase-1 pick,
+//     even when that node was about to succeed (e.g. a healthy node that
+//     needs 1.8s was killed at 1.5s, then the fallback chain re-burned
+//     budget on fresh nodes that are no more likely to finish sooner).
+//     Now attempts keep running in a background pool: the next phase races
+//     the new node(s) AGAINST the still-pending attempts, so whichever
+//     resolves successfully first wins the request. A winner (or chain
+//     exhaustion) aborts everything else, so no dangling subrequests leak.
+//   • Every node attempt still writes a full-fidelity row straight to
 //     RASTER_METRICS via logAttempt() — node, format, type, colo, outcome,
 //     error, lane, wasWinner, wall ms, node-reported compute ms, in-flight
-//     count, payload size, EMA score at selection. logAttempt existed in
-//     metricsWriter.js but nothing called it — that's the actual reason
-//     most of routes/analytics.js's per-node queries returned 0 rows, both
-//     before and after any DO work.
-//   • isWinner is decided once per race group AFTER it settles, not by
-//     whichever attempt happened to resolve successfully inside its own
-//     promise body (previously `isWinner: result.ok` could tag every
-//     successful racer as a winner, not just the one actually returned).
-//   • logRequest() removed — the per-request 'req' summary row is written
-//     exactly once by Worker A (writeWallTime), so Worker B no longer emits
-//     a duplicate datapoint per poster request.
+//     count, payload size, EMA score at selection. isWinner is decided once
+//     per request after a winner is chosen; attempts settling later log as
+//     losers, exactly once.
+//   • logEmbed() writes one RASTER_METRICS 'embed' row per request
+//     (embedMs, gzipMs, payloadBytes, cache hit/miss) so embed-cache hit
+//     rate and gzip cost stay visible in the dashboard.
+//   • logRequest() remains removed — the per-request 'req' summary row is
+//     written exactly once by Worker A (writeWallTime).
 //
 // fleetBridge.refreshScores feeds the KV fleet snapshot (written every
 // 15 minutes by fleetSync.js from Analytics Engine stats + health polls)
@@ -33,13 +33,16 @@
 import { geoOrderNodes, getRegion } from "./geoRouting.js";
 import { tryNode, gzip } from "./nodeAttempt.js";
 import { embedPoster } from "./embedding.js";
-import { logAttempt } from "./metricsWriter.js";
+import { logAttempt, logEmbed } from "./metricsWriter.js";
 
 const HARD_WALL_MS = 5_000;
-// Per-attempt ceiling across the fallback ladder: a single hanging node must
+// Per-phase ceiling across the fallback ladder: a single hanging node must
 // not be allowed to consume the entire wall budget — otherwise one timeout
 // would make every later node unreachable. Healthy nodes finish in ~100-500ms,
 // so 1.5s is generous while still guaranteeing the chain can walk all nodes.
+// NOTE: this bounds how long we WAIT before moving to the next phase; it does
+// NOT cancel the attempts (they continue in the background pool and can still
+// win the request — see header comment).
 const SEQUENTIAL_ATTEMPT_MS = 1_500;
 
 const NOOP_BRIDGE = {
@@ -67,7 +70,7 @@ function buildImageResp(
   h.set("X-Node-Score", String(Math.round(health.nodeScore(nodeId))));
   h.set("X-Geo-Preferred", geoRegion);
   h.set("X-CF-Colo", colo || "");
-  h.set("X-LB-Version", "cf-v15");
+  h.set("X-LB-Version", "cf-v16");
   h.set("Cache-Control", "public, max-age=172800");
   h.set(
     "Access-Control-Expose-Headers",
@@ -100,7 +103,6 @@ export async function distributedRender({
   const payloadKb = Math.round(new Blob([svgText]).size / 1024);
   let attemptsMade = 0;
   const elapsed = () => Date.now() - tWall0;
-  const timedOut = () => elapsed() >= maxWallTimeMs;
 
   function reportAttempt(nodeId, ok, ms, isWinner, extra) {
     try {
@@ -129,7 +131,7 @@ export async function distributedRender({
     /* stale/local health state is fine — routing still works */
   }
 
-  const { svg: embeddedSvg, embedMs } = await embedPoster(
+  const { svg: embeddedSvg, embedMs, embedded, fromCache } = await embedPoster(
     svgText,
     posterUrl,
     env,
@@ -146,6 +148,7 @@ export async function distributedRender({
   // the same ~200-400KB SVG inside every single tryNode() call (4-6 gzips per
   // request). URL-payload nodes (wsrv/Vercel GET) never need it. gzip() is
   // null-safe: on failure each node falls back to a plain-text POST.
+  const tGzip0 = Date.now();
   const gzPayload = racePool.some(
     (n) =>
       !n.useUrlPayload &&
@@ -153,89 +156,175 @@ export async function distributedRender({
   )
     ? await gzip(embeddedSvg)
     : null;
+  const gzipMs = Date.now() - tGzip0;
+
+  try {
+    logEmbed(env, {
+      format,
+      inputType,
+      colo,
+      outcome: embedded ? "success" : "failure",
+      cache: fromCache ? "hit" : posterUrl ? "miss" : "none",
+      embedMs,
+      gzipMs,
+      payloadBytes: new Blob([embeddedSvg]).size,
+    });
+  } catch (_) {}
+
+  // ── Background attempt pool ───────────────────────────────────────────────
+  // Attempts survive their phase: when a phase budget expires we move on
+  // without aborting, and the next phase races fresh nodes against the
+  // still-pending attempts. Whichever resolves successfully first wins.
+  // A chosen winner (or chain exhaustion) aborts everything else.
+  let winnerKey = null; // key of the winning attempt, or 'none' if exhausted
+  const pool = new Map(); // attemptKey -> record
+  let attemptSeq = 0;
+
+  function logAttemptRecord(rec) {
+    if (rec.logged) return;
+    rec.logged = true;
+    reportAttempt(rec.node.id, rec.result.ok, rec.result.ms, rec.key === winnerKey, {
+      error: rec.result.error,
+      status: rec.result.status,
+      inflightAtStart: rec.result.inflightAtStart,
+      nodeScore: health.nodeScore(rec.node.id),
+      computeMs: rec.result.computeMs,
+      lane: rec.lane,
+    });
+  }
+
+  function settleRecord(rec, result) {
+    rec.result = result;
+    rec.settled = true;
+    if (winnerKey) logAttemptRecord(rec);
+  }
+
+  function abortPool(exceptKey) {
+    pool.forEach((rec) => {
+      if (rec.key !== exceptKey && !rec.controller.signal.aborted) {
+        rec.controller.abort();
+      }
+    });
+  }
+
+  function startAttempt(node, lane) {
+    if (health.atCapacity(node)) return null;
+    attemptsMade++;
+    const key = `a${attemptSeq++}`;
+    const t0 = Date.now();
+    const controller = new AbortController();
+    const rec = {
+      key,
+      node,
+      lane,
+      t0,
+      controller,
+      promise: null,
+      settled: false,
+      logged: false,
+      result: null,
+    };
+    rec.promise = tryNode(
+      node,
+      embeddedSvg,
+      svgUrl,
+      format,
+      controller.signal,
+      health,
+      gzPayload,
+    )
+      .then((result) => {
+        const attemptMs = Date.now() - t0;
+        if (!result.ok && result.error !== "timeout") {
+          log("warn", "t1_failed", {
+            node: node.id,
+            error: result.error,
+            attemptMs,
+          });
+        }
+        settleRecord(rec, { ...result, ms: attemptMs });
+        return rec;
+      })
+      .catch((err) => {
+        log("warn", "race_promise_settle_error", {
+          reason: err?.message || String(err),
+        });
+        settleRecord(rec, {
+          ok: false,
+          res: null,
+          error: `throw:${err?.message?.slice(0, 60) || "unknown"}`,
+          status: 0,
+          ms: Date.now() - t0,
+          inflightAtStart: 0,
+          computeMs: 0,
+        });
+        return rec;
+      });
+    pool.set(key, rec);
+    return rec;
+  }
+
+  /**
+   * A winner has been chosen: log it as the winner, abort everything else,
+   * and wait for the losers to settle so their analytics rows are flushed
+   * before the response leaves (a returned response can freeze the isolate).
+   */
+  async function finalizeWinner(winner) {
+    winnerKey = winner.key;
+    logAttemptRecord(winner);
+    abortPool(winner.key);
+    await Promise.allSettled([...pool.values()].map((r) => r.promise));
+    pool.forEach((rec) => logAttemptRecord(rec));
+  }
 
   async function raceGroup(nodes, budgetMs, lane) {
-    const nodeControllers = nodes.map(() => new AbortController());
-    let winnerIdx = -1;
-    const abortLosers = (exceptIdx) => {
-      nodeControllers.forEach((c, i) => {
-        if (i !== exceptIdx && !c.signal.aborted) c.abort();
-      });
-    };
-    const timer = setTimeout(() => abortLosers(winnerIdx), budgetMs);
+    const fresh = [];
+    nodes.forEach((node) => {
+      const rec = startAttempt(node, lane);
+      if (rec) fresh.push(rec);
+    });
 
-    const promises = nodes.map(async (node, idx) => {
-      if (health.atCapacity(node)) {
-        return { ok: false, node, skipped: true, idx };
-      }
-      attemptsMade++;
-      const t0 = Date.now();
-      const result = await tryNode(
-        node,
-        embeddedSvg,
-        svgUrl,
-        format,
-        nodeControllers[idx].signal,
-        health,
-        gzPayload,
-      );
-      const attemptMs = Date.now() - t0;
-
-      if (!result.ok && result.error !== "timeout") {
-        log("warn", "t1_failed", {
-          node: node.id,
-          error: result.error,
-          attemptMs,
+    let budgetTimer = null;
+    const winner = await new Promise((resolve) => {
+      let remaining = fresh.length;
+      if (remaining === 0) {
+        // Every candidate was at capacity — an already-settled success from
+        // the background pool still counts as a win.
+        let bgWin = null;
+        pool.forEach((rec) => {
+          if (!bgWin && rec.result?.ok) bgWin = rec;
         });
+        resolve(bgWin);
+        return;
       }
-      return { ...result, node, attemptMs, idx };
-    });
 
-    let winner;
-    try {
-      winner = await new Promise((resolve) => {
-        let remaining = promises.length;
-        if (remaining === 0) resolve({ ok: false });
-        promises.forEach((p) =>
-          p
-            .then((r) => {
-              if (r.ok && winnerIdx === -1) {
-                winnerIdx = r.idx;
-                abortLosers(r.idx);
-                resolve(r);
-              } else {
-                remaining--;
-                if (remaining === 0) resolve(r);
-              }
-            })
-            .catch((err) => {
-              remaining--;
-              log("warn", "race_promise_settle_error", {
-                reason: err?.message || String(err),
-              });
-              if (remaining === 0) resolve({ ok: false });
-            }),
-        );
-      });
-    } finally {
-      clearTimeout(timer);
-    }
+      const onSettled = (rec) => {
+        if (rec.result?.ok) {
+          resolve(rec);
+          return;
+        }
+        if (fresh.includes(rec)) {
+          remaining--;
+          if (remaining === 0) resolve(null);
+        }
+      };
 
-    // Now that the true winner is known, log every settled attempt once.
-    const settled = await Promise.allSettled(promises);
-    settled.forEach((s) => {
-      if (s.status !== "fulfilled" || s.value?.skipped) return;
-      const r = s.value;
-      const isWinner = r.ok && r.idx === winnerIdx;
-      reportAttempt(r.node.id, r.ok, r.attemptMs, isWinner, {
-        error: r.error,
-        status: r.status,
-        inflightAtStart: r.inflightAtStart,
-        nodeScore: health.nodeScore(r.node.id),
-        computeMs: r.computeMs,
-        lane,
+      fresh.forEach((rec) => rec.promise.then(onSettled, onSettled));
+
+      // Still-pending (or already settled) attempts from earlier phases can
+      // win this race too — a slow-but-successful original node is never
+      // cancelled just because its phase timed out.
+      pool.forEach((rec) => {
+        if (rec.settled) {
+          if (rec.result?.ok) resolve(rec);
+        } else {
+          rec.promise.then(onSettled, onSettled);
+        }
       });
+
+      budgetTimer = setTimeout(() => resolve(null), budgetMs);
     });
+    if (budgetTimer) clearTimeout(budgetTimer);
 
     return winner;
   }
@@ -259,9 +348,9 @@ export async function distributedRender({
     Math.min(wallDeadline - elapsed(), SEQUENTIAL_ATTEMPT_MS);
   const arm = (nodes, lane) => raceGroup(nodes, attemptBudget(), lane);
   const respond = (winner) => {
-    if (winner.ok) {
+    if (winner?.result?.ok) {
       return buildImageResp(
-        winner.res,
+        winner.result.res,
         winner.node.id,
         attemptsMade,
         elapsed(),
@@ -279,7 +368,10 @@ export async function distributedRender({
     const winner = await arm([racePool[cursor]], "t1");
     cursor += 1;
     const resp = respond(winner);
-    if (resp) return resp;
+    if (resp) {
+      await finalizeWinner(winner);
+      return resp;
+    }
   }
 
   // Phase 2 — parallel pair of the next two T1 nodes
@@ -287,7 +379,10 @@ export async function distributedRender({
     const winner = await arm([racePool[cursor], racePool[cursor + 1]], "t1");
     cursor += 2;
     const resp = respond(winner);
-    if (resp) return resp;
+    if (resp) {
+      await finalizeWinner(winner);
+      return resp;
+    }
   }
 
   // Phase 3 — remaining T1, one node at a time
@@ -296,7 +391,10 @@ export async function distributedRender({
     const winner = await arm([racePool[cursor]], "t1");
     cursor += 1;
     const resp = respond(winner);
-    if (resp) return resp;
+    if (resp) {
+      await finalizeWinner(winner);
+      return resp;
+    }
   }
 
   // Phase 3b — T2 pool, one node at a time
@@ -304,7 +402,10 @@ export async function distributedRender({
     if (!budgetOk()) break;
     const winner = await arm([node], "t2");
     const resp = respond(winner);
-    if (resp) return resp;
+    if (resp) {
+      await finalizeWinner(winner);
+      return resp;
+    }
     log("error", "t2_failed", { node: node.id, attemptMs: elapsed() });
   }
 
@@ -316,6 +417,12 @@ export async function distributedRender({
     attempts: attemptsMade,
     wallMs,
   });
+
+  // Stop everything still in flight and log any settled attempts as losers.
+  winnerKey = "none";
+  abortPool(null);
+  await Promise.allSettled([...pool.values()].map((r) => r.promise));
+  pool.forEach((rec) => logAttemptRecord(rec));
 
   if (fallbackImageUrl || posterUrl) {
     return new Response(null, {

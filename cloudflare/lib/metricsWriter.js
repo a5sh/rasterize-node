@@ -83,3 +83,46 @@ export function logAttempt(
 // covers every path, including binding-unavailable and SVG-generation
 // failures that never reach Worker B. logRequest() was removed here to
 // avoid a duplicate datapoint per raster request.
+
+// ── Embed analytics (written by raceDispatch.js, one row per request) ───────
+//   blob1 = 'embed'
+//   blob2 = format             'png' | 'jpg' | 'webp'
+//   blob3 = inputType          'movie' | 'tv' | 'anime'
+//   blob4 = colo               CF datacenter code
+//   blob5 = outcome            'success' | 'failure'
+//   blob6 = errorReason        '' on success, 'http_NNN' | 'throw:...' on fail
+//   blob7 = cache              'hit' | 'miss' (poster-asset cache)
+//   double1 = embedMs          fetch + base64 + splice time (0 on cache hit)
+//   double2 = gzipMs           time spent gzipping the embedded SVG
+//   double3 = payloadBytes     embedded SVG length in bytes
+export function logEmbed(
+  env,
+  {
+    format,
+    inputType,
+    colo,
+    outcome,
+    errorReason = "",
+    cache,
+    embedMs = 0,
+    gzipMs = 0,
+    payloadBytes = 0,
+  },
+) {
+  try {
+    env?.RASTER_METRICS?.writeDataPoint({
+      blobs: [
+        "embed",
+        format,
+        inputType,
+        colo,
+        outcome,
+        errorReason,
+        cache,
+        "",
+      ],
+      doubles: [embedMs, gzipMs, payloadBytes, 0, 0, 0, 0],
+      indexes: ["embed"],
+    });
+  } catch (_) {}
+}
