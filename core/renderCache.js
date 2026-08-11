@@ -1,24 +1,22 @@
 export function simpleHash(str) {
+  // Full-string FNV-1a. The earlier windowed variant (first 4096 chars + last
+  // 64) COLLIDED for POST bodies: the icon <defs> block dominates the head and
+  // closing tags the tail, so different posters hashed to the same key and the
+  // cache served the wrong render. FNV over the whole string is O(n) and costs
+  // microseconds even on a 60KB b64-embedded SVG — correctness over micro-opts.
   let h = 0x811c9dc5;
-  const len = Math.min(str.length, 4096);
-  for (let i = 0; i < len; i++) {
+  for (let i = 0; i < str.length; i++) {
     h ^= str.charCodeAt(i);
-    h = Math.imul(h, 0x01000193);
-  }
-  const tail = str.length > 4096 ? str.slice(-64) : "";
-  for (let i = 0; i < tail.length; i++) {
-    h ^= tail.charCodeAt(i);
     h = Math.imul(h, 0x01000193);
   }
   return (h >>> 0).toString(36);
 }
 
 export function makeCacheKey(svgText, format, queryParts = null) {
-  // When the request carried query params (GET ?url=&format=), hash a JSON of
-  // those instead of the raw SVG. Hashing the SVG is expensive and unstable
-  // once it embeds large base64 images (poster + logo): any byte drift in the
-  // b64 blobs produces a new key for a logically identical render. Same
-  // url + format ⇒ same render ⇒ same key, at a fraction of the cost.
+  // GET requests (Vercel/Netlify URL-payload path) carry query params — hash a
+  // JSON of those instead of the raw SVG: same url + format ⇒ same render ⇒
+  // same key, immune to b64 byte drift. POST bodies have no queries and are
+  // fully content-addressed (whole-SVG hash, see simpleHash).
   const seed = queryParts ? JSON.stringify(queryParts) : svgText;
   return simpleHash(seed) + ":" + format;
 }

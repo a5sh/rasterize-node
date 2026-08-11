@@ -2,7 +2,9 @@
   "name": "rasterize",
   "main": "worker.js",
   "compatibility_date": "2026-08-11",
-  "compatibility_flags": ["nodejs_compat"],
+  // No nodejs_compat — this Worker uses only standard Web APIs (arrayBuffer,
+  // Headers, CompressionStream…). The old wasm/ttf bundling rules are gone
+  // too: no .wasm/.ttf assets are imported anymore (pure JS load balancer).
   "routes": [
     {
       "pattern": "r-cf.spicydevs.xyz",
@@ -49,29 +51,12 @@
     "bindings": [],
   },
   "migrations": [{ "tag": "v2", "deleted_classes": ["FleetHealth"] }],
-  // Node URLs — set real values with: wrangler vars set KEY value
-  // Or set in the Cloudflare dashboard under Workers > Settings > Variables.
-  // DISCORD_WEBHOOK_URL must be set as a secret:
-  //   wrangler secret put DISCORD_WEBHOOK_URL
-  // AFTER — separate alerts webhook so a flapping node during a real incident
-  // doesn't bury the hourly dashboard channel. Set the real webhook URL via
-  // `wrangler secret put ALERTS_WEBHOOK_URL` — left as a var placeholder here
-  // since I don't have a real URL to put; swap to secrets_store_secrets if
-  // preferred, matching CF_ACCOUNT_ID/CF_API_TOKEN's pattern in the main
-  // wrangler.jsonc.
-  "vars": {
-    "VERCEL_NODE_URL": "https://us-r-vercel.vercel.app",
-    "NETLIFY_NODE_URL": "https://r-netlify.netlify.app",
-    "RENDER_NODE_URL": "https://euc-r-render.onrender.com",
-    "VPS1_NODE_URL": "http://node-3.midas.host:25108",
-    "VPS2_NODE_URL": "http://de20.spaceify.eu:26100",
-    "VPS3_NODE_URL": "http://fr1.spaceify.eu:25980/",
-    "DISCORD_WEBHOOK_URL": "https://discord.com/api/webhooks/1522125033227550771/pFI__NgmhoZeiy9XyyCWi1RMkWd2IKBDOkepkj7qpSQBXDaVwyNANVpyfL8IDMDjG1nW",
-    "ALERTS_WEBHOOK_URL": "https://discord.com/api/webhooks/1485865094695878800/a6_LaS5R6J6mbZXWvsMG6PTz9N0He5oG2yqsPWqs-olF5jmHMq0yuDYJ69n5zIdqnpGB",
-  },
-  // Fleet sync queries the Analytics Engine SQL API from inside the Worker
-  // (the only in-Worker path — there is no binding-level query API), so the
-  // same Secrets Store bindings as backend require those credentials:
+  // Secrets: webhook URLs moved to the Secrets Store (official
+  // secrets_store_secrets binding — same store as CF_ACCOUNT_ID/CF_API_TOKEN).
+  // IMPORTANT: add DISCORD_WEBHOOK_URL + ALERTS_WEBHOOK_URL to the store
+  // before deploying or fleet alerts/dashboard embeds silently stop.
+  // (The legacy VERCEL_NODE_URL/…/VPS3_NODE_URL vars were dead — the node
+  // registry is derived from assets/nodes.config.js, not these vars.)
   "secrets_store_secrets": [
     {
       "binding": "CF_ACCOUNT_ID",
@@ -83,17 +68,15 @@
       "store_id": "9b4aa7fc14e74938a057ff9e3fbf4d4d",
       "secret_name": "CF_API_TOKEN",
     },
-  ],
-  "rules": [
     {
-      "type": "CompiledWasm",
-      "globs": ["**/*.wasm"],
-      "fallthrough": true,
+      "binding": "DISCORD_WEBHOOK_URL",
+      "store_id": "9b4aa7fc14e74938a057ff9e3fbf4d4d",
+      "secret_name": "DISCORD_WEBHOOK_URL",
     },
     {
-      "type": "Data",
-      "globs": ["**/*.ttf"],
-      "fallthrough": true,
+      "binding": "ALERTS_WEBHOOK_URL",
+      "store_id": "9b4aa7fc14e74938a057ff9e3fbf4d4d",
+      "secret_name": "ALERTS_WEBHOOK_URL",
     },
   ],
   "observability": {
