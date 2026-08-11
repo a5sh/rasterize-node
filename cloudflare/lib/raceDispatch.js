@@ -31,7 +31,7 @@
 // that same data at cron time.
 
 import { geoOrderNodes, COLO_REGION } from "./geoRouting.js";
-import { tryNode } from "./nodeAttempt.js";
+import { tryNode, gzip } from "./nodeAttempt.js";
 import { embedPoster } from "./embedding.js";
 import { logAttempt } from "./metricsWriter.js";
 
@@ -149,6 +149,19 @@ export async function distributedRender({
   const ordered = geoOrderNodes(colo, t1Nodes, health);
   const racePool = [...ordered];
 
+  // Compression: build the gzipped payload ONCE per request and reuse it for
+  // every POST-body node — the old path re-ran CompressionStream("gzip") on
+  // the same ~200-400KB SVG inside every single tryNode() call (4-6 gzips per
+  // request). URL-payload nodes (wsrv/Vercel GET) never need it. gzip() is
+  // null-safe: on failure each node falls back to a plain-text POST.
+  const gzPayload = racePool.some(
+    (n) =>
+      !n.useUrlPayload &&
+      (n.acceptsCompression === "gzip" || n.acceptsCompression === true),
+  )
+    ? await gzip(embeddedSvg)
+    : null;
+
   async function raceGroup(nodes, budgetMs, lane) {
     const nodeControllers = nodes.map(() => new AbortController());
     let winnerIdx = -1;
@@ -172,6 +185,7 @@ export async function distributedRender({
         format,
         nodeControllers[idx].signal,
         health,
+        gzPayload,
       );
       const attemptMs = Date.now() - t0;
 

@@ -19,6 +19,11 @@
 // Header contract (Worker A → Worker B):
 //   X-Poster-Url          poster image URL → Worker B embeds once
 //   X-SVG-Url             canonical .svg URL (wsrv / Vercel URL-payload path)
+//   X-SVG-Encoding        optional 'gzip' — the POST body is gzip-compressed
+//                         SVG. Stream-decompressed with DecompressionStream
+//                         (Web API, workerd runtime); the CF edge's brotli/
+//                         zstd is for client responses only, the in-worker
+//                         stream codecs stay gzip/deflate.
 //   X-CF-Colo             requesting CF datacenter for geo routing
 //   X-Format              png | jpg | webp
 //   X-Fallback-Image-Url  TMDB direct URL — used for last-resort 302
@@ -50,6 +55,7 @@
 import { T1_NODES, T2_NODES, SETTINGS } from "./lib/nodeRegistry.js";
 import { createHealthState, createKvFleetBridge } from "./lib/health.js";
 import { distributedRender } from "./lib/raceDispatch.js";
+import { decompressGzipStream } from "./lib/nodeAttempt.js";
 import {
   fetchNodeHealth,
   getLastDashboardUpdate,
@@ -398,7 +404,20 @@ export default {
 
     let svgText;
     if (request.method === "POST") {
-      svgText = await request.text();
+      // Worker A gzips the SVG uplink (X-SVG-Encoding: gzip) — the body is
+      // piped through DecompressionStream as a stream, no full-buffer step.
+      const encoding = request.headers.get("X-SVG-Encoding");
+      if (encoding === "gzip") {
+        try {
+          svgText = await decompressGzipStream(request.body);
+        } catch (e) {
+          return _jsonError(400, `Gzip decode failed: ${e?.message}`);
+        }
+      } else if (encoding && encoding !== "identity") {
+        return _jsonError(415, `Unsupported X-SVG-Encoding: ${encoding}`);
+      } else {
+        svgText = await request.text();
+      }
       if (!svgText?.trim()) return _jsonError(400, "Empty SVG body");
       // Reject non-SVG bodies up front: garbage input used to burn the whole
       // T1/T2 chain (every node fails on an invalid document → 502 after

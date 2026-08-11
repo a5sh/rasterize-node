@@ -1,7 +1,17 @@
 // cloudflare/lib/nodeAttempt.js
 //
 // Single-node raster attempt dispatch: URL-payload GET (Vercel, wsrv.nl)
-// vs POST-body (everyone else, with optional gzip), plus the gzip helper.
+// vs POST-body (everyone else, with gzip), plus gzip helpers.
+//
+// Compression notes (Cloudflare runtime, 2026):
+//   • CompressionStream/DecompressionStream (Web API, implemented by the
+//     workerd runtime) support gzip / deflate / deflate-raw — NOT brotli.
+//     In-stream brotli would need a WASM codec, so the node uplink stays gzip.
+//   • The rasterizer's outbound responses (SVG/JSON) are compressed by the
+//     CF edge automatically (brotli/zstd/gzip negotiated per client) — that
+//     is a Cloudflare-native feature, nothing to do in code.
+//   • The same gzipped payload is built ONCE per request (raceDispatch.js)
+//     and reused for every POST node — never re-compressed per attempt.
 
 export async function gzip(text) {
   try {
@@ -16,6 +26,17 @@ export async function gzip(text) {
 }
 
 /**
+ * Stream-decompress a gzip request body (Web API DecompressionStream, as
+ * implemented by the workerd runtime). `request.body` is piped straight
+ * through the decompressor — no intermediate buffering (true streaming).
+ */
+export async function decompressGzipStream(body) {
+  return await new Response(
+    body.pipeThrough(new DecompressionStream("gzip")),
+  ).text();
+}
+
+/**
  * Attempt a single raster node. Records health/error state via `health`.
  *
  * @param {object} node
@@ -24,9 +45,19 @@ export async function gzip(text) {
  * @param {string} format
  * @param {AbortSignal} signal
  * @param {object} health - createHealthState() instance
+ * @param {ArrayBuffer|null} [precompressed] - gzip bytes of svgText, built
+ *   once per request by raceDispatch.js; reused by every POST node.
  * @returns {Promise<{ok, res, error, status, inflightAtStart}>}
  */
-export async function tryNode(node, svgText, svgUrl, format, signal, health) {
+export async function tryNode(
+  node,
+  svgText,
+  svgUrl,
+  format,
+  signal,
+  health,
+  precompressed = null,
+) {
   health.acquireInflight(node.id);
   const inflightAtStart = health.inFlight(node.id);
   try {
@@ -62,7 +93,7 @@ export async function tryNode(node, svgText, svgUrl, format, signal, health) {
         signal,
       });
     } else {
-      // Body POST path — optionally gzip
+      // Body POST path — gzip once per request, reused across nodes
       let body = svgText,
         ct = "image/svg+xml";
       const extra = {};
@@ -70,14 +101,13 @@ export async function tryNode(node, svgText, svgUrl, format, signal, health) {
         node.acceptsCompression === "gzip" ||
         node.acceptsCompression === true
       ) {
-        const gz = await gzip(svgText);
+        const gz = precompressed ?? (await gzip(svgText));
         if (gz) {
           body = gz;
           ct = "application/octet-stream";
           extra["X-SVG-Encoding"] = "gzip";
         }
       }
-      // 'br' reserved for when CF Workers' CompressionStream adds brotli support
       res = await fetch(node.url, {
         method: "POST",
         body,
