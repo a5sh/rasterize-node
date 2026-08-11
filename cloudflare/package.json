@@ -1,0 +1,8 @@
+{
+  "name": "rasterize-edge",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "wrangler": "^4.121.0"
+  }
+}

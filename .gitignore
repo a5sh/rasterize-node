@@ -5,7 +5,6 @@ node_modules/
 .vscode/
 .git/
 schema.sql
-.wragnler/
+.wrangler/
 .env
-/cloudflare/.package-lock.json
-/cloudflare/package.json
+/cloudflare/node_modules/
