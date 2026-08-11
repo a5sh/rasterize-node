@@ -75,6 +75,8 @@ export const COLO_REGION = (() => {
       "MXP",
       "MAN",
       "EDI",
+      "TLV",
+      "BOM",
     ],
   };
   for (const [r, colos] of Object.entries(zones))

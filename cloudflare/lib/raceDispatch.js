@@ -243,6 +243,11 @@ export async function distributedRender({
     if (remainingBudget <= 200) break;
 
     const group = racePool.slice(cursor, cursor + groupSize);
+    // cursor must advance by the ORIGINAL slice width — wsrv injection
+    // inflates group.length and a post-injection advance skips the next
+    // real node (e.g. index 3 in [.., midas, germany, ..] after 1+2+wsrv),
+    // permanently orphaning it from every escalation chain.
+    const sliceLen = group.length;
     // Every fallback group (after the initial single-node attempt) must
     // include wsrv — it's the always-reliable CDN safety net.
     if (groupSize > 1 && wsrvNode && !group.some((n) => n.id === "wsrv")) {
@@ -261,7 +266,7 @@ export async function distributedRender({
         health,
       );
     }
-    cursor += group.length;
+    cursor += sliceLen;
     groupSize = GROUP_SIZE_ESCALATED;
   }
 
