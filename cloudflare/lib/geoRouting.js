@@ -1,88 +1,20 @@
 // cloudflare/lib/geoRouting.js
 //
-// CF colo → region mapping and geo+score-ordered T1 node selection.
+// CF continent / colo → region mapping and geo+score-ordered T1 node selection.
+// Uses request.cf.continent directly from Cloudflare, avoiding unlisted COLO bugs.
 
-export const COLO_REGION = (() => {
-  const m = {};
-  const zones = {
-    NA: [
-      "IAD",
-      "EWR",
-      "MIA",
-      "ORD",
-      "ATL",
-      "BOS",
-      "LAX",
-      "SFO",
-      "SEA",
-      "DFW",
-      "MSP",
-      "PHX",
-      "DEN",
-      "PDX",
-      "LAS",
-      "SMF",
-      "SLC",
-      "OAK",
-      "SJC",
-      "DTW",
-      "PHL",
-      "CMH",
-      "BUF",
-      "CLE",
-      "MSY",
-      "PIT",
-      "RDU",
-      "STL",
-      "OKC",
-      "KCI",
-      "OMA",
-      "TUL",
-      "YYZ",
-      "YVR",
-    ],
-    EU: [
-      "LHR",
-      "CDG",
-      "AMS",
-      "DUB",
-      "FRA",
-      "ZRH",
-      "ARN",
-      "WAW",
-      "FCO",
-      "MAD",
-      "BCN",
-      "MUC",
-      "DUS",
-      "HAM",
-      "BRU",
-      "GVA",
-      "CPH",
-      "OSL",
-      "HEL",
-      "LIS",
-      "VIE",
-      "PRG",
-      "BUD",
-      "OTP",
-      "SOF",
-      "SKP",
-      "BEG",
-      "RIX",
-      "VNO",
-      "TLL",
-      "MXP",
-      "MAN",
-      "EDI",
-      "TLV",
-      "BOM",
-    ],
-  };
-  for (const [r, colos] of Object.entries(zones))
-    for (const c of colos) m[c] = r;
-  return m;
-})();
+/**
+ * Maps CF continent code to target LB region ('NA' | 'EU').
+ *
+ * @param {string|null} colo
+ * @param {string|null} continent - CF continent code (NA, EU, AS, SA, AF, OC)
+ * @returns {'NA'|'EU'}
+ */
+export function getRegion(colo, continent) {
+  if (continent === "EU") return "EU";
+  if (continent === "NA") return "NA";
+  return "NA"; // default fallback for AS, SA, AF, OC
+}
 
 /**
  * Returns T1 nodes in geo-preferred + score order.
@@ -92,13 +24,13 @@ export const COLO_REGION = (() => {
  * @param {string|null} colo
  * @param {Array} t1Nodes
  * @param {object} health - createHealthState() instance
+ * @param {string|null} continent - optional CF continent header
  */
-export function geoOrderNodes(colo, t1Nodes, health) {
-  const req = (colo && COLO_REGION[colo.toUpperCase()]) || "NA";
+export function geoOrderNodes(colo, t1Nodes, health, continent = null) {
+  const req = getRegion(colo, continent);
   const same = t1Nodes.filter((n) => n.lbRegion === req);
   const other = t1Nodes.filter((n) => n.lbRegion !== req);
   const byScore = (a, b) => {
-    // Hard-failing nodes always go last within their geo group
     const fa = health.isFailing(a.id) ? 1 : 0;
     const fb = health.isFailing(b.id) ? 1 : 0;
     if (fa !== fb) return fa - fb;

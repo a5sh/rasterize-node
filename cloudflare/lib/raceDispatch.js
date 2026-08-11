@@ -80,6 +80,7 @@ export async function distributedRender({
   svgUrl,
   format,
   colo,
+  continent,
   fallbackImageUrl,
   posterUrl,
   inputType,
@@ -136,7 +137,7 @@ export async function distributedRender({
   );
 
   const wallDeadline = Math.min(maxWallTimeMs, HARD_WALL_MS);
-  const ordered = geoOrderNodes(colo, t1Nodes, health);
+  const ordered = geoOrderNodes(colo, t1Nodes, health, continent);
   const racePool = [...ordered];
 
   // Compression: build the gzipped payload ONCE per request and reuse it for

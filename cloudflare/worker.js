@@ -389,6 +389,8 @@ export default {
 
     const svgUrl = request.headers.get("X-SVG-Url") || null;
     const colo = request.headers.get("X-CF-Colo") || request.cf?.colo || null;
+    const continent =
+      request.headers.get("X-CF-Continent") || request.cf?.continent || null;
     const fallbackImageUrl =
       request.headers.get("X-Fallback-Image-Url") || null;
     const posterUrl = request.headers.get("X-Poster-Url") || null;
@@ -419,10 +421,6 @@ export default {
         svgText = await request.text();
       }
       if (!svgText?.trim()) return _jsonError(400, "Empty SVG body");
-      // Reject non-SVG bodies up front: garbage input used to burn the whole
-      // T1/T2 chain (every node fails on an invalid document → 502 after
-      // up to 10 outbound attempts per request). Cheap shape check only —
-      // full validation is the nodes' job.
       if (
         svgText.length < 50 ||
         !/<\s*svg[\s>]/i.test(svgText) ||
@@ -448,6 +446,7 @@ export default {
       svgUrl,
       format,
       colo,
+      continent,
       fallbackImageUrl,
       posterUrl,
       inputType,

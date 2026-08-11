@@ -24,6 +24,7 @@ async function sha256Hex(str) {
     new TextEncoder().encode(str),
   );
   const bytes = new Uint8Array(digest);
+  if (typeof bytes.toHex === "function") return bytes.toHex();
   let hex = "";
   for (let i = 0; i < bytes.length; i++) {
     hex += bytes[i].toString(16).padStart(2, "0");
