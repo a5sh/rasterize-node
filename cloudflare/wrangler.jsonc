@@ -51,12 +51,16 @@
     "bindings": [],
   },
   "migrations": [{ "tag": "v2", "deleted_classes": ["FleetHealth"] }],
-  // Secrets: webhook URLs moved to the Secrets Store (official
-  // secrets_store_secrets binding — same store as CF_ACCOUNT_ID/CF_API_TOKEN).
-  // IMPORTANT: add DISCORD_WEBHOOK_URL + ALERTS_WEBHOOK_URL to the store
-  // before deploying or fleet alerts/dashboard embeds silently stop.
-  // (The legacy VERCEL_NODE_URL/…/VPS3_NODE_URL vars were dead — the node
-  // registry is derived from assets/nodes.config.js, not these vars.)
+  // Secrets: CF_ACCOUNT_ID/CF_API_TOKEN come from the Secrets Store (official
+  // secrets_store_secrets binding) — fleetSync.js resolves them via
+  // resolveSecret() for the Analytics Engine SQL API. The Discord webhooks
+  // are NOT store bindings: the store entries don't exist (code 10182 blocks
+  // every deploy) and the code reads them as plain strings anyway, so they
+  // are plain worker secrets set with:
+  //   wrangler secret put DISCORD_WEBHOOK_URL
+  //   wrangler secret put ALERTS_WEBHOOK_URL
+  // Until they are set, fleet alerts/dashboard embeds silently degrade
+  // (fleetSync.js warns at cron time; no deploy block).
   "secrets_store_secrets": [
     {
       "binding": "CF_ACCOUNT_ID",
@@ -67,16 +71,6 @@
       "binding": "CF_API_TOKEN",
       "store_id": "9b4aa7fc14e74938a057ff9e3fbf4d4d",
       "secret_name": "CF_API_TOKEN",
-    },
-    {
-      "binding": "DISCORD_WEBHOOK_URL",
-      "store_id": "9b4aa7fc14e74938a057ff9e3fbf4d4d",
-      "secret_name": "DISCORD_WEBHOOK_URL",
-    },
-    {
-      "binding": "ALERTS_WEBHOOK_URL",
-      "store_id": "9b4aa7fc14e74938a057ff9e3fbf4d4d",
-      "secret_name": "ALERTS_WEBHOOK_URL",
     },
   ],
   "observability": {
