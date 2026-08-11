@@ -142,6 +142,17 @@ async function resolveSecret(binding) {
 
 // ── Shared per-isolate health state ──────────────────────────────────────────
 
+// ── /proxy allowlist — the only hostnames the browser bridge may fetch ──────
+// Mirrors rasterise/assets/nodes.config.js (the plain-HTTP fleet nodes).
+// Kept in sync manually: adding a node to the config without adding it here
+// just means the test page routes that node through /proxy with 403.
+const PROXY_ALLOWED_HOSTS = new Set([
+  "node-3.midas.host",
+  "de20.spaceify.eu",
+  "dono-01.danbot.host",
+  "fr1.spaceify.eu",
+]);
+
 const health = createHealthState({
   errWindowMs: SETTINGS.errWindowMs,
   stressThreshold: SETTINGS.stressThreshold,
@@ -328,6 +339,41 @@ export default {
           502,
           e?.message?.slice(0, 200) || "fleet sync failed",
         );
+      }
+    }
+
+    // ── /proxy — browser bridge for plain-HTTP nodes ─────────────────────────
+    // The admin test page (/admin/test) benchmarks every node directly from
+    // the browser, but midas/germany/danbot/france listen on plain HTTP and
+    // browsers refuse mixed-content fetches. This is NOT an open proxy: only
+    // the four fleet node hostnames may be fetched, GET only, and the
+    // upstream response is streamed back with CORS so the page can read it.
+    if (url.pathname === "/proxy") {
+      if (request.method !== "GET")
+        return _jsonError(405, "Method not allowed");
+      const target = url.searchParams.get("url");
+      if (!target) return _jsonError(400, "Missing ?url= parameter");
+      let upstream;
+      try {
+        upstream = new URL(target);
+      } catch {
+        return _jsonError(400, "Invalid ?url= parameter");
+      }
+      if (!["http:", "https:"].includes(upstream.protocol))
+        return _jsonError(400, "Unsupported protocol");
+      if (!PROXY_ALLOWED_HOSTS.has(upstream.hostname.toLowerCase()))
+        return _jsonError(403, "Disallowed proxy host");
+      try {
+        const r = await fetch(upstream, {
+          headers: { "User-Agent": "SpicyDevs-LB/14.0" },
+          redirect: "manual",
+          signal: AbortSignal.timeout(12_000),
+        });
+        const headers = new Headers(r.headers);
+        headers.set("Access-Control-Allow-Origin", "*");
+        return new Response(r.body, { status: r.status, headers });
+      } catch (e) {
+        return _jsonError(502, `Proxy error: ${e?.message || "fetch failed"}`);
       }
     }
 
