@@ -34,6 +34,7 @@ async function sha256Hex(str) {
 
 function bufToB64(buffer) {
   const bytes = new Uint8Array(buffer);
+  if (typeof bytes.toBase64 === "function") return bytes.toBase64();
   let bin = "";
   for (let i = 0; i < bytes.length; i += 32_768)
     bin += String.fromCharCode(
