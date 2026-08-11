@@ -7,3 +7,5 @@ node_modules/
 schema.sql
 .wragnler/
 .env
+/cloudflare/.package-lock.json
+/cloudflare/package.json
