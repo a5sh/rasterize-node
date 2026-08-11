@@ -251,14 +251,4 @@ export async function updateDashboard(env, snapshot, log, { t1Nodes, t2Nodes } =
   }
 }
 
-function jsonError(status, msg) {
-  return new Response(JSON.stringify({ error: msg }), {
-    status,
-    headers: {
-      "Content-Type": "application/json",
-      "Access-Control-Allow-Origin": "*",
-    },
-  });
-}
-
 

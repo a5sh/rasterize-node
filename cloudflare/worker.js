@@ -62,6 +62,7 @@ import {
 } from "./lib/dashboard.js";
 import { runFleetSync } from "./lib/fleetSync.js";
 import { BRAND } from "./lib/embedBrand.js";
+import { jsonOk, jsonError } from "./lib/http.js";
 
 // ── Node-error relay rate limiter ─────────────────────────────────────────────
 // Mirrors the nodes' own report limiter: at most MAX posts per window with a
@@ -195,28 +196,6 @@ const health = createHealthState({
 });
 const fleetBridge = createKvFleetBridge();
 
-// ── JSON helpers ──────────────────────────────────────────────────────────────
-
-function _jsonOk(body) {
-  return new Response(JSON.stringify(body), {
-    status: 200,
-    headers: {
-      "Content-Type": "application/json",
-      "Cache-Control": "no-store",
-      "Access-Control-Allow-Origin": "*",
-    },
-  });
-}
-function _jsonError(status, msg) {
-  return new Response(JSON.stringify({ error: msg }), {
-    status,
-    headers: {
-      "Content-Type": "application/json",
-      "Access-Control-Allow-Origin": "*",
-    },
-  });
-}
-
 // ── Main export ────────────────────────────────────────────────────────────────
 export default {
   async fetch(request, env, ctx) {
@@ -245,7 +224,7 @@ export default {
 
     // ── /health ────────────────────────────────────────────────────────────
     if (url.pathname === "/health") {
-      return _jsonOk({
+      return jsonOk({
         status: "ok",
         version: "14.0",
         node: "cf-lb",
@@ -293,7 +272,7 @@ export default {
         })),
       );
       const lastUpdate = await getLastDashboardUpdate(env);
-      return _jsonOk({
+      return jsonOk({
         discordConfigured: !!env.DISCORD_WEBHOOK_URL,
         lastDiscordUpdate: lastUpdate
           ? new Date(lastUpdate).toISOString()
@@ -324,7 +303,7 @@ export default {
     if (request.method === "POST" && url.pathname === "/report") {
       try {
         const body = await request.json().catch(() => null);
-        if (!body?.node) return _jsonError(400, "missing node");
+        if (!body?.node) return jsonError(400, "missing node");
         if (body.type === "error") {
           await relayNodeError(env, _log, {
             node: body.node,
@@ -332,7 +311,7 @@ export default {
             message: body.message || "",
             ts: body.ts || Date.now(),
           });
-          return _jsonOk({ ok: true, relayed: true });
+          return jsonOk({ ok: true, relayed: true });
         }
         if (body.type === "offline") {
           await relayNodeError(env, _log, {
@@ -341,17 +320,17 @@ export default {
             message: body.message || "",
             ts: body.ts || Date.now(),
           });
-          return _jsonOk({ ok: true, relayed: true });
+          return jsonOk({ ok: true, relayed: true });
         }
         if (body.type !== "metrics" && body.type !== "online")
-          return _jsonError(400, "unknown report type");
+          return jsonError(400, "unknown report type");
         await env.DASHBOARD_KV.put(
           `fleet:heartbeat:${body.node}`,
           JSON.stringify({ at: Date.now(), ...body }),
         );
-        return _jsonOk({ ok: true });
+        return jsonOk({ ok: true });
       } catch (e) {
-        return _jsonError(502, e?.message || "report failed");
+        return jsonError(502, e?.message || "report failed");
       }
     }
 
@@ -362,16 +341,16 @@ export default {
     if (request.method === "POST" && url.pathname === "/report-log") {
       try {
         const body = await request.json().catch(() => null);
-        if (!body?.message) return _jsonError(400, "missing message");
+        if (!body?.message) return jsonError(400, "missing message");
         const relayed = await relayLogEvent(env, _log, {
           level: body.level || "warn",
           message: body.message,
           meta: body.meta || {},
           embeds: Array.isArray(body.embeds) ? body.embeds : null,
         });
-        return _jsonOk({ ok: true, relayed });
+        return jsonOk({ ok: true, relayed });
       } catch (e) {
-        return _jsonError(502, e?.message || "log relay failed");
+        return jsonError(502, e?.message || "log relay failed");
       }
     }
 
@@ -381,16 +360,16 @@ export default {
     //    as scheduled(), via runFleetSync(force:true).
     if (url.pathname === "/manual") {
       if (request.method !== "GET" && request.method !== "POST")
-        return _jsonError(405, "Method not allowed");
+        return jsonError(405, "Method not allowed");
       try {
         await runFleetSync(env, _log, {
           t1Nodes: T1_NODES,
           t2Nodes: T2_NODES,
           force: true,
         });
-        return _jsonOk({ ok: true, at: new Date().toISOString() });
+        return jsonOk({ ok: true, at: new Date().toISOString() });
       } catch (e) {
-        return _jsonError(
+        return jsonError(
           502,
           e?.message?.slice(0, 200) || "fleet sync failed",
         );
@@ -405,19 +384,19 @@ export default {
     // upstream response is streamed back with CORS so the page can read it.
     if (url.pathname === "/proxy") {
       if (request.method !== "GET")
-        return _jsonError(405, "Method not allowed");
+        return jsonError(405, "Method not allowed");
       const target = url.searchParams.get("url");
-      if (!target) return _jsonError(400, "Missing ?url= parameter");
+      if (!target) return jsonError(400, "Missing ?url= parameter");
       let upstream;
       try {
         upstream = new URL(target);
       } catch {
-        return _jsonError(400, "Invalid ?url= parameter");
+        return jsonError(400, "Invalid ?url= parameter");
       }
       if (!["http:", "https:"].includes(upstream.protocol))
-        return _jsonError(400, "Unsupported protocol");
+        return jsonError(400, "Unsupported protocol");
       if (!PROXY_ALLOWED_HOSTS.has(upstream.hostname.toLowerCase()))
-        return _jsonError(403, "Disallowed proxy host");
+        return jsonError(403, "Disallowed proxy host");
       try {
         const r = await fetch(upstream, {
           headers: { "User-Agent": "SpicyDevs-LB/14.0" },
@@ -428,13 +407,13 @@ export default {
         headers.set("Access-Control-Allow-Origin", "*");
         return new Response(r.body, { status: r.status, headers });
       } catch (e) {
-        return _jsonError(502, `Proxy error: ${e?.message || "fetch failed"}`);
+        return jsonError(502, `Proxy error: ${e?.message || "fetch failed"}`);
       }
     }
 
     // ── Main rasterization ─────────────────────────────────────────────────
     if (request.method !== "POST" && request.method !== "GET")
-      return _jsonError(405, "Method not allowed");
+      return jsonError(405, "Method not allowed");
 
     const svgUrl = request.headers.get("X-SVG-Url") || null;
     const colo = request.headers.get("X-CF-Colo") || request.cf?.colo || null;
@@ -462,31 +441,31 @@ export default {
         try {
           svgText = await decompressGzipStream(request.body);
         } catch (e) {
-          return _jsonError(400, `Gzip decode failed: ${e?.message}`);
+          return jsonError(400, `Gzip decode failed: ${e?.message}`);
         }
       } else if (encoding && encoding !== "identity") {
-        return _jsonError(415, `Unsupported X-SVG-Encoding: ${encoding}`);
+        return jsonError(415, `Unsupported X-SVG-Encoding: ${encoding}`);
       } else {
         svgText = await request.text();
       }
-      if (!svgText?.trim()) return _jsonError(400, "Empty SVG body");
+      if (!svgText?.trim()) return jsonError(400, "Empty SVG body");
       if (
         svgText.length < 50 ||
         !/<\s*svg[\s>]/i.test(svgText) ||
         !/<\/svg\s*>/i.test(svgText)
       )
-        return _jsonError(400, "Body does not look like an SVG");
+        return jsonError(400, "Body does not look like an SVG");
     } else {
       const targetUrl = url.searchParams.get("url");
-      if (!targetUrl) return _jsonError(400, "Missing ?url= parameter");
+      if (!targetUrl) return jsonError(400, "Missing ?url= parameter");
       try {
         const r = await fetch(targetUrl, {
           headers: { "User-Agent": "SpicyDevs-LB/12.0" },
         });
-        if (!r.ok) return _jsonError(502, `SVG fetch failed: ${r.status}`);
+        if (!r.ok) return jsonError(502, `SVG fetch failed: ${r.status}`);
         svgText = await r.text();
       } catch (e) {
-        return _jsonError(502, `SVG fetch error: ${e?.message}`);
+        return jsonError(502, `SVG fetch error: ${e?.message}`);
       }
     }
 
